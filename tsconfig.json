@@ -5,7 +5,16 @@
     "types": [
       "node"
     ],
-    "allowImportingTsExtensions": true
+    "allowImportingTsExtensions": true,
+    "paths": {
+      "dsh-shellout-protocol": [
+        "./packages/protocol/src/index.ts"
+      ],
+      "dsh-shellout-runner/core": [
+        "./packages/runner/src/core/index.ts"
+      ]
+    },
+    "baseUrl": "."
   },
   "include": [
     "packages/*/src/**/*.ts",
