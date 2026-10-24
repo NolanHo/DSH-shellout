@@ -55,6 +55,18 @@ pnpm -r build
 pnpm test:e2e     # isolated harness instance: runner + host, seven checks
 ```
 
+For an **agent-level** check, `scripts/isolated-web.mjs --port 3107` starts a runner and a full web
+instance from a temporary `DSH_HOME` (the source profile's `node_modules` is reused read-only, every
+storage path is rewritten into the temporary home, and the instance binds loopback only). Send the
+agent a prompt that shells out, then confirm where the command ran:
+
+```
+$ ps -eo pid,ppid,cmd | grep 'sleep 8'
+2838697 2833544 bash -c sleep 8; echo shellout-agent-ok; hostname   # parent = runner
+$ ps -o pid= --ppid <web-instance pid>
+                                                                     # host has no children
+```
+
 The end-to-end script creates its own `DSH_HOME`, socket, and profiles under the system temp
 directory; it never touches a running harness. It asserts:
 

@@ -278,4 +278,4 @@ Snapshot taken 2026-10-24 against DeepSeek Harness `0.2.1-rc.2`.
 - [x] Runner composition + supervisor unit documentation (`examples/`)
 - [x] Unit, contract, integration, and isolation suites (§7) — `pnpm test`, `pnpm test:e2e`
 - [x] README install/enable instructions (one row, one disable)
-- [ ] Model-driven turn (requires a model API key; the seam path is covered by the harness-instance e2e)
+- [x] Model-driven turn — an isolated web instance ran an agent turn whose `bash` command executed as a child of the runner while the host process had no children (§7.5 evidence)
