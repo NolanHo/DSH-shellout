@@ -25,7 +25,7 @@ import {
   type SettledEvent,
   type WireErrorCode,
 } from 'dsh-shellout-protocol'
-import { ExecutionRegistry, RunnerError } from './registry.ts'
+import { ExecutionRegistry, RunnerError } from './registry.js'
 
 /** Server bounds and identity. */
 export interface RunnerServerOptions {

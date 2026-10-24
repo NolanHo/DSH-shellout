@@ -18,7 +18,7 @@ import type {
   StreamRead,
   WireErrorCode,
 } from 'dsh-shellout-protocol'
-import type { BackendExecution, ShellBackend } from './types.ts'
+import type { BackendExecution, ShellBackend } from './types.js'
 
 /** A failure the server maps onto an `err` frame. */
 export class RunnerError extends Error {

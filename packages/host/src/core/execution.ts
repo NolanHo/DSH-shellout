@@ -11,7 +11,7 @@
  */
 
 import type { ExecutionState, OutputRead, SettledEvent, StreamName, StreamRead } from 'dsh-shellout-protocol'
-import type { ShelloutClient } from './client.ts'
+import type { ShelloutClient } from './client.js'
 
 /** Mirror bounds. */
 export interface RemoteExecutionOptions {

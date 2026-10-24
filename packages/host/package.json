@@ -21,21 +21,33 @@
       "default": "./lib/core/index.js"
     }
   },
-  "files": ["lib", "src"],
-  "engines": { "node": ">=22" },
+  "files": [
+    "lib",
+    "src"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
   "dependencies": {
     "dsh-shellout-protocol": "workspace:*"
   },
   "devDependencies": {
-    "dsh-shellout-runner": "workspace:*"
+    "dsh-shellout-runner": "workspace:*",
+    "@deepseek-ai/cordis": "^4.0.0",
+    "@deepseek-ai/dsh-shell": "^0.2.1-rc.2",
+    "@deepseek-ai/dsh-sandbox": "^0.2.1-rc.2"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.0",
     "@deepseek-ai/dsh-shell": "^0.2.1-rc.2"
   },
   "peerDependenciesMeta": {
-    "@deepseek-ai/cordis": { "optional": true },
-    "@deepseek-ai/dsh-shell": { "optional": true }
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-shell": {
+      "optional": true
+    }
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
