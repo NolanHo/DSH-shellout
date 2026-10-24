@@ -31,7 +31,41 @@ stay in the host: they do not poll process liveness, and moving them is a separa
 
 ## Status
 
-Design complete, implementation in progress. The contract lives in [docs/spec.md](docs/spec.md).
+Implementation complete for the shell path; the contract lives in [docs/spec.md](docs/spec.md).
+An isolated end-to-end check (`pnpm test:e2e`) boots a runner and a host in a temporary
+`DSH_HOME` and asserts the properties below.
+
+## Enable it
+
+1. **Runner profile** — create a profile that mounts a local shell executor plus the runner
+   service: [examples/runner-profile.cordis.patch.yml](examples/runner-profile.cordis.patch.yml).
+   Start it with `dsh --profile <runner-profile>`; the process stays up on its socket.
+2. **Supervised service** — run that profile under your process manager so a runner restart is
+   automatic: [examples/dsh-runner.supervisor.conf](examples/dsh-runner.supervisor.conf).
+3. **Host profile** — disable the local executor row and mount the client:
+   [examples/host-profile.cordis.patch.yml](examples/host-profile.cordis.patch.yml).
+4. **Restart the host once.** Every command the agent runs now executes in the runner.
+
+## Verify
+
+```sh
+pnpm test         # protocol, registry, server, client, mirror, seam behaviour
+pnpm typecheck
+pnpm -r build
+pnpm test:e2e     # isolated harness instance: runner + host, seven checks
+```
+
+The end-to-end script creates its own `DSH_HOME`, socket, and profiles under the system temp
+directory; it never touches a running harness. It asserts:
+
+| Check | What it proves |
+|---|---|
+| basic | stdout, stderr and exit code match a local run |
+| lag | a core-burning command in the runner leaves the host event loop idle (max lag in ms) |
+| background | a command that leaves a descendant still reports its own exit |
+| isolation | the host process has no child in the execution's group |
+| lease | after the host dies, the runner terminates the group when the boot lease expires |
+| runner crash | a live execution settles as `killed` with a `shellout: runner lost` note |
 
 ## Layout
 

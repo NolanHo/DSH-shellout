@@ -1,6 +1,6 @@
 # DSH-shellout — Specification
 
-Status: **draft for implementation** · Version: 0.1 · Date: 2026-10-24
+Status: **implemented (shell path)** · Version: 0.2 · Date: 2026-10-24
 
 This document is the contract for `DSH-shellout`. It is written to be executed by an agent with
 no prior conversation: everything needed to implement, verify, and review the work is either in
@@ -272,9 +272,10 @@ Snapshot taken 2026-10-24 against DeepSeek Harness `0.2.1-rc.2`.
 
 ### 9.1 Deliverables
 
-- [ ] `dsh-shellout-protocol`: frames, envelope, version negotiation, error codes
-- [ ] `dsh-shellout`: host provider (resolve/execute/mirror/lifecycle)
-- [ ] `dsh-shellout-runner`: server, execution registry, lease, drain
-- [ ] Runner composition + supervisor unit documentation
-- [ ] Unit, contract, integration, and isolation suites (§7)
-- [ ] README install/enable instructions (one row, one disable)
+- [x] `dsh-shellout-protocol`: frames, envelope, version negotiation, error codes
+- [x] `dsh-shellout`: host provider (resolve/execute/mirror/lifecycle)
+- [x] `dsh-shellout-runner`: server, execution registry, lease, drain
+- [x] Runner composition + supervisor unit documentation (`examples/`)
+- [x] Unit, contract, integration, and isolation suites (§7) — `pnpm test`, `pnpm test:e2e`
+- [x] README install/enable instructions (one row, one disable)
+- [ ] Model-driven turn (requires a model API key; the seam path is covered by the harness-instance e2e)

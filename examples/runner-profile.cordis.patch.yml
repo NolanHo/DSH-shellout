@@ -1,0 +1,9 @@
+# Runner profile layer: mount the runner service next to a local shell executor.
+# Put this file in $DSH_HOME/profiles/<runner-profile>/cordis.patch.yml and
+# start that profile with `dsh --profile <runner-profile>`.
+- insert:
+    - id: shellout-runner
+      name: 'dsh-shellout-runner'
+      config:
+        leaseTtlMs: 60000
+        maxConcurrent: 64

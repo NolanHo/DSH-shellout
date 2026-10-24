@@ -65,6 +65,8 @@ export function resolveConfig(config: ShelloutConfig = {}, env: NodeJS.ProcessEn
 /** The host-side executor backed by a runner process. */
 export class ShelloutExecutor extends ShellExecutor {
   private readonly bootId = randomUUID()
+  private readonly live = new Set<RemoteExecution>()
+  private readonly detachClose: () => void
 
   /**
    * @param ctx - owning context.
@@ -73,6 +75,10 @@ export class ShelloutExecutor extends ShellExecutor {
    */
   constructor(ctx: Context, private readonly config: ResolvedShelloutConfig, private readonly client: ShelloutClient) {
     super(ctx)
+    this.detachClose = client.onClose(() => {
+      for (const execution of this.live) execution.abortLost('shellout: runner lost')
+      this.live.clear()
+    })
   }
 
   /** The runner's sandbox mode, when its executor confines. */
@@ -135,11 +141,15 @@ export class ShelloutExecutor extends ShellExecutor {
       throw error
     }
     remote.start()
-    return new RunnerShellExecution(remote, spec, detach)
+    this.live.add(remote)
+    const release = (): void => { this.live.delete(remote); detach() }
+    void remote.done.then(release)
+    return new RunnerShellExecution(remote, spec, release)
   }
 
   /** Close the connection and settle every live execution. */
   async [Symbol.asyncDispose](): Promise<void> {
+    this.detachClose()
     this.client.close()
   }
 }

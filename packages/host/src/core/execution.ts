@@ -166,6 +166,22 @@ export class RemoteExecution {
   }
 
   /**
+   * Settle this execution because the runner is gone and will never report it.
+   * @param note - one line appended to stderr, matching the seam's provider-failure shape.
+   */
+  abortLost(note: string): void {
+    if (this.stateValue !== 'running') return
+    this.append('stderr', this.buffers.stderr.text.endsWith('\n') || this.buffers.stderr.text === '' ? `${note}\n` : `\n${note}\n`)
+    this.stateValue = 'killed'
+    this.exitCodeValue = null
+    this.signalValue = null
+    this.stopped = true
+    if (this.timer !== undefined) clearTimeout(this.timer)
+    this.timer = undefined
+    this.resolveDone()
+  }
+
+  /**
    * Record a settlement event pushed by the runner.
    * @param event - the event payload.
    */

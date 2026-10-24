@@ -202,6 +202,7 @@ export class ShelloutClient {
     const reconnect = this.options.reconnectDelayMs
     if (reconnect === undefined) {
       this.failPending('runner connection closed')
+      this.notifyClosed()
       return
     }
     setTimeout(() => { void this.reconnect() }, reconnect)
@@ -218,6 +219,15 @@ export class ShelloutClient {
       if (this.closed) return
       setTimeout(() => { void this.reconnect() }, this.options.reconnectDelayMs ?? 1_000)
     }
+  }
+
+  /** Mark the client permanently closed and notify subscribers once. */
+  private notifyClosed(): void {
+    if (this.closed) return
+    this.closed = true
+    if (this.heartbeat !== undefined) clearInterval(this.heartbeat)
+    this.heartbeat = undefined
+    for (const listener of this.closeListeners) listener()
   }
 
   private failPending(message: string): void {

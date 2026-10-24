@@ -1,0 +1,26 @@
+{
+  "name": "dsh-shellout-testapp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Scenario runner used by DSH-shellout end-to-end tests",
+  "type": "module",
+  "license": "Apache-2.0",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    }
+  },
+  "files": ["lib", "src"],
+  "engines": { "node": ">=22" },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.0",
+    "@deepseek-ai/dsh-shell": "^0.2.1-rc.2"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json"
+  }
+}

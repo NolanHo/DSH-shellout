@@ -1,0 +1,11 @@
+# Host profile layer: run shell commands in the runner instead of this process.
+# Put this file in the profile's cordis.patch.yml (or in a bundle it mounts).
+- id: bash-sandbox
+  disabled: true
+
+- insert:
+    - id: shellout
+      name: 'dsh-shellout'
+      config:
+        # Defaults to $DSH_HOME/shellout/control.sock when omitted.
+        mirrorPollMs: 150
