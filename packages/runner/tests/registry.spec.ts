@@ -38,7 +38,19 @@ describe('ExecutionRegistry', () => {
     const started = await instance.exec(request('e1'), BOOT)
     expect(started.executionId).toBe('e1')
     expect(backend.specs).toHaveLength(1)
-    expect(instance.attach(BOOT)).toEqual([{ executionId: 'e1', state: 'running' }])
+    expect(instance.attach(BOOT)).toEqual([{ executionId: 'e1', state: 'running', exitCode: null, signal: null }])
+    instance.dispose()
+  })
+
+  it('reports the terminal facts of a settled execution on attach', async () => {
+    const { backend, instance } = registry()
+    instance.attach(BOOT)
+    await instance.exec(request('e1'), BOOT)
+    backend.executions[0]?.complete(5)
+    await new Promise(resolve => { setTimeout(resolve, 40) })
+    expect(instance.attach(BOOT)).toEqual([
+      { executionId: 'e1', state: 'exited', exitCode: 5, signal: null },
+    ])
     instance.dispose()
   })
 

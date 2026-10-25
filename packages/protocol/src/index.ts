@@ -135,7 +135,11 @@ export type StreamName = 'stdout' | 'stderr'
 export interface StreamRead {
   /** Text captured from the requested offset. */
   readonly text: string
-  /** Whole-stream offset to resume from. */
+  /**
+   * Whole-stream offset to resume from. Offsets count UTF-8 bytes, not UTF-16
+   * code units, so a stream containing non-ASCII text has shorter offsets than
+   * the decoded text is long.
+   */
   readonly nextOffset: number
   /** True when the requested offset slid out of the retained window. */
   readonly lossy: boolean
@@ -163,6 +167,28 @@ export interface HelloRequest {
   readonly maxFrameBytes: number
 }
 
+/**
+ * One execution a runner still holds for a boot.
+ *
+ * The terminal facts travel with the handshake because a settlement announced
+ * while no connection was subscribed is not repeated: a host that reconnects
+ * after its execution settled learns the outcome from these fields.
+ */
+export interface HeldExecution {
+  /** Execution identity. */
+  readonly executionId: string
+  /** Current lifecycle state; anything but `running` is terminal. */
+  readonly state: ExecutionState
+  /** Exit code once settled, else null. */
+  readonly exitCode?: number | null
+  /** Terminating signal once settled, else null (name or POSIX number, as the runner reports it). */
+  readonly signal?: string | number | null
+  /** Why the execution was terminated, when a party asked for it. */
+  readonly termination?: string | null
+  /** Terminal note, including why a lost execution was lost. */
+  readonly detail?: string | null
+}
+
 /** `hello` reply payload. */
 export interface HelloResponse {
   readonly protocol: string
@@ -173,7 +199,7 @@ export interface HelloResponse {
   readonly heartbeatMs: number
   readonly leaseTtlMs: number
   /** Executions of this boot the runner still holds, for reconnect reconciliation. */
-  readonly executions: readonly { readonly executionId: string; readonly state: ExecutionState }[]
+  readonly executions: readonly HeldExecution[]
 }
 
 /** `exec` request payload. `operationId` makes a retried spawn idempotent. */

@@ -109,6 +109,23 @@ describe('ShelloutClient + RemoteExecution', () => {
     await execution.done
   })
 
+  it('reconstructs non-ASCII output byte for byte', async () => {
+    const { backend, exec } = await harness()
+    const execution = await exec()
+    backend.executions[0]?.append('stdout', 'é中\nok\n')
+    // Two poll passes: a second read must resume where the runner's byte
+    // offset says, not where the decoded text happens to end.
+    await new Promise(resolve => { setTimeout(resolve, 140) })
+    await new Promise(resolve => { setTimeout(resolve, 140) })
+    backend.executions[0]?.complete(0)
+    await execution.done
+    expect(execution.readOutput().delta).toBe('é中\nok\n')
+    expect(execution.readStream('stdout', 0, 1024)).toMatchObject({ text: 'é中\nok\n', nextOffset: 9 })
+    const first = execution.readStream('stdout', 0, 2)
+    expect(first).toMatchObject({ text: 'é', nextOffset: 2 })
+    expect(execution.readStream('stdout', first.nextOffset, 1024).text).toBe('中\nok\n')
+  })
+
   it('reports loss below the retained window', async () => {
     const { backend, client } = await harness()
     const execution = new RemoteExecution(client, 'e1', { pollMs: 20, retainBytes: 4 })

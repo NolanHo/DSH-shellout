@@ -232,12 +232,17 @@ export class ShelloutExecutor extends ShellExecutor {
       clearTimeout(this.lossTimer)
       this.lossTimer = undefined
     }
-    const held = new Set(this.client.executions.map(entry => entry.executionId))
+    const held = new Map(this.client.executions.map(entry => [entry.executionId, entry]))
     for (const execution of [...this.live]) {
-      if (!held.has(execution.executionId)) {
+      const facts = held.get(execution.executionId)
+      if (facts === undefined) {
         execution.abortLost('shellout: runner lost')
         this.live.delete(execution)
+        continue
       }
+      // A settlement announced while this host was away is never repeated:
+      // the handshake reports how the execution ended instead.
+      if (facts.state !== 'running') execution.settleFromFacts(facts)
     }
   }
 

@@ -11,6 +11,7 @@
 import type {
   ExecRequest,
   ExecutionState,
+  HeldExecution,
   OutputRead,
   SettledEvent,
   StateResponse,
@@ -101,12 +102,29 @@ export class ExecutionRegistry {
    * @param bootId - the host's boot identity.
    * @returns every execution this boot still owns.
    */
-  attach(bootId: string): { readonly executionId: string; readonly state: ExecutionState }[] {
+  attach(bootId: string): HeldExecution[] {
     this.boots.set(bootId, { deadline: Date.now() + this.leaseTtlMs })
-    const held: { executionId: string; state: ExecutionState }[] = []
+    const held: HeldExecution[] = []
     for (const record of this.records.values()) {
       if (record.bootId !== bootId) continue
-      held.push({ executionId: record.executionId, state: record.execution.state().state })
+      const terminal = record.terminal
+      if (terminal === undefined) {
+        const current = record.execution.state()
+        held.push({
+          executionId: record.executionId,
+          state: current.state,
+          exitCode: current.exitCode,
+          signal: current.signal,
+        })
+        continue
+      }
+      held.push({
+        executionId: record.executionId,
+        state: terminal.status === 'failed' ? 'lost' : terminal.status,
+        exitCode: terminal.exitCode,
+        signal: terminal.signal,
+        ...terminal.detail === undefined ? {} : { detail: terminal.detail },
+      })
     }
     return held
   }

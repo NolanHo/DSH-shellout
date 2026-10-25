@@ -56,9 +56,16 @@ export class FakeExecution implements BackendExecution {
   }
 
   readStream(stream: StreamName, offset: number, limit: number): StreamRead {
-    const buffer = this.buffers[stream]
-    const text = buffer.slice(offset, offset + limit)
-    return { text, nextOffset: offset + text.length, lossy: offset > buffer.length }
+    // The wire counts UTF-8 bytes, so this double seeks bytes as well.
+    const bytes = Buffer.from(this.buffers[stream], 'utf8')
+    const from = Math.min(offset, bytes.byteLength)
+    let to = Math.min(from + limit, bytes.byteLength)
+    while (to > from && to < bytes.byteLength && (bytes[to]! & 0xc0) === 0x80) to -= 1
+    return {
+      text: bytes.subarray(from, to).toString('utf8'),
+      nextOffset: to,
+      lossy: offset > bytes.byteLength,
+    }
   }
 
   kill(): boolean {
