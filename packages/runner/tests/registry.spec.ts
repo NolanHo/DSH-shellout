@@ -1,19 +1,21 @@
 import { describe, expect, it } from 'vitest'
-import { specDigest, type ExecSpec, type ExecRequest, type SettledEvent } from 'dsh-shellout-protocol'
+import { specDigest, type SpawnSpec, type ExecRequest, type SettledEvent } from 'dsh-shellout-protocol'
 import { ExecutionRegistry, RunnerError } from '../src/core/registry.ts'
 import { FakeBackend } from './support/fake-backend.ts'
 
-const SPEC: ExecSpec = {
-  command: 'echo hi',
-  workdir: '/tmp',
+const SPEC: SpawnSpec = {
+  argv: ['bash', '-c', 'echo hi'],
+  cwd: '/tmp',
+  env: { PATH: '/usr/bin:/bin' },
   timeoutMs: 1_000,
   onExpiry: 'kill',
-  stdoutMaxBytes: 4_096,
+  graceMs: 3_000,
+  capture: { stdoutMaxBytes: 4_096, stderrMaxBytes: 4_096, spillMaxBytes: 1_048_576, spillDir: '/tmp' },
 }
 
 const BOOT = 'boot-a'
 
-function request(id: string, spec: ExecSpec = SPEC, operationId = `op-${id}`): ExecRequest {
+function request(id: string, spec: SpawnSpec = SPEC, operationId = `op-${id}`): ExecRequest {
   return { operationId, executionId: id, spec, specDigest: specDigest(spec) }
 }
 
@@ -54,7 +56,7 @@ describe('ExecutionRegistry', () => {
     const { instance } = registry()
     instance.attach(BOOT)
     await instance.exec(request('e1'), BOOT)
-    await expect(instance.exec(request('e2', { ...SPEC, command: 'echo bye' }, 'op-e1'), BOOT))
+    await expect(instance.exec(request('e2', { ...SPEC, argv: ['bash', '-c', 'echo bye'] }, 'op-e1'), BOOT))
       .rejects.toBeInstanceOf(RunnerError)
     instance.dispose()
   })

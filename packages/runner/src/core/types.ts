@@ -10,10 +10,10 @@
  */
 
 import type {
-  ExecSpec,
   ExecutionState,
   OutputRead,
   RunnerDescriptor,
+  SpawnSpec,
   StreamName,
   StreamRead,
 } from 'dsh-shellout-protocol'
@@ -49,10 +49,10 @@ export interface ShellBackend {
   readonly descriptor: RunnerDescriptor
   /**
    * Spawn one command.
-   * @param spec - a fully resolved execution spec.
+   * @param spec - a fully resolved spawn spec.
    * @param signal - cancellation owned by the caller.
    * @returns the live execution handle.
    * @throws when preparation fails.
    */
-  execute(spec: ExecSpec, signal: AbortSignal): Promise<BackendExecution>
+  execute(spec: SpawnSpec, signal: AbortSignal): Promise<BackendExecution>
 }

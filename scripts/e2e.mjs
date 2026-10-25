@@ -103,6 +103,8 @@ function spawnProfile(profile, env) {
 function startRunner() {
   makeProfile('shellout-runner', [
     '- insert:',
+    '    - id: subprocess',
+    "      name: '@deepseek-ai/dsh-subprocess-local'",
     '    - id: shellout-runner',
     "      name: 'dsh-shellout-runner'",
     '      config:',

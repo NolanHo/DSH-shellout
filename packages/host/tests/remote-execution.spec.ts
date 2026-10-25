@@ -2,18 +2,20 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { specDigest, type ExecSpec } from 'dsh-shellout-protocol'
+import { specDigest, type SpawnSpec } from 'dsh-shellout-protocol'
 import { ExecutionRegistry, RunnerServer } from 'dsh-shellout-runner/core'
 import { ShelloutClient, ShelloutRpcError } from '../src/core/client.ts'
 import { RemoteExecution } from '../src/core/execution.ts'
 import { FakeBackend } from '../../runner/tests/support/fake-backend.ts'
 
-const SPEC: ExecSpec = {
-  command: 'echo hi',
-  workdir: '/tmp',
+const SPEC: SpawnSpec = {
+  argv: ['bash', '-c', 'echo hi'],
+  cwd: '/tmp',
+  env: { PATH: '/usr/bin:/bin' },
   timeoutMs: 5_000,
   onExpiry: 'kill',
-  stdoutMaxBytes: 1_048_576,
+  graceMs: 3_000,
+  capture: { stdoutMaxBytes: 1_048_576, stderrMaxBytes: 65_536, spillMaxBytes: 67_108_864, spillDir: '/tmp' },
 }
 
 const cleanups: (() => Promise<void> | void)[] = []

@@ -137,6 +137,8 @@ writeFileSync(join(runnerDir, 'package.json'), JSON.stringify({
 writeFileSync(join(runnerDir, 'cordis.yml'), '[]\n')
 writeFileSync(join(runnerDir, 'cordis.patch.yml'), [
   '- insert:',
+  '    - id: subprocess',
+  "      name: '@deepseek-ai/dsh-subprocess-local'",
   '    - id: shellout-runner',
   "      name: 'dsh-shellout-runner'",
   '      config:',

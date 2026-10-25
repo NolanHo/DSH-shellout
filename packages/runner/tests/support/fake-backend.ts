@@ -5,7 +5,7 @@
  */
 
 import type {
-  ExecSpec,
+  SpawnSpec,
   ExecutionState,
   OutputRead,
   RunnerDescriptor,
@@ -83,7 +83,7 @@ export class FakeExecution implements BackendExecution {
 /** A backend that records specs and hands out scripted executions. */
 export class FakeBackend implements ShellBackend {
   readonly executions: FakeExecution[] = []
-  readonly specs: ExecSpec[] = []
+  readonly specs: SpawnSpec[] = []
   descriptor: RunnerDescriptor = {
     cwd: '/tmp',
     timeoutMs: 60_000,
@@ -94,7 +94,7 @@ export class FakeBackend implements ShellBackend {
   /** Fail the next `execute` call with this error. */
   failNext: Error | undefined
 
-  async execute(spec: ExecSpec): Promise<BackendExecution> {
+  async execute(spec: SpawnSpec): Promise<BackendExecution> {
     if (this.failNext !== undefined) {
       const failure = this.failNext
       this.failNext = undefined

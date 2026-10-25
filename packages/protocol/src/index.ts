@@ -11,7 +11,7 @@
 import { createHash } from 'node:crypto'
 
 /** Exact protocol revision this build speaks. A mismatch is fatal, never negotiated down. */
-export const PROTOCOL_VERSION = '1.0'
+export const PROTOCOL_VERSION = '2.0'
 
 /** Largest frame either side accepts unless the handshake says otherwise. */
 export const DEFAULT_MAX_FRAME_BYTES = 8 * 1024 * 1024
@@ -33,7 +33,7 @@ export type RequestMethod =
   | 'shutdown'
 
 /** Events the runner pushes to the host. */
-export type EventMethod = 'settled'
+export type EventMethod = 'settled' | 'warn'
 
 /** One length-prefixed JSON envelope. `id` is 0 on events, which carry no request. */
 export interface Envelope<T = unknown> {
@@ -88,17 +88,44 @@ export interface RunnerDescriptor {
 /** Terminal facts for one execution. */
 export type ExecutionState = 'running' | 'exited' | 'killed' | 'lost'
 
-/** One resolved execution spec crossing the wire (the harness shell spec minus its AbortSignal). */
-export interface ExecSpec {
-  readonly command: string
-  readonly workdir: string
-  readonly timeoutMs: number
-  readonly onExpiry: 'kill' | 'none'
+/** How much of each captured stream the runner retains and spills. */
+export interface CapturePolicy {
+  /** In-memory cap for stdout; overflow keeps the tail. */
   readonly stdoutMaxBytes: number
+  /** In-memory cap for stderr; overflow keeps the tail. */
+  readonly stderrMaxBytes: number
+  /** Whole-stream cap for a spill file; a larger stream discards its spill. */
+  readonly spillMaxBytes: number
+  /** Directory the runner writes spill files to. */
+  readonly spillDir: string
+}
+
+/**
+ * One fully resolved execution crossing the wire: everything the runner needs
+ * to exec, and nothing about harness policy.
+ *
+ * The host resolves the command into argv, the final environment, the deadline
+ * policy and capture budgets; the runner owns process creation, supervision
+ * and byte capture. No shell semantics, sandbox policy or output merging cross
+ * this boundary.
+ */
+export interface SpawnSpec {
+  /** Executable and arguments; `argv[0]` is the program. */
+  readonly argv: readonly string[]
+  /** Working directory for the child. */
+  readonly cwd: string
+  /** Complete child environment, already scrubbed and merged by the host. */
+  readonly env: Record<string, string>
+  /** Bytes written to the child's stdin before it closes; absent means no stdin. */
   readonly stdin?: string
-  readonly env?: Record<string, string>
-  readonly dshEnv?: Record<string, string>
-  readonly sandboxPolicy?: Record<string, unknown>
+  /** Deadline in milliseconds; enforced by the runner. */
+  readonly timeoutMs: number
+  /** What to do when the deadline expires. */
+  readonly onExpiry: 'kill' | 'none'
+  /** Termination grace between the first signal and SIGKILL. */
+  readonly graceMs: number
+  /** Capture budgets for the two collected streams. */
+  readonly capture: CapturePolicy
 }
 
 /** One captured stream an execution owns. */
@@ -153,7 +180,7 @@ export interface HelloResponse {
 export interface ExecRequest {
   readonly operationId: string
   readonly executionId: string
-  readonly spec: ExecSpec
+  readonly spec: SpawnSpec
   readonly specDigest: string
 }
 
@@ -201,15 +228,41 @@ export interface DrainResponse {
   readonly live: number
 }
 
+/**
+ * One notice attached to an execution.
+ *
+ * Reserved: a runner may inspect a command before executing it and report what
+ * it observed. No runner emits notices today; the field and the `warn` event
+ * exist so that interception can be added without a protocol change.
+ */
+export interface RunnerNotice {
+  /** How the host should surface it. */
+  readonly severity: 'info' | 'warning'
+  /** Stable machine code. */
+  readonly code: string
+  /** One human-readable line. */
+  readonly message: string
+}
+
 /** `settled` event payload. */
 export interface SettledEvent {
   readonly executionId: string
   readonly status: 'exited' | 'killed' | 'failed'
   readonly exitCode: number | null
   readonly signal: string | null
+  /** Sandbox facts, when the runner confines (no runner does today). */
   readonly sandbox?: Record<string, unknown>
   /** Human-readable terminal note, including the cause when the runner lost the execution. */
   readonly detail?: string
+  /** Reserved: notices produced while inspecting this execution (see {@link RunnerNotice}). */
+  readonly notices?: readonly RunnerNotice[]
+}
+
+/** `warn` event payload: a notice the runner raises outside settlement. Reserved. */
+export interface WarnEvent {
+  /** Execution the notice belongs to, when it belongs to one. */
+  readonly executionId?: string
+  readonly notice: RunnerNotice
 }
 
 /**
@@ -319,7 +372,7 @@ function decodeBody(body: Buffer): Envelope {
  * @param spec - the resolved execution spec.
  * @returns a stable hex digest that changes whenever the spec changes.
  */
-export function specDigest(spec: ExecSpec): string {
+export function specDigest(spec: SpawnSpec): string {
   return createHash('sha256').update(canonicalJson(spec)).digest('hex')
 }
 

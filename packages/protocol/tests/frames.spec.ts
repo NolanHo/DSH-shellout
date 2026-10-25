@@ -6,7 +6,7 @@ import {
   encodeFrame,
   specDigest,
   type Envelope,
-  type ExecSpec,
+  type SpawnSpec,
 } from '../src/index.ts'
 
 const request: Envelope = {
@@ -72,27 +72,31 @@ describe('framing', () => {
 })
 
 describe('specDigest', () => {
-  const base: ExecSpec = {
-    command: 'echo hi',
-    workdir: '/tmp',
-    timeoutMs: 1000,
-    onExpiry: 'kill',
-    stdoutMaxBytes: 4096,
-  }
+  const base: SpawnSpec = {
+  argv: ['bash', '-c', 'echo hi'],
+  cwd: '/tmp',
+  env: { PATH: '/usr/bin:/bin' },
+  timeoutMs: 1_000,
+  onExpiry: 'kill',
+  graceMs: 3_000,
+  capture: { stdoutMaxBytes: 4_096, stderrMaxBytes: 4_096, spillMaxBytes: 1_048_576, spillDir: '/tmp' },
+}
 
   it('is stable across key order', () => {
-    const reordered: ExecSpec = {
-      stdoutMaxBytes: 4096,
+    const reordered: SpawnSpec = {
+      capture: { spillDir: '/tmp', spillMaxBytes: 1_048_576, stderrMaxBytes: 4_096, stdoutMaxBytes: 4_096 },
+      graceMs: 3_000,
       onExpiry: 'kill',
-      timeoutMs: 1000,
-      workdir: '/tmp',
-      command: 'echo hi',
+      timeoutMs: 1_000,
+      env: { PATH: '/usr/bin:/bin' },
+      cwd: '/tmp',
+      argv: ['bash', '-c', 'echo hi'],
     }
     expect(specDigest(reordered)).toBe(specDigest(base))
   })
 
   it('changes when the spec changes', () => {
-    expect(specDigest({ ...base, command: 'echo bye' })).not.toBe(specDigest(base))
+    expect(specDigest({ ...base, argv: ['bash', '-c', 'echo bye'] })).not.toBe(specDigest(base))
   })
 
   it('ignores undefined optional fields', () => {

@@ -11,6 +11,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { SandboxMode } from '@deepseek-ai/dsh-sandbox'
@@ -24,7 +25,9 @@ import type {
   ShellRunResult,
   ShellSandboxInfo,
 } from '@deepseek-ai/dsh-shell'
-import { specDigest, type ExecSpec } from 'dsh-shellout-protocol'
+import { ENV_OVERRIDES } from '@deepseek-ai/dsh-bash-local'
+import { scrubbedParentEnv } from '@deepseek-ai/dsh-subprocess'
+import { specDigest, type SpawnSpec } from 'dsh-shellout-protocol'
 import { ShelloutClient } from '../core/client.js'
 import { RemoteExecution } from '../core/execution.js'
 
@@ -180,7 +183,7 @@ export class ShelloutExecutor extends ShellExecutor {
     if (spec.signal?.aborted === true) throw new Error('shellout: command aborted before start')
     const executionId = randomUUID()
     const operationId = randomUUID()
-    const wireSpec = toWireSpec(spec)
+    const wireSpec = toSpawnSpec(spec, this.config)
     const remote = new RemoteExecution(this.client, executionId, {
       pollMs: this.config.mirrorPollMs,
       retainBytes: this.config.mirrorRetainBytes,
@@ -373,20 +376,40 @@ function toSandboxMode(value: string | undefined): SandboxMode | undefined {
 }
 
 /**
- * Project a harness spec onto the wire.
- * @param spec - the resolved spec.
- * @returns the JSON-safe wire spec.
+ * Resolve a harness spec into the runner's spawn vocabulary.
+ *
+ * Everything policy-shaped is decided here — argv, the fully merged child
+ * environment, capture budgets — so the runner only creates, supervises and
+ * captures a process. The command runs through `bash -c`, exactly as the local
+ * executor would run it.
+ *
+ * @param spec - the resolved harness spec.
+ * @param config - resolved plugin configuration (local budgets and grace).
+ * @returns the wire spawn spec.
  */
-function toWireSpec(spec: ShellExecSpec): ExecSpec {
+function toSpawnSpec(spec: ShellExecSpec, config: ResolvedShelloutConfig): SpawnSpec {
+  const env: Record<string, string> = {}
+  for (const [key, value] of Object.entries({
+    ...scrubbedParentEnv(),
+    ...ENV_OVERRIDES,
+    ...spec.env,
+    ...spec.dshEnv as Record<string, string> | undefined,
+  })) {
+    if (value !== undefined) env[key] = value
+  }
   return {
-    command: spec.command,
-    workdir: spec.workdir,
+    argv: ['bash', '-c', spec.command],
+    cwd: spec.workdir,
+    env,
+    ...spec.stdin === undefined ? {} : { stdin: spec.stdin },
     timeoutMs: spec.timeoutMs,
     onExpiry: spec.onExpiry,
-    stdoutMaxBytes: spec.stdoutMaxBytes,
-    ...spec.stdin === undefined ? {} : { stdin: spec.stdin },
-    ...spec.env === undefined ? {} : { env: spec.env },
-    ...spec.dshEnv === undefined ? {} : { dshEnv: spec.dshEnv as Record<string, string> },
-    ...spec.sandboxPolicy === undefined ? {} : { sandboxPolicy: spec.sandboxPolicy as unknown as Record<string, unknown> },
+    graceMs: config.local.graceMs,
+    capture: {
+      stdoutMaxBytes: spec.stdoutMaxBytes,
+      stderrMaxBytes: config.local.maxOutputBytes,
+      spillMaxBytes: config.local.maxSpillBytes,
+      spillDir: tmpdir(),
+    },
   }
 }

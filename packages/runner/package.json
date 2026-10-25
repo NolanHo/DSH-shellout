@@ -29,7 +29,8 @@
     "node": ">=22"
   },
   "dependencies": {
-    "dsh-shellout-protocol": "workspace:*"
+    "dsh-shellout-protocol": "workspace:*",
+    "@deepseek-ai/dsh-subprocess": "^0.2.1-rc.2"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.0",
@@ -50,7 +51,6 @@
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.0",
     "@deepseek-ai/dsh-shell": "^0.2.1-rc.2",
-    "@deepseek-ai/dsh-sandbox": "^0.2.1-rc.2",
-    "@deepseek-ai/dsh-subprocess": "^0.2.1-rc.2"
+    "@deepseek-ai/dsh-sandbox": "^0.2.1-rc.2"
   }
 }

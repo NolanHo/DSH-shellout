@@ -9,18 +9,20 @@ import {
   encodeFrame,
   specDigest,
   type Envelope,
-  type ExecSpec,
+  type SpawnSpec,
 } from 'dsh-shellout-protocol'
 import { ExecutionRegistry } from '../src/core/registry.ts'
 import { RunnerServer } from '../src/core/server.ts'
 import { FakeBackend } from './support/fake-backend.ts'
 
-const SPEC: ExecSpec = {
-  command: 'echo hi',
-  workdir: '/tmp',
+const SPEC: SpawnSpec = {
+  argv: ['bash', '-c', 'echo hi'],
+  cwd: '/tmp',
+  env: { PATH: '/usr/bin:/bin' },
   timeoutMs: 1_000,
   onExpiry: 'kill',
-  stdoutMaxBytes: 4_096,
+  graceMs: 3_000,
+  capture: { stdoutMaxBytes: 4_096, stderrMaxBytes: 4_096, spillMaxBytes: 1_048_576, spillDir: '/tmp' },
 }
 
 const cleanups: (() => Promise<void> | void)[] = []
