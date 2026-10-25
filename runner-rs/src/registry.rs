@@ -10,7 +10,7 @@ use tokio::sync::broadcast;
 
 use crate::exec::{self, Counters, Execution};
 use crate::protocol::ExecRequest;
-use crate::shim::Meta;
+use crate::shim::{self, Meta};
 use crate::store::Store;
 
 pub struct Failure {
@@ -37,8 +37,15 @@ pub struct Registry {
     started: Instant,
     store: Option<Arc<Store>>,
     state_dir: PathBuf,
+    state_retention: Duration,
     persistence_error: Mutex<Option<String>>,
 }
+
+/// How long a settled execution's files stay readable after its row is durable,
+/// so a reader that follows the settlement event can still fetch its tail. It
+/// must outlast the host's `disconnectGraceMs`: a host that reconnects inside
+/// its grace still has to be able to read the execution it missed.
+pub const DEFAULT_STATE_RETENTION: Duration = Duration::from_secs(15);
 
 impl Registry {
     #[cfg(test)]
@@ -55,14 +62,31 @@ impl Registry {
             started: Instant::now(),
             store: None,
             state_dir: PathBuf::new(),
+            state_retention: DEFAULT_STATE_RETENTION,
             persistence_error: Mutex::new(None),
         })
     }
+    #[cfg(test)]
     pub fn with_store(
         max_concurrent: usize,
         lease_ttl: Duration,
         store: Option<Arc<Store>>,
         state_dir: PathBuf,
+    ) -> std::io::Result<Arc<Self>> {
+        Self::with_retention(
+            max_concurrent,
+            lease_ttl,
+            store,
+            state_dir,
+            DEFAULT_STATE_RETENTION,
+        )
+    }
+    pub fn with_retention(
+        max_concurrent: usize,
+        lease_ttl: Duration,
+        store: Option<Arc<Store>>,
+        state_dir: PathBuf,
+        state_retention: Duration,
     ) -> std::io::Result<Arc<Self>> {
         std::fs::create_dir_all(&state_dir)?;
         let (events, _) = broadcast::channel(1024);
@@ -77,19 +101,23 @@ impl Registry {
             started: Instant::now(),
             store,
             state_dir,
+            state_retention,
             persistence_error: Mutex::new(None),
         });
         registry.adopt()?;
         Ok(registry)
     }
 
+    /// History is a projection of the state directory: at startup every row
+    /// must match a directory that still exists.
     fn adopt(&self) -> std::io::Result<()> {
+        let store = self.store.clone();
         for entry in std::fs::read_dir(&self.state_dir)? {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
                 continue;
             }
-            match exec::load(entry.path()) {
+            match exec::load(entry.path(), store.as_deref()) {
                 Ok(execution) => {
                     if execution.running() {
                         eprintln!(
@@ -115,7 +143,37 @@ impl Registry {
             }
         }
         self.poll();
+        self.reconcile_history();
         Ok(())
+    }
+
+    /// A `running` row with no execution behind it is a fact, not a guess: the
+    /// state directory it projected is gone, so the row becomes `lost`.
+    fn reconcile_history(&self) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        let running = match store.running_ids() {
+            Ok(ids) => ids,
+            Err(error) => {
+                eprintln!("history: cannot list running rows: {error}");
+                return;
+            }
+        };
+        for id in running {
+            let live = self
+                .executions
+                .lock()
+                .expect("executions poisoned")
+                .get(&id)
+                .is_some_and(|execution| execution.running());
+            if live {
+                continue;
+            }
+            if let Err(error) = store.mark_lost(&id, shim::now_ms()) {
+                eprintln!("execution {id}: cannot mark its history row lost: {error}");
+            }
+        }
     }
 
     pub fn history_health(&self) -> Value {
@@ -181,14 +239,44 @@ impl Registry {
         let _ = self.events.send(event);
     }
 
+    /// Register a host boot and report every execution it still owns, with the
+    /// terminal facts a host needs to settle one whose event it never saw.
     pub fn attach(&self, boot: &str) -> Vec<Value> {
         self.boots
             .lock()
             .expect("boots poisoned")
             .insert(boot.into(), Instant::now() + self.lease_ttl);
-        self.executions.lock().expect("executions poisoned").values()
+        self.executions
+            .lock()
+            .expect("executions poisoned")
+            .values()
             .filter(|execution| execution.meta.boot_id == boot)
-            .map(|execution| json!({"executionId":execution.meta.id,"state":execution.state().state})).collect()
+            .map(|execution| execution.terminal_facts())
+            .collect()
+    }
+
+    /// Re-announce the settlements of one boot whose files are still retained.
+    ///
+    /// A settlement emitted while no connection was subscribed would otherwise
+    /// be lost: the execution is announced once and never again. Only the
+    /// settlements a reconnecting host can still read are repeated, so the
+    /// replay stays proportional to recent work rather than to all history.
+    pub fn replay(&self, boot: &str) {
+        let settled: Vec<Value> = self
+            .executions
+            .lock()
+            .expect("executions poisoned")
+            .values()
+            .filter(|execution| {
+                execution.meta.boot_id == boot
+                    && execution.state().state != "running"
+                    && execution.retained()
+            })
+            .map(|execution| settled_event(execution))
+            .collect();
+        for event in settled {
+            let _ = self.events.send(event);
+        }
     }
 
     pub fn ping(&self, boot: &str) -> Result<(), Failure> {
@@ -258,6 +346,8 @@ impl Registry {
             boot_id: boot.into(),
             spec: request.spec,
         };
+        // A command that could not be started is a preparation failure, so the
+        // reply is an error rather than a handle that fails later.
         let execution = exec::admit(meta, &self.state_dir, store)
             .map_err(|error| Failure::new("rejected", error.to_string()))?;
         self.counters.spawned.fetch_add(1, Ordering::Relaxed);
@@ -302,8 +392,12 @@ impl Registry {
     }
 
     pub fn kill(&self, id: &str) -> Result<Value, Failure> {
+        self.kill_for(id, shim::TERMINATION_REQUEST)
+    }
+
+    fn kill_for(&self, id: &str, reason: &str) -> Result<Value, Failure> {
         Ok(
-            json!({"requested":self.get(id)?.kill().map_err(|error| Failure::new("capture",error.to_string()))?}),
+            json!({"requested":self.get(id)?.kill(reason).map_err(|error| Failure::new("capture",error.to_string()))?}),
         )
     }
 
@@ -314,7 +408,7 @@ impl Registry {
 
     pub fn drain(&self, timeout_ms: u64) -> Value {
         for execution in self.all() {
-            if let Err(error) = execution.kill() {
+            if let Err(error) = execution.kill(shim::TERMINATION_DRAIN) {
                 eprintln!("execution {}: kill failed: {error}", execution.meta.id);
             }
         }
@@ -346,7 +440,7 @@ impl Registry {
                 .into_iter()
                 .filter(|execution| execution.meta.boot_id == boot && execution.running())
             {
-                if let Err(error) = execution.kill() {
+                if let Err(error) = execution.kill(shim::TERMINATION_LEASE) {
                     eprintln!(
                         "execution {}: lease termination failed: {error}",
                         execution.meta.id
@@ -383,18 +477,35 @@ impl Registry {
                     _ => &self.counters.failed,
                 }
                 .fetch_add(1, Ordering::Relaxed);
-                let _ = self.events.send(crate::protocol::event(
-                    "settled",
-                    json!({"executionId":execution.meta.id,
-                    "status":if status.state == "lost" { "failed" } else { &status.state },
-                    "exitCode":status.exit_code,"signal":status.signal,"detail":status.error}),
-                ));
+                let _ = self.events.send(settled_event(&execution));
             }
+            self.retire(&execution);
         }
         *self
             .persistence_error
             .lock()
             .expect("persistence error poisoned") = persistence_error;
+    }
+
+    /// Delete the files of a settled execution once its row is durable and the
+    /// window for a reader following its settlement event has passed.
+    fn retire(&self, execution: &Execution) {
+        if execution.running()
+            || execution.dirty.load(Ordering::Relaxed)
+            || !execution.announced.load(Ordering::Relaxed)
+        {
+            return;
+        }
+        execution.schedule_cleanup(self.state_retention);
+        if !execution.cleanup_due() {
+            return;
+        }
+        if let Err(error) = execution.remove_state() {
+            eprintln!(
+                "execution {}: state cleanup failed: {error}",
+                execution.meta.id
+            );
+        }
     }
 
     fn all(&self) -> Vec<Arc<Execution>> {
@@ -415,6 +526,18 @@ impl Registry {
     }
 }
 
+/// The event a settled execution publishes, once.
+fn settled_event(execution: &Execution) -> Value {
+    let status = execution.state();
+    crate::protocol::event(
+        "settled",
+        json!({"executionId":execution.meta.id,
+            "status":if status.state == "lost" { "failed" } else { &status.state },
+            "exitCode":status.exit_code,"signal":status.signal,
+            "termination":status.termination,"detail":status.error}),
+    )
+}
+
 fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
@@ -428,6 +551,31 @@ fn valid_id(id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shim::{atomic_json, Status};
+    use crate::store::Record;
+
+    fn meta(id: &str, boot: &str, argv: Value) -> Meta {
+        serde_json::from_value(
+            json!({"id":id,"operationId":"op","digest":"d","bootId":boot,
+            "argv":argv,"cwd":"/tmp","env":{},"timeoutMs":100,"onExpiry":"kill","graceMs":10,
+            "capture":{"stdoutMaxBytes":10,"stderrMaxBytes":10,"spillMaxBytes":0,"spillDir":"."}}),
+        )
+        .unwrap()
+    }
+
+    fn terminal_status(exit_code: i32) -> Status {
+        let mut status = Status::admitted(1);
+        status.state = "exited".into();
+        status.pid = Some(1);
+        status.pgid = Some(1);
+        status.process_start_time = Some(1);
+        status.shim_pid = 1;
+        status.shim_start_time = 1;
+        status.finished_at = Some(2);
+        status.exit_code = Some(exit_code);
+        status
+    }
+
     #[test]
     fn admission_store_failure_is_returned_without_spawning() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".test-state/admission-failure");
@@ -456,10 +604,8 @@ mod tests {
         let state = dir.join("state");
         let execution_dir = state.join("starting");
         std::fs::create_dir_all(&execution_dir).unwrap();
-        let meta: Meta = serde_json::from_value(json!({"id":"starting","operationId":"op","digest":"d","bootId":"boot",
-            "argv":["/bin/sh","-c","exit 7"],"cwd":dir,"env":{},"timeoutMs":100,"onExpiry":"kill","graceMs":10,
-            "capture":{"stdoutMaxBytes":10,"stderrMaxBytes":10,"spillMaxBytes":0,"spillDir":state}})).unwrap();
-        crate::shim::atomic_json(&execution_dir.join("meta.json"), &meta).unwrap();
+        let meta = meta("starting", "boot", json!(["/bin/sh", "-c", "exit 7"]));
+        atomic_json(&execution_dir.join("meta.json"), &meta).unwrap();
         let store = Arc::new(Store::open(&dir.join("history.sqlite")).unwrap());
         // Admitted, but the shim has not published its identity yet.
         let registry = Registry::with_store(
@@ -514,9 +660,7 @@ mod tests {
         let state = dir.join("state");
         let execution_dir = state.join("stale");
         std::fs::create_dir_all(&execution_dir).unwrap();
-        let meta: Meta = serde_json::from_value(json!({"id":"stale","operationId":"op","digest":"d","bootId":"boot",
-            "argv":["/bin/sh","-c","exit 0"],"cwd":dir,"env":{},"timeoutMs":100,"onExpiry":"kill","graceMs":10,
-            "capture":{"stdoutMaxBytes":10,"stderrMaxBytes":10,"spillMaxBytes":0,"spillDir":state}})).unwrap();
+        let meta = meta("stale", "boot", json!(["/bin/sh", "-c", "exit 0"]));
         crate::shim::atomic_json(&execution_dir.join("meta.json"), &meta).unwrap();
         // Backdate the admission directory past the startup grace.
         let old =
@@ -545,9 +689,7 @@ mod tests {
         std::fs::create_dir_all(&execution_dir).unwrap();
         let db = dir.join("history.sqlite");
         let store = Arc::new(Store::open(&db).unwrap());
-        let meta: Meta = serde_json::from_value(json!({"id":"retry","operationId":"op","digest":"d","bootId":"boot",
-            "argv":["/bin/sh"],"cwd":dir,"env":{},"timeoutMs":100,"onExpiry":"kill","graceMs":10,
-            "capture":{"stdoutMaxBytes":10,"stderrMaxBytes":10,"spillMaxBytes":0,"spillDir":state}})).unwrap();
+        let meta = meta("retry", "boot", json!(["/bin/sh"]));
         crate::shim::atomic_json(&execution_dir.join("meta.json"), &meta).unwrap();
         crate::shim::atomic_json(&execution_dir.join("status.json"), &json!({"state":"exited","pid":null,"pgid":null,
             "processStartTime":null,"shimPid":0,"shimStartTime":0,"startedAt":1,"finishedAt":2,"exitCode":7,"signal":null,
@@ -571,6 +713,108 @@ mod tests {
         assert_eq!(saved["stdout"], "kept");
         assert_eq!(saved["stdoutTruncated"], true);
         assert_eq!(registry.history_health()["historyWritable"], true);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn attach_reports_the_terminal_facts_the_host_missed() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".test-state/settlement-replay");
+        let state = dir.join("state");
+        let execution_dir = state.join("settled-early");
+        std::fs::create_dir_all(&execution_dir).unwrap();
+        let meta = meta("settled-early", "boot", json!(["/bin/sh", "-c", "exit 5"]));
+        crate::shim::atomic_json(&execution_dir.join("meta.json"), &meta).unwrap();
+        crate::shim::atomic_json(&execution_dir.join("status.json"), &terminal_status(5)).unwrap();
+        let store = Arc::new(Store::open(&dir.join("history.sqlite")).unwrap());
+        // Startup announces the settlement with no connection subscribed.
+        let registry = Registry::with_store(
+            4,
+            Duration::from_secs(60),
+            Some(Arc::clone(&store)),
+            state.clone(),
+        )
+        .unwrap();
+
+        // The facts travel in the hello reply, so a host that never saw the
+        // event can still settle the execution.
+        let rows = registry.attach("boot");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["state"], "exited");
+        assert_eq!(rows[0]["exitCode"], 5);
+        assert_eq!(rows[0]["executionId"], "settled-early");
+
+        // And a connecting host is told again through the event channel.
+        let mut events = registry.subscribe();
+        registry.replay("boot");
+        let event = events.try_recv().expect("replayed settlement");
+        assert_eq!(event["kind"], "evt");
+        assert_eq!(event["method"], "settled");
+        assert_eq!(event["payload"]["executionId"], "settled-early");
+        assert_eq!(event["payload"]["exitCode"], 5);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_running_row_without_a_state_directory_becomes_lost() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".test-state/history-projection");
+        let state = dir.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let store = Arc::new(Store::open(&dir.join("history.sqlite")).unwrap());
+        store
+            .save(&Record {
+                id: "gone".into(),
+                argv: "[\"/bin/sh\"]".into(),
+                cwd: "/tmp".into(),
+                started_at: 10,
+                finished_at: None,
+                state: "running".into(),
+                exit_code: None,
+                signal: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                lossy: false,
+                stdout_lossy: false,
+                stderr_lossy: false,
+                stdout_truncated: false,
+                stderr_truncated: false,
+            })
+            .unwrap();
+        let registry =
+            Registry::with_store(4, Duration::from_secs(60), Some(Arc::clone(&store)), state)
+                .unwrap();
+        assert!(registry.state("gone").is_err());
+        let facts = store.facts("gone").unwrap().unwrap();
+        assert_eq!(facts.state, "lost");
+        assert!(facts.finished_at.is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_settled_execution_keeps_its_row_and_loses_its_directory() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".test-state/retention");
+        let state = dir.join("state");
+        let execution_dir = state.join("done");
+        std::fs::create_dir_all(&execution_dir).unwrap();
+        let meta = meta("done", "boot", json!(["/bin/sh", "-c", "exit 0"]));
+        crate::shim::atomic_json(&execution_dir.join("meta.json"), &meta).unwrap();
+        crate::shim::atomic_json(&execution_dir.join("status.json"), &terminal_status(0)).unwrap();
+        let store = Arc::new(Store::open(&dir.join("history.sqlite")).unwrap());
+        let registry = Registry::with_retention(
+            4,
+            Duration::from_secs(60),
+            Some(Arc::clone(&store)),
+            state.clone(),
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert!(
+            !execution_dir.exists(),
+            "the terminal row replaced the directory"
+        );
+        assert_eq!(store.detail("done").unwrap().unwrap()["exitCode"], 0);
+        // A second pass must not resurrect or rewrite anything.
+        registry.sweep();
+        assert_eq!(store.count().unwrap(), 1);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

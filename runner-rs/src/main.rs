@@ -4,6 +4,7 @@ mod dashboard;
 mod exec;
 mod hub;
 mod legacy;
+mod lock;
 mod protocol;
 mod registry;
 mod server;
@@ -110,6 +111,9 @@ fn main() -> std::io::Result<()> {
             if mode != "executor" {
                 return Err(std::io::Error::other(format!("unknown mode {mode}")));
             }
+            // One executor owns a state directory. Take the claim before the
+            // socket is unlinked, so a refused start leaves the live one intact.
+            let _claim = lock::StateLock::acquire(&paths.state)?;
             let cwd = arg_value("--cwd").unwrap_or(std::env::current_dir()?.display().to_string());
             let config = server::Config {
                 socket_path: paths.socket.clone(),
@@ -132,11 +136,15 @@ fn main() -> std::io::Result<()> {
                     None
                 }
             };
-            let registry = registry::Registry::with_store(
+            let registry = registry::Registry::with_retention(
                 config.max_concurrent,
                 Duration::from_millis(config.lease_ttl_ms),
                 store,
                 paths.state,
+                Duration::from_millis(arg_number(
+                    "--state-retention-ms",
+                    registry::DEFAULT_STATE_RETENTION.as_millis() as u64,
+                )),
             )?;
             eprintln!(
                 "dsh-shellout-runner {} listening on {}",

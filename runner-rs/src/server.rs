@@ -97,9 +97,22 @@ async fn handle_connection(
                     Ok(None) => break,
                     Err(_) => break,
                 };
-                let reply_value = dispatch(envelope, &registry, &config, &mut boot_id, &mut observer, &mut max_frame_bytes);
-                if boot_id.is_some() && events.is_none() {
+                // A hello makes this connection a host. Subscribe before the
+                // reply is built, so a settlement decided during the handshake
+                // is buffered for this connection instead of lost.
+                let hello = envelope.kind == "req" && envelope.method == "hello" && events.is_none();
+                if hello {
                     events = Some(registry.subscribe());
+                }
+                let reply_value = dispatch(envelope, &registry, &config, &mut boot_id, &mut observer, &mut max_frame_bytes);
+                if hello {
+                    match (&reply_value["kind"], boot_id.as_deref()) {
+                        // A settlement decided before this handshake reached no
+                        // subscriber; the reply carries its facts, and the
+                        // recent ones are announced again.
+                        (Value::String(kind), Some(boot)) if kind == "res" => registry.replay(boot),
+                        _ => events = None,
+                    }
                 }
                 write_frame(&mut writer, &reply_value, max_frame_bytes).await?;
             }
@@ -109,8 +122,11 @@ async fn handle_connection(
                     None => std::future::pending().await,
                 }
             } => {
+                // Only a connection that completed a handshake is a host.
                 if let Ok(value) = event_value {
-                    write_frame(&mut writer, &value, max_frame_bytes).await?;
+                    if boot_id.is_some() {
+                        write_frame(&mut writer, &value, max_frame_bytes).await?;
+                    }
                 }
             }
         }

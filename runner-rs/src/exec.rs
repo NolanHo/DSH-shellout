@@ -6,12 +6,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
 use crate::capture;
-use crate::shim::{self, Meta, Status, StreamStatus};
+use crate::shim::{self, Meta, Status};
 use crate::store::{Record, Store};
+
+/// How long `exec` waits for the shim to report that the command started.
+/// A spawn failure is a preparation failure, so it belongs in the exec reply.
+const SPAWN_GRACE: Duration = Duration::from_secs(5);
 
 pub struct Execution {
     pub meta: Meta,
@@ -19,6 +24,8 @@ pub struct Execution {
     status: Mutex<Status>,
     pub dirty: AtomicBool,
     pub announced: AtomicBool,
+    cleanup_at: Mutex<Option<Instant>>,
+    removed: AtomicBool,
 }
 
 #[derive(Default)]
@@ -41,12 +48,14 @@ impl Execution {
         self.state().state == "running"
     }
 
-    pub fn kill(&self) -> io::Result<bool> {
+    /// Ask the shim to terminate the group, naming the asking party so the
+    /// terminal record can say who ended the execution.
+    pub fn kill(&self, reason: &str) -> io::Result<bool> {
         if !self.running() {
             return Ok(false);
         }
         // A durable request, consumed by the shim; executor never owns signals.
-        fs::write(self.dir.join("kill.request"), [])?;
+        fs::write(self.dir.join("kill.request"), reason)?;
         Ok(true)
     }
 
@@ -54,11 +63,11 @@ impl Execution {
         if !self.running() {
             return;
         }
-        let path = self.dir.join("status.json");
-        let mut next = match shim::read_json::<Status>(&path) {
+        let previous = self.state();
+        let next = match shim::read_status(&self.dir) {
             Ok(next) => next,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                if !self.starting() {
+                if !shim::starting(&previous, shim::now_ms()) {
                     self.lose("the shim never published its status");
                 }
                 return;
@@ -68,30 +77,11 @@ impl Execution {
                 return;
             }
         };
-        if next.state == "running" && !shim::is_live(&next) {
-            // Re-read after the liveness check: publication may have raced the
-            // command's exit and removal from /proc.
-            if let Ok(latest) = shim::read_json::<Status>(&path) {
-                next = latest;
-            }
-            if next.state == "running"
-                && !shim::is_live(&next)
-                && !shim::starting(&next, shim::now_ms())
-                && !shim::matches_process(next.shim_pid, next.shim_start_time)
-            {
-                self.lose("the shim process disappeared");
-                return;
-            }
-        }
-        if next.state != "running" {
+        // Only terminal facts belong in history; a running row is already there.
+        if next.state != "running" && next != previous {
             self.dirty.store(true, Ordering::Relaxed);
         }
         *self.status.lock().expect("execution status poisoned") = next;
-    }
-
-    /// A shim has been admitted but has not published its identity yet.
-    fn starting(&self) -> bool {
-        shim::starting(&self.state(), shim::now_ms())
     }
 
     /// Record a fact the shim never published: this execution is lost.
@@ -124,6 +114,16 @@ impl Execution {
             "lossy":status.stdout.lossy || status.stderr.lossy,
             "stdoutLossy":status.stdout.lossy,"stderrLossy":status.stderr.lossy,
             "stdoutTruncated":status.stdout.truncated,"stderrTruncated":status.stderr.truncated})
+    }
+
+    /// Terminal facts other processes need to settle this execution without an
+    /// event: whether it still runs, and how it ended.
+    pub fn terminal_facts(&self) -> Value {
+        let status = self.state();
+        json!({"executionId":self.meta.id,"state":status.state,
+            "exitCode":status.exit_code,"signal":status.signal,
+            "termination":status.termination,
+            "detail":status.error})
     }
 
     pub fn read_stream(&self, stream: &str, offset: u64, limit: usize) -> io::Result<Value> {
@@ -196,33 +196,56 @@ impl Execution {
         self.dirty.store(false, Ordering::Relaxed);
         Ok(())
     }
+
+    /// Delete the execution's files once its terminal row is durable and the
+    /// reads that follow a settlement had their window.
+    pub fn schedule_cleanup(&self, retention: Duration) {
+        let mut at = self.cleanup_at.lock().expect("cleanup poisoned");
+        if at.is_none() {
+            *at = Some(Instant::now() + retention);
+        }
+    }
+
+    pub fn cleanup_due(&self) -> bool {
+        self.cleanup_at
+            .lock()
+            .expect("cleanup poisoned")
+            .is_some_and(|at| at <= Instant::now())
+    }
+
+    /// True while the files a settlement refers to are still readable.
+    pub fn retained(&self) -> bool {
+        self.cleanup_at.lock().expect("cleanup poisoned").is_some()
+            && !self.removed.load(Ordering::Relaxed)
+    }
+
+    pub fn remove_state(&self) -> io::Result<()> {
+        if self.removed.swap(true, Ordering::Relaxed) {
+            return Ok(());
+        }
+        match fs::remove_dir_all(&self.dir) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => {
+                self.removed.store(false, Ordering::Relaxed);
+                Err(error)
+            }
+        }
+    }
 }
 
 pub fn admit(meta: Meta, state: &Path, store: &Store) -> io::Result<Arc<Execution>> {
     let dir = state.join(&meta.id);
     fs::create_dir(&dir)?;
     shim::atomic_json(&dir.join("meta.json"), &meta)?;
-    let status = Status {
-        state: "running".into(),
-        pid: None,
-        pgid: None,
-        process_start_time: None,
-        shim_pid: 0,
-        shim_start_time: 0,
-        started_at: shim::now_ms(),
-        finished_at: None,
-        exit_code: None,
-        signal: None,
-        stdout: StreamStatus::default(),
-        stderr: StreamStatus::default(),
-        error: None,
-    };
     let execution = Arc::new(Execution {
         meta,
         dir,
-        status: Mutex::new(status),
+        status: Mutex::new(Status::admitted(shim::now_ms())),
         dirty: AtomicBool::new(false),
         announced: AtomicBool::new(false),
+        cleanup_at: Mutex::new(None),
+        removed: AtomicBool::new(false),
     });
     if let Err(error) = execution.persist(store) {
         // No child has been spawned. Remove only the admission metadata we own
@@ -261,15 +284,65 @@ pub fn admit(meta: Meta, state: &Path, store: &Store) -> io::Result<Arc<Executio
             });
         }
         Err(error) => {
-            let mut status = execution.status.lock().expect("execution status poisoned");
-            status.state = "failed".into();
-            status.finished_at = Some(shim::now_ms());
-            status.error = Some(error.to_string());
-            shim::atomic_json(&execution.dir.join("status.json"), &*status)?;
-            execution.dirty.store(true, Ordering::Relaxed);
+            let message = persist_failure(&execution, store, &error.to_string());
+            let _ = fs::remove_dir_all(&execution.dir);
+            return Err(io::Error::other(message));
         }
     }
+    execution.await_spawn(store)?;
     Ok(execution)
+}
+
+/// Record a shim that never started as a settled failure, then report it.
+fn persist_failure(execution: &Execution, store: &Store, error: &str) -> String {
+    {
+        let mut status = execution.status.lock().expect("execution status poisoned");
+        status.state = "failed".into();
+        status.finished_at = Some(shim::now_ms());
+        status.error = Some(error.into());
+        status.spawn_error = Some(error.into());
+    }
+    execution.dirty.store(true, Ordering::Relaxed);
+    match execution.persist(store) {
+        Ok(()) => format!("cannot start execution: {error}"),
+        Err(persist) => format!("cannot start execution: {error} (history: {persist})"),
+    }
+}
+
+impl Execution {
+    /// The command is spawned by the shim, so the admission result is the
+    /// shim's report: a recorded pid, or why it could not start one.
+    fn await_spawn(&self, store: &Store) -> io::Result<()> {
+        let path = self.dir.join("status.json");
+        let deadline = Instant::now() + SPAWN_GRACE;
+        loop {
+            match shim::read_json::<Status>(&path) {
+                Ok(status) => {
+                    if status.spawn_error.is_some() {
+                        let message = persist_failure(
+                            self,
+                            store,
+                            status.spawn_error.as_deref().unwrap_or("spawn failed"),
+                        );
+                        let _ = fs::remove_dir_all(&self.dir);
+                        return Err(io::Error::other(message));
+                    }
+                    if status.pid.is_some() {
+                        return Ok(());
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => eprintln!("execution {}: status read failed: {error}", self.meta.id),
+            }
+            if Instant::now() >= deadline {
+                // Nothing is known about the command; make sure it cannot keep
+                // running unattended while the caller is told admission failed.
+                let _ = fs::write(self.dir.join("kill.request"), shim::TERMINATION_REQUEST);
+                return Err(io::Error::other("the shim did not report a spawn outcome"));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 }
 
 /// An admitted execution whose shim has not published a status yet. The shim
@@ -281,59 +354,49 @@ fn unpublished(dir: &Path) -> Status {
         .ok()
         .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or_else(shim::now_ms, |elapsed| elapsed.as_millis() as u64);
-    Status {
-        state: "running".into(),
-        pid: None,
-        pgid: None,
-        process_start_time: None,
-        shim_pid: 0,
-        shim_start_time: 0,
-        started_at,
-        finished_at: None,
-        exit_code: None,
-        signal: None,
-        stdout: StreamStatus::default(),
-        stderr: StreamStatus::default(),
-        error: None,
+    Status::admitted(started_at)
+}
+
+/// Only a terminal fact the row does not carry yet needs a rewrite: restarting
+/// the executor must not rewrite the whole history.
+fn needs_persist(store: Option<&Store>, id: &str, status: &Status) -> bool {
+    let Some(store) = store else {
+        return true;
+    };
+    match store.facts(id) {
+        Ok(Some(facts)) => {
+            facts.state != status.state
+                || facts.exit_code != status.exit_code.map(i64::from)
+                || facts.signal != status.signal.map(i64::from)
+                || facts.finished_at != status.finished_at.map(|at| at as i64)
+        }
+        Ok(None) => true,
+        Err(error) => {
+            eprintln!("execution {id}: history lookup failed: {error}");
+            true
+        }
     }
 }
 
-pub fn load(dir: PathBuf) -> io::Result<Arc<Execution>> {
+pub fn load(dir: PathBuf, store: Option<&Store>) -> io::Result<Arc<Execution>> {
     let meta: Meta = shim::read_json(&dir.join("meta.json"))?;
-    let mut status: Status = match shim::read_json(&dir.join("status.json")) {
+    let status = match shim::read_status(&dir) {
         Ok(status) => status,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => unpublished(&dir),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut status = unpublished(&dir);
+            shim::reconcile(&mut status, shim::now_ms());
+            status
+        }
         Err(error) => return Err(error),
     };
-    if status.state == "running"
-        && !shim::is_live(&status)
-        && !shim::starting(&status, shim::now_ms())
-    {
-        // Re-read once: publication may have raced the command's exit.
-        if let Ok(latest) = shim::read_json::<Status>(&dir.join("status.json")) {
-            status = latest;
-        }
-        if status.state == "running"
-            && !shim::is_live(&status)
-            && !shim::starting(&status, shim::now_ms())
-        {
-            status.error = Some(
-                if status.shim_pid == 0 {
-                    "the shim never published its status"
-                } else {
-                    "recorded process identity no longer exists"
-                }
-                .into(),
-            );
-            status.state = "lost".into();
-            status.finished_at = Some(shim::now_ms());
-        }
-    }
+    let dirty = needs_persist(store, &meta.id, &status);
     Ok(Arc::new(Execution {
         meta,
         dir,
         status: Mutex::new(status),
-        dirty: AtomicBool::new(true),
+        dirty: AtomicBool::new(dirty),
         announced: AtomicBool::new(false),
+        cleanup_at: Mutex::new(None),
+        removed: AtomicBool::new(false),
     }))
 }

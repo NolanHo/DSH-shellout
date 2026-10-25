@@ -11,6 +11,15 @@ const MAX_RECENT_ROWS: usize = 50;
 const SUMMARY_BYTES: usize = 5 * 1024;
 const RECENT_BYTES: usize = 256 * 1024;
 
+/// The state-relevant facts of one persisted row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Facts {
+    pub state: String,
+    pub exit_code: Option<i64>,
+    pub signal: Option<i64>,
+    pub finished_at: Option<i64>,
+}
+
 /// One persisted execution.
 pub struct Record {
     pub id: String,
@@ -114,7 +123,11 @@ impl Store {
         })
     }
 
-    /// Insert or update one execution, reporting every write failure.
+    /// Insert one execution, or advance a `running` row to its terminal facts.
+    ///
+    /// The state machine is one-way: a row is born `running` and only the
+    /// transition out of `running` is ever written. A terminal row is final, so
+    /// a late or repeated save can never regress it.
     pub fn save(&self, record: &Record) -> Result<(), String> {
         let result = (|| {
             let connection = self.connection.lock().map_err(|error| error.to_string())?;
@@ -129,7 +142,8 @@ impl Store {
                    exit_code=excluded.exit_code, signal=excluded.signal,
                    stdout=excluded.stdout, stderr=excluded.stderr, lossy=excluded.lossy,
                    stdout_lossy=excluded.stdout_lossy, stderr_lossy=excluded.stderr_lossy,
-                   stdout_truncated=excluded.stdout_truncated, stderr_truncated=excluded.stderr_truncated",
+                   stdout_truncated=excluded.stdout_truncated, stderr_truncated=excluded.stderr_truncated
+                 WHERE executions.state = 'running'",
                 params![
                     record.id, record.argv, record.cwd, record.started_at,
                     record.finished_at, record.state, record.exit_code, record.signal,
@@ -145,6 +159,56 @@ impl Store {
             .map_err(|error| error.to_string())?;
         health.error = result.as_ref().err().cloned();
         result
+    }
+
+    /// State-relevant facts of one row, without loading its output.
+    pub fn facts(&self, id: &str) -> Result<Option<Facts>, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let mut statement = connection
+            .prepare("SELECT state, exit_code, signal, finished_at FROM executions WHERE id = ?1")
+            .map_err(|error| error.to_string())?;
+        let mut rows = statement
+            .query(params![id])
+            .map_err(|error| error.to_string())?;
+        let Some(row) = rows.next().map_err(|error| error.to_string())? else {
+            return Ok(None);
+        };
+        Ok(Some(Facts {
+            state: row.get(0).map_err(|error| error.to_string())?,
+            exit_code: row.get(1).map_err(|error| error.to_string())?,
+            signal: row.get(2).map_err(|error| error.to_string())?,
+            finished_at: row.get(3).map_err(|error| error.to_string())?,
+        }))
+    }
+
+    /// Every row still recorded as `running`; startup reconciles them against
+    /// the state directory.
+    pub fn running_ids(&self) -> Result<Vec<String>, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        let mut statement = connection
+            .prepare("SELECT id FROM executions WHERE state = 'running'")
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        let mut ids = Vec::new();
+        for id in rows {
+            ids.push(id.map_err(|error| error.to_string())?);
+        }
+        Ok(ids)
+    }
+
+    /// Advance a `running` row to `lost`. A terminal row is never touched.
+    pub fn mark_lost(&self, id: &str, at_ms: u64) -> Result<(), String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        connection
+            .execute(
+                "UPDATE executions SET state = 'lost', finished_at = ?2
+                 WHERE id = ?1 AND state = 'running'",
+                params![id, at_ms as i64],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     /// Writer availability and the last write failure (cleared by a successful save).
