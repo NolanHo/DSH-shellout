@@ -218,6 +218,57 @@ fn a_shim_does_not_run_a_command_the_executor_rejected() {
     );
 }
 
+/// Retention deletes the execution directory while its shim is still
+/// finishing. The shim must exit instead of retrying a write that can never
+/// succeed, or every test run leaks one supervisor process.
+#[test]
+fn a_shim_exits_when_its_state_directory_disappears() {
+    let scratch = Scratch::new("vanished");
+    let state = scratch.state();
+    write_meta(
+        &state,
+        "vanished",
+        json!({
+            "argv": ["/bin/sh", "-c", "sleep 1; exit 0"],
+            "cwd": scratch.root,
+            "env": {"PATH": "/usr/bin:/bin"},
+            "timeoutMs": 10_000,
+            "onExpiry": "kill",
+            "graceMs": 100,
+            "capture": {"stdoutMaxBytes": 64_000, "stderrMaxBytes": 64_000,
+                "spillMaxBytes": 1_048_576, "spillDir": "/tmp"},
+        }),
+    );
+    let mut shim = spawn_shim(&state, "vanished");
+    until(
+        || status_of(&state, "vanished").filter(|status| status["pid"].as_i64().is_some()),
+        Duration::from_secs(5),
+        "command running",
+    );
+    std::fs::remove_dir_all(state.join("vanished")).expect("the executor deleted the execution");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut exit = None;
+    while Instant::now() < deadline {
+        exit = shim.try_wait().expect("shim polled");
+        if exit.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    if exit.is_none() {
+        let _ = shim.kill();
+        let _ = shim.wait();
+    } else {
+        // `try_wait` already reaped it; this releases the cached status.
+        let _ = shim.wait();
+    }
+    assert!(
+        exit.is_some(),
+        "the shim kept spinning after its state directory disappeared"
+    );
+}
+
 #[test]
 fn a_termination_request_records_the_party_that_asked() {
     let scratch = Scratch::new("term");

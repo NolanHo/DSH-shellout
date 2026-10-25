@@ -425,10 +425,13 @@ pub fn run(state: &Path, id: &str) -> io::Result<()> {
     if let Err(error) = atomic_json(&dir.join("meta.json"), &meta) {
         eprintln!("shim {id}: meta scrub failed: {error}");
     }
-    // Never exit before terminal facts are published, including temporary I/O failures.
+    // Never exit before terminal facts are published, including temporary I/O
+    // failures. A missing state directory is permanent: the executor already
+    // deleted this execution, so spinning here would leak a process per run.
     loop {
         match atomic_json(&dir.join("status.json"), &status) {
             Ok(()) => break,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return result,
             Err(error) => {
                 eprintln!("shim {id}: terminal status write failed: {error}");
                 thread::sleep(Duration::from_millis(250));
