@@ -126,6 +126,24 @@ describe('ShelloutClient + RemoteExecution', () => {
     expect(execution.readStream('stdout', first.nextOffset, 1024).text).toBe('中\nok\n')
   })
 
+  it('drains a large non-ASCII stream completely before settling', async () => {
+    const { backend, client } = await harness()
+    const execution = new RemoteExecution(client, 'e1', { pollMs: 20, chunkBytes: 300 })
+    client.onSettled(event => { execution.receive(event) })
+    await client.request('exec', { operationId: 'op1', executionId: 'e1', spec: SPEC, specDigest: specDigest(SPEC) })
+    // 900 bytes but only 300 UTF-16 code units: a decoded-length comparison
+    // against a byte budget declares the stream exhausted after the first read.
+    const text = '中'.repeat(300)
+    backend.executions[0]?.append('stdout', text)
+    backend.executions[0]?.complete(0)
+    // The settlement event is already known when the first poll runs, so the
+    // final drain is the only chance to read the tail.
+    await new Promise(resolve => { setTimeout(resolve, 60) })
+    execution.start()
+    await execution.done
+    expect(execution.readOutput().delta).toBe(text)
+  })
+
   it('reports loss below the retained window', async () => {
     const { backend, client } = await harness()
     const execution = new RemoteExecution(client, 'e1', { pollMs: 20, retainBytes: 4 })

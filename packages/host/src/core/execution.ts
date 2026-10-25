@@ -292,17 +292,21 @@ export class RemoteExecution {
     for (const stream of ['stdout', 'stderr'] as const) {
       for (;;) {
         const buffer = this.buffers[stream]
+        const offset = buffer.end
         const read = await this.client.request<StreamRead>('readStream', {
           executionId: this.executionId,
           stream,
-          offset: buffer.end,
+          offset,
           limit: this.options.chunkBytes,
         })
         if (read.spillPath !== undefined) buffer.spillPath = read.spillPath
         if (read.lossy) buffer.lossy = true
-        if (read.text.length === 0) break
+        // Only an empty read proves the stream is exhausted: `chunkBytes` is a
+        // byte budget, while `text.length` counts UTF-16 code units, so a full
+        // byte chunk of non-ASCII text is shorter decoded. A read that consumed
+        // no bytes cannot make progress either.
+        if (read.text.length === 0 || read.nextOffset <= offset) break
         this.append(stream, read.text, read.nextOffset)
-        if (read.text.length < this.options.chunkBytes) break
       }
     }
   }
