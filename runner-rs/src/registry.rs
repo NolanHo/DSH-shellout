@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
-use crate::exec::{spawn_execution, Execution};
+use crate::exec::{spawn_execution, Counters, Execution};
 use crate::protocol::ExecRequest;
 
 /// Admission or lookup failure carrying a wire error code.
@@ -32,6 +32,8 @@ pub struct Registry {
     events: broadcast::Sender<Value>,
     max_concurrent: usize,
     lease_ttl: Duration,
+    counters: Arc<Counters>,
+    started: Instant,
 }
 
 impl Registry {
@@ -45,8 +47,47 @@ impl Registry {
             events,
             max_concurrent,
             lease_ttl,
+            counters: Arc::new(Counters::default()),
+            started: Instant::now(),
         });
         (registry, receiver)
+    }
+
+    /// Snapshot for the dashboard.
+    pub fn stats(&self) -> Value {
+        let executions: Vec<Value> = self
+            .executions
+            .lock()
+            .map(|guard| {
+                guard
+                    .values()
+                    .filter(|execution| execution.state().running)
+                    .map(|execution| {
+                        json!({
+                            "id": execution.id,
+                            "command": execution.program,
+                            "state": "running",
+                            "ageMs": execution.started.elapsed().as_millis() as u64,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let leases = self.boots.lock().map(|boots| boots.len()).unwrap_or(0);
+        json!({
+            "version": format!("rust-{}", env!("CARGO_PKG_VERSION")),
+            "protocols": ["1.0", "2.0"],
+            "pid": std::process::id(),
+            "uptimeMs": self.started.elapsed().as_millis() as u64,
+            "live": executions.len(),
+            "spawned": self.counters.spawned.load(std::sync::atomic::Ordering::Relaxed),
+            "settled": self.counters.settled.load(std::sync::atomic::Ordering::Relaxed),
+            "killed": self.counters.killed.load(std::sync::atomic::Ordering::Relaxed),
+            "failed": self.counters.failed.load(std::sync::atomic::Ordering::Relaxed),
+            "leases": leases,
+            "maxConcurrent": self.max_concurrent,
+            "executions": executions,
+        })
     }
 
     /// Subscribe to settlement events.
@@ -112,6 +153,7 @@ impl Registry {
             request.spec_digest.clone(),
             boot_id.to_string(),
             self.events.clone(),
+            Arc::clone(&self.counters),
         )
         .map_err(|error| Failure::new("rejected", format!("spawn failed: {error}")))?;
         if let Ok(mut executions) = self.executions.lock() {

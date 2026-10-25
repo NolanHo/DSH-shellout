@@ -4,7 +4,9 @@
 //! connects to. It holds no sessions, no model connection and no web surface.
 
 mod capture;
+mod dashboard;
 mod exec;
+mod legacy;
 mod protocol;
 mod registry;
 mod server;
@@ -53,12 +55,26 @@ async fn main() -> std::io::Result<()> {
         timeout_ms: arg_number("--timeout-ms", 120_000),
         max_timeout_ms: arg_number("--max-timeout-ms", 600_000),
         max_output_bytes: arg_number("--max-output-bytes", 64_000) as usize,
+        spill_dir: std::env::temp_dir().display().to_string(),
     };
+    let dashboard_address = arg_value("--dashboard")
+        .or_else(|| std::env::var("DSH_SHELLOUT_DASHBOARD").ok())
+        .unwrap_or_default();
 
     eprintln!("dsh-shellout-runner {} listening on {}", env!("CARGO_PKG_VERSION"), socket_path);
 
+    let (registry, _events) = registry::Registry::new(
+        config.max_concurrent,
+        Duration::from_millis(config.lease_ttl_ms),
+    );
+    if !dashboard_address.is_empty() {
+        let registry = std::sync::Arc::clone(&registry);
+        tokio::spawn(async move {
+            let _ = dashboard::serve(dashboard_address, registry).await;
+        });
+    }
     tokio::select! {
-        result = server::serve(config) => result,
+        result = server::serve(config, registry) => result,
         _ = shutdown_signal() => {
             // A supervisor stop: give live executions a short window to end.
             tokio::time::sleep(Duration::from_millis(200)).await;

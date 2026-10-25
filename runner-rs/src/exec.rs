@@ -4,10 +4,10 @@
 use std::io::{Read, Write};
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 use tokio::sync::broadcast;
@@ -44,6 +44,10 @@ pub struct Execution {
     pub digest: String,
     /// Host boot that owns this execution.
     pub boot_id: String,
+    /// `argv[0]` for the dashboard.
+    pub program: String,
+    /// When the process was created.
+    pub started: Instant,
     /// Captured stdout.
     pub stdout: Arc<Mutex<CaptureState>>,
     /// Captured stderr.
@@ -53,6 +57,19 @@ pub struct Execution {
     killed_by_request: Arc<AtomicBool>,
     pid: Arc<Mutex<Option<i32>>>,
     grace_ms: u64,
+}
+
+/// Totals the dashboard reports.
+#[derive(Default)]
+pub struct Counters {
+    /// Spawns that reached the operating system.
+    pub spawned: AtomicU64,
+    /// Executions that exited on their own.
+    pub settled: AtomicU64,
+    /// Executions terminated by a request or the deadline.
+    pub killed: AtomicU64,
+    /// Executions that failed after admission.
+    pub failed: AtomicU64,
 }
 
 impl Execution {
@@ -117,6 +134,7 @@ pub fn spawn_execution(
     digest: String,
     boot_id: String,
     events: broadcast::Sender<serde_json::Value>,
+    counters: Arc<Counters>,
 ) -> std::io::Result<Arc<Execution>> {
     let mut command = Command::new(&spec.argv[0]);
     command
@@ -168,8 +186,11 @@ pub fn spawn_execution(
     let stdout_reader = pump(child.stdout.take(), Arc::clone(&stdout));
     let stderr_reader = pump(child.stderr.take(), Arc::clone(&stderr));
 
+    counters.spawned.fetch_add(1, Ordering::Relaxed);
     let execution = Arc::new(Execution {
         id: execution_id.clone(),
+        program: spec.argv.first().cloned().unwrap_or_default(),
+        started: Instant::now(),
         operation_id,
         digest,
         boot_id: boot_id.clone(),
@@ -217,6 +238,13 @@ pub fn spawn_execution(
             *guard = None;
         }
         let status = if killed { "killed" } else { "exited" };
+        if killed {
+            counters.killed.fetch_add(1, Ordering::Relaxed);
+        } else if exit_code == Some(0) {
+            counters.settled.fetch_add(1, Ordering::Relaxed);
+        } else {
+            counters.failed.fetch_add(1, Ordering::Relaxed);
+        }
         let _ = events.send(crate::protocol::event(
             "settled",
             json!({

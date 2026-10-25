@@ -8,10 +8,14 @@ use serde_json::{json, Value};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::broadcast;
 
+use crate::legacy::{is_legacy, to_spawn_spec, LegacyExecRequest};
 use crate::protocol::{
     error_reply, event, read_frame, reply, write_frame, DrainRequest, Envelope, ExecRequest, ExecutionRef,
-    HelloRequest, PingRequest, ReadStreamRequest, PROTOCOL_VERSION,
+    HelloRequest, PingRequest, ReadStreamRequest,
 };
+
+/// Revisions this runner accepts: the current one and its predecessor.
+const SUPPORTED_PROTOCOLS: [&str; 2] = ["2.0", "1.0"];
 use crate::registry::Registry;
 
 /// Server configuration.
@@ -33,10 +37,19 @@ pub struct Config {
     pub max_timeout_ms: u64,
     /// stdout capture cap reported to the host.
     pub max_output_bytes: usize,
+    /// Directory legacy requests spill into.
+    pub spill_dir: String,
+}
+
+impl Config {
+    /// Directory legacy (protocol 1.0) requests spill into.
+    fn spill_dir(&self) -> String {
+        self.spill_dir.clone()
+    }
 }
 
 /// Run the accept loop until the process is told to stop.
-pub async fn serve(config: Config) -> std::io::Result<()> {
+pub async fn serve(config: Config, registry: Arc<Registry>) -> std::io::Result<()> {
     let path = Path::new(&config.socket_path);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -45,10 +58,6 @@ pub async fn serve(config: Config) -> std::io::Result<()> {
     let listener = UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
 
-    let (registry, _) = Registry::new(
-        config.max_concurrent,
-        std::time::Duration::from_millis(config.lease_ttl_ms),
-    );
     let sweeper = Arc::clone(&registry);
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(500));
@@ -109,11 +118,15 @@ fn dispatch(
                 Ok(request) => request,
                 Err(error) => return error_reply(id, "protocol", &format!("bad hello: {error}")),
             };
-            if request.protocol != PROTOCOL_VERSION {
+            if !SUPPORTED_PROTOCOLS.contains(&request.protocol.as_str()) {
                 return error_reply(
                     id,
                     "version",
-                    &format!("protocol {} is not supported; this runner speaks {PROTOCOL_VERSION}", request.protocol),
+                    &format!(
+                        "protocol {} is not supported; this runner speaks {}",
+                        request.protocol,
+                        SUPPORTED_PROTOCOLS.join(", ")
+                    ),
                 );
             }
             if let Some(host_max) = request.max_frame_bytes {
@@ -122,7 +135,7 @@ fn dispatch(
             *boot_id = Some(request.boot_id.clone());
             let executions = registry.attach(&request.boot_id);
             reply(id, "hello", json!({
-                "protocol": PROTOCOL_VERSION,
+                "protocol": request.protocol,
                 "runnerBuild": format!("rust-{}", env!("CARGO_PKG_VERSION")),
                 "runnerBootId": std::process::id().to_string(),
                 "descriptor": {
@@ -152,9 +165,21 @@ fn dispatch(
                 Some(boot) => boot.clone(),
                 None => return error_reply(id, "protocol", "hello must precede this request"),
             };
-            let request: ExecRequest = match serde_json::from_value(envelope.payload) {
+            let request = match if is_legacy(&envelope.payload) {
+                serde_json::from_value::<LegacyExecRequest>(envelope.payload.clone())
+                    .map(|legacy| ExecRequest {
+                        operation_id: legacy.operation_id,
+                        execution_id: legacy.execution_id,
+                        spec_digest: legacy.spec_digest,
+                        spec: to_spawn_spec(legacy.spec, 3_000, 64 * 1024 * 1024, &config.spill_dir()),
+                    })
+                    .map_err(|error| format!("bad exec: {error}"))
+            } else {
+                serde_json::from_value::<ExecRequest>(envelope.payload.clone())
+                    .map_err(|error| format!("bad exec: {error}"))
+            } {
                 Ok(request) => request,
-                Err(error) => return error_reply(id, "protocol", &format!("bad exec: {error}")),
+                Err(message) => return error_reply(id, "protocol", &message),
             };
             match registry.exec(request, &boot) {
                 Ok(value) => reply(id, "exec", value),
