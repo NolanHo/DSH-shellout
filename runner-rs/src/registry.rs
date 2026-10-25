@@ -451,6 +451,93 @@ mod tests {
     }
 
     #[test]
+    fn an_unpublished_shim_is_adopted_and_settles_from_its_status() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".test-state/unpublished-adoption");
+        let state = dir.join("state");
+        let execution_dir = state.join("starting");
+        std::fs::create_dir_all(&execution_dir).unwrap();
+        let meta: Meta = serde_json::from_value(json!({"id":"starting","operationId":"op","digest":"d","bootId":"boot",
+            "argv":["/bin/sh","-c","exit 7"],"cwd":dir,"env":{},"timeoutMs":100,"onExpiry":"kill","graceMs":10,
+            "capture":{"stdoutMaxBytes":10,"stderrMaxBytes":10,"spillMaxBytes":0,"spillDir":state}})).unwrap();
+        crate::shim::atomic_json(&execution_dir.join("meta.json"), &meta).unwrap();
+        let store = Arc::new(Store::open(&dir.join("history.sqlite")).unwrap());
+        // Admitted, but the shim has not published its identity yet.
+        let registry = Registry::with_store(
+            4,
+            Duration::from_secs(60),
+            Some(Arc::clone(&store)),
+            state.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            registry
+                .state("starting")
+                .unwrap_or_else(|_| panic!("an unpublished shim is adopted"))["state"],
+            "running"
+        );
+
+        // This process stands in for both the shim and its command.
+        let pid = std::process::id() as i32;
+        let start = crate::shim::process_start_time(pid).unwrap();
+        let published = |state: &str, finished: Value, exit: Value| {
+            json!({"state":state,"pid":pid,"pgid":pid,"processStartTime":start,
+                "shimPid":pid,"shimStartTime":start,"startedAt":1,"finishedAt":finished,
+                "exitCode":exit,"signal":null,
+                "stdout":{"bytes":0,"lossy":false,"truncated":false},
+                "stderr":{"bytes":0,"lossy":false,"truncated":false},"error":null})
+        };
+        let status = execution_dir.join("status.json");
+        crate::shim::atomic_json(&status, &published("running", Value::Null, Value::Null)).unwrap();
+        registry.sweep();
+        assert_eq!(
+            registry
+                .state("starting")
+                .unwrap_or_else(|_| panic!("running"))["state"],
+            "running"
+        );
+
+        crate::shim::atomic_json(&status, &published("exited", json!(2), json!(7))).unwrap();
+        registry.sweep();
+        assert_eq!(
+            registry
+                .state("starting")
+                .unwrap_or_else(|_| panic!("settled"))["exitCode"],
+            7
+        );
+        assert_eq!(store.detail("starting").unwrap().unwrap()["exitCode"], 7);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_unpublished_shim_older_than_the_grace_is_lost() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".test-state/unpublished-stale");
+        let state = dir.join("state");
+        let execution_dir = state.join("stale");
+        std::fs::create_dir_all(&execution_dir).unwrap();
+        let meta: Meta = serde_json::from_value(json!({"id":"stale","operationId":"op","digest":"d","bootId":"boot",
+            "argv":["/bin/sh","-c","exit 0"],"cwd":dir,"env":{},"timeoutMs":100,"onExpiry":"kill","graceMs":10,
+            "capture":{"stdoutMaxBytes":10,"stderrMaxBytes":10,"spillMaxBytes":0,"spillDir":state}})).unwrap();
+        crate::shim::atomic_json(&execution_dir.join("meta.json"), &meta).unwrap();
+        // Backdate the admission directory past the startup grace.
+        let old =
+            std::time::SystemTime::now() - Duration::from_millis(crate::shim::STARTUP_GRACE_MS * 2);
+        std::fs::File::open(&execution_dir)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let store = Arc::new(Store::open(&dir.join("history.sqlite")).unwrap());
+        let registry =
+            Registry::with_store(4, Duration::from_secs(60), Some(Arc::clone(&store)), state)
+                .unwrap();
+        assert_eq!(
+            registry.state("stale").unwrap_or_else(|_| panic!("loaded"))["state"],
+            "lost"
+        );
+        assert_eq!(store.detail("stale").unwrap().unwrap()["state"], "lost");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn failed_settlement_is_retained_and_retried() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".test-state/settlement-retry");
         let state = dir.join("state");

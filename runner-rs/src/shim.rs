@@ -91,9 +91,19 @@ pub fn matches_process(pid: i32, start: u64) -> bool {
     process_start_time(pid).is_ok_and(|actual| actual == start)
 }
 
+/// A shim publishes its identity as its first act. Until it does, an execution
+/// has no recorded process to verify, so it is neither live nor lost.
+pub const STARTUP_GRACE_MS: u64 = 10_000;
+
 pub fn is_live(status: &Status) -> bool {
     matches_process(status.shim_pid, status.shim_start_time)
         && matches!((status.pid, status.process_start_time), (Some(pid), Some(start)) if matches_process(pid, start))
+}
+
+pub fn starting(status: &Status, now: u64) -> bool {
+    status.state == "running"
+        && status.shim_pid == 0
+        && now < status.started_at.saturating_add(STARTUP_GRACE_MS)
 }
 
 fn signal_group(pgid: i32, signal: i32) {
@@ -327,6 +337,30 @@ mod tests {
         assert!(matches_process(pid, start));
         assert!(!matches_process(pid, start + 1));
         assert!(!matches_process(i32::MAX, start));
+    }
+
+    #[test]
+    fn an_unpublished_shim_is_only_lost_after_the_grace() {
+        let mut status = Status {
+            state: "running".into(),
+            pid: None,
+            pgid: None,
+            process_start_time: None,
+            shim_pid: 0,
+            shim_start_time: 0,
+            started_at: 1_000,
+            finished_at: None,
+            exit_code: None,
+            signal: None,
+            stdout: StreamStatus::default(),
+            stderr: StreamStatus::default(),
+            error: None,
+        };
+        assert!(starting(&status, 1_000 + STARTUP_GRACE_MS - 1));
+        assert!(!starting(&status, 1_000 + STARTUP_GRACE_MS));
+        status.shim_pid = 42;
+        status.shim_start_time = 7;
+        assert!(!starting(&status, 1_000));
     }
 
     #[test]

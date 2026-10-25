@@ -54,29 +54,53 @@ impl Execution {
         if !self.running() {
             return;
         }
-        match shim::read_json::<Status>(&self.dir.join("status.json")) {
-            Ok(mut next) => {
-                if next.state == "running" && !shim::is_live(&next) {
-                    // Re-read after the liveness check: publication may have
-                    // raced the command's exit and removal from /proc.
-                    if let Ok(latest) = shim::read_json::<Status>(&self.dir.join("status.json")) {
-                        next = latest;
-                    }
-                    if next.state == "running"
-                        && !shim::matches_process(next.shim_pid, next.shim_start_time)
-                    {
-                        next.state = "lost".into();
-                        next.finished_at = Some(shim::now_ms());
-                        next.error = Some("shim process disappeared".into());
-                    }
+        let path = self.dir.join("status.json");
+        let mut next = match shim::read_json::<Status>(&path) {
+            Ok(next) => next,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if !self.starting() {
+                    self.lose("the shim never published its status");
                 }
-                if next.state != "running" {
-                    self.dirty.store(true, Ordering::Relaxed);
-                }
-                *self.status.lock().expect("execution status poisoned") = next;
+                return;
             }
-            Err(error) => eprintln!("execution {}: status read failed: {error}", self.meta.id),
+            Err(error) => {
+                eprintln!("execution {}: status read failed: {error}", self.meta.id);
+                return;
+            }
+        };
+        if next.state == "running" && !shim::is_live(&next) {
+            // Re-read after the liveness check: publication may have raced the
+            // command's exit and removal from /proc.
+            if let Ok(latest) = shim::read_json::<Status>(&path) {
+                next = latest;
+            }
+            if next.state == "running"
+                && !shim::is_live(&next)
+                && !shim::starting(&next, shim::now_ms())
+                && !shim::matches_process(next.shim_pid, next.shim_start_time)
+            {
+                self.lose("the shim process disappeared");
+                return;
+            }
         }
+        if next.state != "running" {
+            self.dirty.store(true, Ordering::Relaxed);
+        }
+        *self.status.lock().expect("execution status poisoned") = next;
+    }
+
+    /// A shim has been admitted but has not published its identity yet.
+    fn starting(&self) -> bool {
+        shim::starting(&self.state(), shim::now_ms())
+    }
+
+    /// Record a fact the shim never published: this execution is lost.
+    fn lose(&self, reason: &str) {
+        let mut status = self.status.lock().expect("execution status poisoned");
+        status.state = "lost".into();
+        status.finished_at = Some(shim::now_ms());
+        status.error = Some(reason.into());
+        self.dirty.store(true, Ordering::Relaxed);
     }
 
     pub fn summary(&self) -> Value {
@@ -248,34 +272,61 @@ pub fn admit(meta: Meta, state: &Path, store: &Store) -> io::Result<Arc<Executio
     Ok(execution)
 }
 
+/// An admitted execution whose shim has not published a status yet. The shim
+/// writes its identity as its first act, so this is a starting execution, not
+/// evidence that it was lost.
+fn unpublished(dir: &Path) -> Status {
+    let started_at = fs::metadata(dir)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or_else(shim::now_ms, |elapsed| elapsed.as_millis() as u64);
+    Status {
+        state: "running".into(),
+        pid: None,
+        pgid: None,
+        process_start_time: None,
+        shim_pid: 0,
+        shim_start_time: 0,
+        started_at,
+        finished_at: None,
+        exit_code: None,
+        signal: None,
+        stdout: StreamStatus::default(),
+        stderr: StreamStatus::default(),
+        error: None,
+    }
+}
+
 pub fn load(dir: PathBuf) -> io::Result<Arc<Execution>> {
     let meta: Meta = shim::read_json(&dir.join("meta.json"))?;
     let mut status: Status = match shim::read_json(&dir.join("status.json")) {
         Ok(status) => status,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Status {
-            state: "lost".into(),
-            pid: None,
-            pgid: None,
-            process_start_time: None,
-            shim_pid: 0,
-            shim_start_time: 0,
-            started_at: shim::now_ms(),
-            finished_at: Some(shim::now_ms()),
-            exit_code: None,
-            signal: None,
-            stdout: StreamStatus::default(),
-            stderr: StreamStatus::default(),
-            error: Some("admission interrupted before shim status".into()),
-        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => unpublished(&dir),
         Err(error) => return Err(error),
     };
-    if status.state == "running" && !shim::is_live(&status) {
-        let latest: Status = shim::read_json(&dir.join("status.json"))?;
-        status = latest;
-        if status.state == "running" && !shim::is_live(&status) {
+    if status.state == "running"
+        && !shim::is_live(&status)
+        && !shim::starting(&status, shim::now_ms())
+    {
+        // Re-read once: publication may have raced the command's exit.
+        if let Ok(latest) = shim::read_json::<Status>(&dir.join("status.json")) {
+            status = latest;
+        }
+        if status.state == "running"
+            && !shim::is_live(&status)
+            && !shim::starting(&status, shim::now_ms())
+        {
+            status.error = Some(
+                if status.shim_pid == 0 {
+                    "the shim never published its status"
+                } else {
+                    "recorded process identity no longer exists"
+                }
+                .into(),
+            );
             status.state = "lost".into();
             status.finished_at = Some(shim::now_ms());
-            status.error = Some("recorded process identity no longer exists".into());
         }
     }
     Ok(Arc::new(Execution {
