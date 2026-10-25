@@ -147,7 +147,18 @@ async function main() {
   assert(basic.stdout === 'hello\n', 'basic stdout (rust)', JSON.stringify(basic.stdout))
   assert(basic.stderr === 'oops\n', 'basic stderr (rust)', JSON.stringify(basic.stderr))
 
-  const lag = await runScenario('lag', 40_000)
+  // The command must be a child of the Rust runner, not of the host.
+  const lagHandle = startHost('lag')
+  let runnerChildren = []
+  const sampleDeadline = Date.now() + 25_000
+  while (Date.now() < sampleDeadline && runnerChildren.length === 0) {
+    runnerChildren = execFileSync('bash', ['-c', `pgrep -P ${String(runner.pid)} -a || true`], { encoding: 'utf8' })
+      .split('\n').map(line => line.trim()).filter(Boolean)
+    if (runnerChildren.length === 0) await new Promise(r => setTimeout(r, 100))
+  }
+  const lag = await waitForResult(lagHandle, entry => entry.maxLagMs !== undefined, 40_000, 'scenario lag (rust)')
+  lagHandle.child.kill('SIGKILL')
+  assert(runnerChildren.length > 0, 'command runs under the rust runner', runnerChildren[0]?.slice(0, 90) ?? 'none')
   assert(lag.maxLagMs < 250, 'host event loop under load (rust)', `${String(lag.maxLagMs)} ms max lag`)
 
   const background = await runScenario('background')

@@ -195,6 +195,10 @@ pub fn spawn_execution(
         let outcome = wait_child(child);
         let _ = stdout_reader.join();
         let _ = stderr_reader.join();
+        // Settlement waits for the *group* to be empty, not just the direct
+        // child: a detached descendant keeps the managed range alive, and the
+        // host's isolation story depends on that boundary being honest.
+        await_group_empty(pid, Duration::from_millis(2_000));
         let killed = supervisor.killed_by_request.load(Ordering::SeqCst);
         let (exit_code, signal) = match outcome {
             Ok(status) => (
@@ -255,6 +259,22 @@ fn wait_child(mut child: Child) -> std::io::Result<std::process::ExitStatus> {
     child.wait()
 }
 
+/// Poll until the process group led by `pid` holds no live member.
+///
+/// `kill(-pgid, 0)` answers "does any non-zombie member remain"; the loop is
+/// bounded so a group held open by an adopted child cannot block settlement.
+fn await_group_empty(pid: i32, bound: Duration) {
+    let deadline = std::time::Instant::now() + bound;
+    loop {
+        // SAFETY: signal 0 probes group membership without delivering anything.
+        let alive = unsafe { libc::kill(-pid, 0) } == 0;
+        if !alive || std::time::Instant::now() >= deadline {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,6 +282,13 @@ mod tests {
     #[test]
     fn signal_group_of_a_dead_group_is_tolerated() {
         signal_group(999_999_999, libc::SIGTERM);
+    }
+
+    #[test]
+    fn group_probe_returns_for_a_missing_group() {
+        let started = std::time::Instant::now();
+        await_group_empty(999_999_999, Duration::from_millis(500));
+        assert!(started.elapsed() < Duration::from_millis(100));
     }
 
     #[test]

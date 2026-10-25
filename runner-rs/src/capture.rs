@@ -88,7 +88,9 @@ impl CaptureState {
         } else {
             let start = (offset - retained_start) as usize;
             let end = (start + limit.max(1)).min(self.tail.len());
-            (&self.tail[start..end], self.lossy && self.total > self.tail.len() as u64)
+            // The requested offset is still retained, so this read is complete
+            // even when earlier bytes were dropped.
+            (&self.tail[start..end], false)
         };
         let usable = utf8_prefix_len(slice);
         ReadResult {
@@ -110,5 +112,65 @@ fn utf8_prefix_len(bytes: &[u8]) -> usize {
     match std::str::from_utf8(bytes) {
         Ok(_) => bytes.len(),
         Err(error) => error.valid_up_to(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn capture(max_bytes: usize, spill_max: u64) -> CaptureState {
+        CaptureState::new(max_bytes, spill_max, "/tmp", "test-execution", "stdout")
+    }
+
+    #[test]
+    fn keeps_the_tail_and_reports_loss_below_the_window() {
+        let mut state = capture(4, 1_048_576);
+        state.push(b"abcdef");
+        assert_eq!(state.total(), 6);
+        let lost = state.read_from(0, 16);
+        assert!(lost.lossy);
+        assert_eq!(lost.text, "cdef");
+        assert_eq!(lost.next_offset, 6);
+    }
+
+    #[test]
+    fn reads_within_the_window_are_complete() {
+        let mut state = capture(4, 1_048_576);
+        state.push(b"abcdef");
+        let read = state.read_from(4, 16);
+        assert!(!read.lossy);
+        assert_eq!(read.text, "ef");
+        assert_eq!(read.next_offset, 6);
+    }
+
+    #[test]
+    fn reads_advance_by_the_returned_bytes() {
+        let mut state = capture(64, 1_048_576);
+        state.push(b"hello world");
+        let first = state.read_from(0, 5);
+        assert_eq!(first.text, "hello");
+        assert_eq!(first.next_offset, 5);
+        let second = state.read_from(5, 64);
+        assert_eq!(second.text, " world");
+        assert_eq!(second.next_offset, 11);
+    }
+
+    #[test]
+    fn an_oversized_stream_drops_its_spill() {
+        let mut state = capture(64, 4);
+        state.push(b"123456789");
+        assert!(state.read_from(0, 64).spill_path.is_none());
+        let read = state.read_from(0, 64);
+        assert_eq!(read.text, "123456789");
+    }
+
+    #[test]
+    fn utf8_boundaries_are_respected() {
+        let mut state = capture(64, 1_048_576);
+        state.push("héllo".as_bytes());
+        let read = state.read_from(0, 2);
+        assert_eq!(read.text, "h");
+        assert_eq!(read.next_offset, 1);
     }
 }

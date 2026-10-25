@@ -15,7 +15,7 @@
  */
 
 import { spawn } from 'node:child_process'
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -37,6 +37,7 @@ const profileName = arg('--profile', 'shellout-web')
 const runnerProfile = arg('--runner-profile', 'shellout-runner')
 const reusePatch = args.includes('--reuse-patch')
 const socketOverride = arg('--socket', '')
+const runnerBinary = arg('--runner-binary', '')
 
 const root = mkdtempSync(join(tmpdir(), 'dsh-so-web-'))
 const home = join(root, 'home')
@@ -47,7 +48,22 @@ mkdirSync(profile, { recursive: true })
 for (const file of ['package.json', 'cordis.yml', 'cordis.patch.yml']) {
   cpSync(join(source, file), join(profile, file))
 }
-symlinkSync(join(source, 'node_modules'), join(profile, 'node_modules'))
+// The profile needs its own node_modules directory: the source profile links
+// `dsh-shellout` at the main checkout, and this instance must load the host
+// package from THIS repository. Every other entry is shared by symlink.
+const sharedModules = join(source, 'node_modules')
+const profileModules = join(profile, 'node_modules')
+mkdirSync(profileModules, { recursive: true })
+for (const entry of readdirSync(sharedModules)) {
+  if (['dsh-shellout', 'dsh-shellout-protocol'].includes(entry)) continue
+  symlinkSync(join(sharedModules, entry), join(profileModules, entry))
+}
+for (const [name, target] of [
+  ['dsh-shellout', join(REPO, 'packages/host')],
+  ['dsh-shellout-protocol', join(REPO, 'packages/protocol')],
+]) {
+  symlinkSync(target, join(profileModules, name))
+}
 
 // 2. Local packages resolve from the isolated home's own node_modules.
 mkdirSync(join(home, 'node_modules'), { recursive: true })
@@ -77,6 +93,11 @@ if (reusePatch) {
     chmodSync(join(home, '.credentials.yaml'), 0o600)
   }
 }
+// A source profile may already carry its own shellout wiring; keep only the
+// leading rows so this instance owns exactly one shellout entry, pointed at its
+// own socket.
+const existingShellout = patch.indexOf('- id: bash-sandbox')
+if (!reusePatch && existingShellout >= 0) patch = patch.slice(0, existingShellout)
 if (!reusePatch) patch += [
   '',
   '- id: bash-sandbox',
@@ -148,11 +169,17 @@ writeFileSync(join(runnerDir, 'cordis.patch.yml'), [
   '',
 ].join('\n'))
 
-const runner = spawn(process.execPath, ['--import', 'tsx/esm', 'apps/cli/src/bin.ts', '--profile', runnerProfile], {
-  cwd: harness,
-  env: { ...process.env, DSH_HOME: home, DSH_TELEMETRY_DISABLED: '1' },
-  stdio: ['ignore', 'pipe', 'pipe'],
-})
+const runner = runnerBinary === ''
+  ? spawn(process.execPath, ['--import', 'tsx/esm', 'apps/cli/src/bin.ts', '--profile', runnerProfile], {
+    cwd: harness,
+    env: { ...process.env, DSH_HOME: home, DSH_TELEMETRY_DISABLED: '1' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  : spawn(resolve(REPO, runnerBinary), [
+    '--socket', join(root, 'control.sock'),
+    '--cwd', root,
+    '--lease-ttl-ms', '60000',
+  ], { stdio: ['ignore', 'pipe', 'pipe'] })
 runner.stderr.on('data', (chunk) => { process.stdout.write(`runner: ${String(chunk)}`) })
 const socketDeadline = Date.now() + 90_000
 while (!existsSync(join(root, 'control.sock')) && Date.now() < socketDeadline) await new Promise(r => setTimeout(r, 200))
