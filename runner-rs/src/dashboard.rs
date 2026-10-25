@@ -84,120 +84,208 @@ fn percent_decode(value: &str) -> String {
 }
 
 /// The single-page dashboard.
+///
+/// Layout is a master–detail split: the execution list scrolls in its own pane
+/// and the detail sits beside it, so selecting a row never moves the page and a
+/// long list costs nothing to browse. Narrow viewports stack the two panes with
+/// the detail opened as a sheet.
 fn page() -> &'static str {
     r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>dsh shellout runner</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-:root{color-scheme:dark}
-body{margin:0;padding:24px;background:#0f1115;color:#e6e6ea;font:14px/1.5 ui-sans-serif,system-ui,-apple-system,sans-serif}
-h1{margin:0 0 4px;font-size:18px;font-weight:600}
-.sub{color:#8b8d98;font-size:12px;margin-bottom:20px}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:20px}
-.card{background:#171a21;border:1px solid #242833;border-radius:10px;padding:12px 14px}
-.card .k{color:#8b8d98;font-size:11px;text-transform:uppercase;letter-spacing:.04em}
-.card .v{font-size:20px;font-weight:600;margin-top:4px}
+:root{color-scheme:dark;--bg:#0f1115;--panel:#141821;--line:#1d2129;--ink:#e6e6ea;--dim:#8b8d98;--accent:#3d6fd8;--code:#9ecbff}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--ink);font:13px/1.5 ui-sans-serif,system-ui,-apple-system,sans-serif;display:flex;flex-direction:column;overflow:hidden}
+header{flex:none;display:flex;flex-wrap:wrap;gap:14px;align-items:center;padding:12px 18px;border-bottom:1px solid var(--line);background:var(--panel)}
+.title{font-size:14px;font-weight:600}
+.meta{color:var(--dim);font-size:12px}
+.pills{display:flex;gap:8px;margin-left:auto;flex-wrap:wrap}
+.pill{background:#171a21;border:1px solid #242833;border-radius:8px;padding:3px 10px;font-size:11px;color:var(--dim)}
+.pill b{color:var(--ink);font-size:12px;margin-left:5px}
+main{flex:1;min-height:0;display:grid;grid-template-columns:minmax(340px,46%) 1fr}
+#listPane{min-height:0;display:flex;flex-direction:column;border-right:1px solid var(--line)}
+.tools{flex:none;display:flex;gap:8px;align-items:center;padding:8px 12px;border-bottom:1px solid var(--line)}
+.tools input{flex:1;background:#0b0d11;border:1px solid #242833;border-radius:8px;color:var(--ink);padding:5px 9px;font:12px/1.4 ui-monospace,Menlo,monospace}
+.tools input:focus{outline:none;border-color:var(--accent)}
+.toggle{background:#171a21;border:1px solid #242833;border-radius:8px;color:var(--dim);padding:4px 10px;font-size:11px;cursor:pointer}
+.toggle.on{border-color:var(--accent);color:#cfe0ff}
+#listScroll{flex:1;min-height:0;overflow:auto}
 table{width:100%;border-collapse:collapse;font-size:12px}
-th,td{text-align:left;padding:7px 10px;border-bottom:1px solid #22262f}
-th{color:#8b8d98;font-weight:500}
+th,td{text-align:left;padding:6px 10px;border-bottom:1px solid #191d25}
+th{position:sticky;top:0;background:var(--panel);color:var(--dim);font-weight:500;z-index:1}
 tbody tr{cursor:pointer}
 tbody tr:hover{background:#171a21}
-tbody tr.sel{background:#1b2230}
-code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#9ecbff}
-pre{margin:0;padding:12px;background:#0b0d11;border:1px solid #22262f;border-radius:8px;overflow:auto;max-height:420px;white-space:pre-wrap;word-break:break-word}
-.empty{color:#6d7078;padding:14px 0}
-#detail{margin-top:24px;display:none}
-#detail.on{display:block}
-.dhead{display:flex;flex-wrap:wrap;gap:14px;align-items:baseline;margin-bottom:10px}
-.dtitle{font-size:13px;font-weight:600;color:#e6e6ea}
-.dmeta{color:#8b8d98;font-size:12px}
-.tabs{display:flex;gap:8px;margin:10px 0 8px}
-.tab{background:#171a21;border:1px solid #242833;color:#b8b8c0;border-radius:8px;padding:4px 12px;font-size:12px;cursor:pointer}
-.tab.on{border-color:#3d6fd8;color:#cfe0ff}
-.flag{color:#e5a15a;font-size:11px;margin-left:8px}
-.badge{font-size:11px;padding:1px 7px;border-radius:999px;border:1px solid #2b3140}
+tbody tr.sel{background:#1a2130;box-shadow:inset 3px 0 0 var(--accent)}
+td.cmd{color:#c9d4e6;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:1px;font-family:ui-monospace,Menlo,monospace;font-size:11.5px}
+#detailPane{min-height:0;overflow:auto;padding:16px 18px}
+.empty{color:#6d7078;padding:18px}
+.dhead{display:flex;flex-wrap:wrap;gap:10px;align-items:baseline;margin-bottom:10px}
+.did{font-size:12px;color:var(--dim);font-family:ui-monospace,Menlo,monospace}
+pre{margin:0 0 14px;padding:11px 13px;background:#0b0d11;border:1px solid #22262f;border-radius:8px;white-space:pre-wrap;word-break:break-word;font:12px/1.55 ui-monospace,Menlo,monospace;color:var(--code)}
+.tabs{display:flex;gap:8px;margin:0 0 8px}
+.tab{background:#171a21;border:1px solid #242833;color:#b8b8c0;border-radius:8px;padding:3px 12px;font-size:11px;cursor:pointer}
+.tab.on{border-color:var(--accent);color:#cfe0ff}
+.badge{font-size:11px;padding:1px 8px;border-radius:999px;border:1px solid #2b3140}
 .badge.running{color:#7fd8a4;border-color:#2f6b4c}
 .badge.exited{color:#9ecbff;border-color:#2f4d7a}
 .badge.killed{color:#e5a15a;border-color:#6b4f2f}
+.flag{color:#e5a15a;font-size:11px}
+#back{display:none}
+@media (max-width:820px){
+  main{grid-template-columns:1fr}
+  #detailPane{display:none;position:fixed;inset:0;background:var(--bg);padding:14px}
+  body.detailOpen #detailPane{display:block}
+  body.detailOpen #listPane{display:none}
+  #back{display:inline-block;margin-bottom:10px}
+}
 </style></head><body>
-<h1>dsh shellout runner</h1>
-<div class="sub" id="sub">loading…</div>
-<div class="cards" id="cards"></div>
-<table><thead><tr><th>execution</th><th>command</th><th>state</th><th>exit</th><th>age / duration</th></tr></thead>
-<tbody id="rows"><tr><td colspan="5" class="empty">no executions yet</td></tr></tbody></table>
-<div id="detail">
-  <div class="dhead"><span class="dtitle" id="dtitle"></span><span class="dmeta" id="dmeta"></span></div>
-  <pre id="dcmd"></pre>
-  <div class="tabs"><button class="tab on" data-tab="stdout">stdout</button><button class="tab" data-tab="stderr">stderr</button></div>
-  <pre id="dout">—</pre>
-</div>
+<header>
+  <span class="title">dsh shellout runner</span>
+  <span class="meta" id="sub">connecting…</span>
+  <div class="pills" id="pills"></div>
+</header>
+<main>
+  <section id="listPane">
+    <div class="tools">
+      <input id="filter" placeholder="filter by command…" autocomplete="off">
+      <button class="toggle on" id="follow" title="keep the newest executions at the top">follow</button>
+    </div>
+    <div id="listScroll">
+      <table><thead><tr><th>exec</th><th>command</th><th>state</th><th>exit</th><th>time</th></tr></thead>
+      <tbody id="rows"><tr><td colspan="5" class="empty">no executions yet</td></tr></tbody></table>
+    </div>
+  </section>
+  <section id="detailPane">
+    <button class="toggle" id="back">\u2190 executions</button>
+    <div id="detail">
+      <div class="empty">Select an execution to inspect its command and output.</div>
+    </div>
+  </section>
+</main>
 <script>
-const fmt = (ms) => ms == null ? '—' : ms < 1000 ? ms + ' ms' : (ms / 1000).toFixed(1) + ' s'
+const fmt = (ms) => ms == null ? '\u2014' : ms < 1000 ? ms + ' ms' : (ms / 1000).toFixed(1) + ' s'
+const esc = (text) => String(text).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]))
 let selected = null
 let tab = 'stdout'
+let filter = ''
+let follow = true
+let rowsCache = []
 
-function esc(text) {
-  return String(text).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]))
+const commandLine = (execution) => {
+  const argv = execution.argv || []
+  const raw = (argv.length > 2 ? argv.slice(2).join(' ') : argv.join(' ')) || execution.command || ''
+  const text = raw.replace(/\s+/g, ' ').trim()
+  // Every agent command starts by moving into its workspace; that prefix is
+  // identical across rows, so the list shows what comes after it instead.
+  const stripped = text.replace(/^cd\s+[^&|;]+?(?:&&|;)\s*/, '')
+  return stripped.length > 0 ? stripped : text
 }
 
 async function loadStats() {
   const stats = await (await fetch('/api/stats', { cache: 'no-store' })).json()
   document.getElementById('sub').textContent =
     `${stats.version} \u00b7 protocol ${stats.protocols.join('/')} \u00b7 up ${fmt(stats.uptimeMs)} \u00b7 pid ${stats.pid}`
-  const cards = [['live', stats.live], ['spawned', stats.spawned], ['settled', stats.settled],
+  const pills = [['live', stats.live], ['spawned', stats.spawned], ['settled', stats.settled],
     ['killed', stats.killed], ['failed', stats.failed], ['leases', stats.leases], ['limit', stats.maxConcurrent]]
-  document.getElementById('cards').innerHTML = cards
-    .map(([k, v]) => `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('')
+  document.getElementById('pills').innerHTML = pills
+    .map(([k, v]) => `<span class="pill">${k}<b>${v}</b></span>`).join('')
 }
 
 async function loadList() {
   const { executions } = await (await fetch('/api/executions', { cache: 'no-store' })).json()
+  rowsCache = executions
+  const needle = filter.trim().toLowerCase()
+  const visible = needle === '' ? executions : executions.filter(e => commandLine(e).toLowerCase().includes(needle))
+  const scroll = document.getElementById('listScroll')
+  const keepTop = scroll.scrollTop
   const rows = document.getElementById('rows')
-  if (executions.length === 0) {
-    rows.innerHTML = '<tr><td colspan="5" class="empty">no executions yet</td></tr>'
+  if (visible.length === 0) {
+    rows.innerHTML = `<tr><td colspan="5" class="empty">${executions.length === 0 ? 'no executions yet' : 'nothing matches the filter'}</td></tr>`
     return
   }
-  rows.innerHTML = executions.map((e) => `
+  rows.innerHTML = visible.map((e) => `
     <tr data-id="${esc(e.id)}" class="${e.id === selected ? 'sel' : ''}">
       <td><code>${esc(e.id.slice(0, 8))}</code></td>
-      <td><code>${esc(e.command)}</code></td>
+      <td class="cmd" title="${esc(commandLine(e))}">${esc(commandLine(e))}</td>
       <td><span class="badge ${e.state}">${e.state}</span></td>
       <td>${e.exitCode == null ? '\u2014' : e.exitCode}</td>
       <td>${fmt(e.durationMs != null ? e.durationMs : e.ageMs)}</td>
     </tr>`).join('')
   for (const row of rows.querySelectorAll('tr[data-id]')) {
-    row.addEventListener('click', () => { selected = row.dataset.id; renderDetail() })
+    row.addEventListener('click', () => select(row.dataset.id))
+  }
+  scroll.scrollTop = keepTop
+  if (selected === null && visible[0]) select(visible[0].id)
+}
+
+async function loadDetail() {
+  const pane = document.getElementById('detail')
+  const response = await fetch('/api/execution?id=' + encodeURIComponent(selected), { cache: 'no-store' })
+  if (!response.ok) {
+    pane.innerHTML = '<div class="empty">This execution is no longer retained.</div>'
+    return
+  }
+  const d = await response.json()
+  const text = tab === 'stdout' ? d.stdout : d.stderr
+  const flag = d.lossy ? '<span class="flag">\u00b7 output truncated (tail kept)</span>' : ''
+  pane.innerHTML = `
+    <div class="dhead">
+      <span class="badge ${d.state}">${d.state}</span>
+      <span>exit ${d.exitCode == null ? '\u2014' : d.exitCode}${d.signal == null ? '' : ' \u00b7 signal ' + d.signal}</span>
+      <span>${fmt(d.durationMs != null ? d.durationMs : d.ageMs)}</span>
+      <span>CWD ${esc(d.cwd)}</span>
+      ${flag}
+      <span class="did">${esc(d.id)}</span>
+    </div>
+    <pre>$ ${esc((d.argv || []).join(' '))}</pre>
+    <div class="tabs">
+      <button class="tab ${tab === 'stdout' ? 'on' : ''}" data-tab="stdout">stdout</button>
+      <button class="tab ${tab === 'stderr' ? 'on' : ''}" data-tab="stderr">stderr</button>
+    </div>
+    <pre>${text && text.length > 0 ? esc(text) : '\u2014'}</pre>`
+  for (const button of pane.querySelectorAll('.tab')) {
+    button.addEventListener('click', () => { tab = button.dataset.tab; loadDetail() })
   }
 }
 
-function renderDetail() {
-  if (!selected) return
-  fetch('/api/execution?id=' + encodeURIComponent(selected), { cache: 'no-store' })
-    .then((r) => r.ok ? r.json() : Promise.reject(r.status))
-    .then((d) => {
-      document.getElementById('detail').classList.add('on')
-      document.getElementById('dtitle').textContent = d.id
-      document.getElementById('dmeta').innerHTML =
-        `<span class="badge ${d.state}">${d.state}</span> \u00b7 exit ${d.exitCode == null ? '\u2014' : d.exitCode}` +
-        (d.signal == null ? '' : ' \u00b7 signal ' + d.signal) + ' \u00b7 ' + fmt(d.durationMs != null ? d.durationMs : d.ageMs) +
-        ' \u00b7 cwd ' + esc(d.cwd) + (d.lossy ? '<span class="flag">output truncated (tail kept)</span>' : '')
-      document.getElementById('dcmd').textContent = '$ ' + d.argv.join(' ')
-      const text = tab === 'stdout' ? d.stdout : d.stderr
-      document.getElementById('dout').textContent = text && text.length > 0 ? text : '\u2014'
-    })
-    .catch((error) => { document.getElementById('dout').textContent = 'cannot load: ' + error })
+function select(id) {
+  selected = id
+  document.body.classList.add('detailOpen')
+  for (const row of document.querySelectorAll('#rows tr[data-id]')) {
+    row.classList.toggle('sel', row.dataset.id === id)
+  }
+  loadDetail()
 }
 
-for (const button of document.querySelectorAll('.tab')) {
-  button.addEventListener('click', () => {
-    tab = button.dataset.tab
-    for (const other of document.querySelectorAll('.tab')) other.classList.toggle('on', other === button)
-    renderDetail()
-  })
-}
+document.getElementById('back').addEventListener('click', () => document.body.classList.remove('detailOpen'))
+document.getElementById('follow').addEventListener('click', (event) => {
+  follow = !follow
+  event.target.classList.toggle('on', follow)
+})
+document.getElementById('filter').addEventListener('input', (event) => {
+  filter = event.target.value
+  loadList()
+})
+document.addEventListener('keydown', (event) => {
+  if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return
+  const rows = [...document.querySelectorAll('#rows tr[data-id]')]
+  if (rows.length === 0) return
+  const index = rows.findIndex(row => row.dataset.id === selected)
+  const next = event.key === 'ArrowDown' ? Math.min(rows.length - 1, index + 1) : Math.max(0, index - 1)
+  const target = rows[index === -1 ? 0 : next]
+  if (!target) return
+  event.preventDefault()
+  select(target.dataset.id)
+  target.scrollIntoView({ block: 'nearest' })
+})
 
 async function tick() {
-  try { await loadStats(); await loadList(); if (selected) renderDetail() } catch (error) {
+  try {
+    await loadStats()
+    if (follow || rowsCache.length === 0) await loadList()
+  } catch (error) {
     document.getElementById('sub').textContent = 'runner unreachable: ' + error
   }
 }
