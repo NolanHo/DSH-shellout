@@ -61,6 +61,20 @@ pub struct Store {
     per_stream_flags: bool,
 }
 
+/// Execution counts by outcome, so a dashboard agrees with history across
+/// executor restarts instead of reporting one process's lifetime.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Counts {
+    /// Every recorded execution, live or terminal.
+    pub rows: u64,
+    /// Executions that exited on their own.
+    pub exited: u64,
+    /// Executions a party terminated.
+    pub killed: u64,
+    /// Executions that never started or whose supervisor was lost.
+    pub failed: u64,
+}
+
 impl Store {
     /// Open without migrations or reconciliation. The hub never writes history.
     pub fn open_read_only(path: &Path) -> rusqlite::Result<Self> {
@@ -254,6 +268,29 @@ impl Store {
             }),
             Err(error) => json!({"historyWritable": false, "historyError": error.to_string()}),
         }
+    }
+
+    /// Counts by outcome, derived from history rather than memory.
+    pub fn counts(&self) -> Result<Counts, String> {
+        let connection = self.connection.lock().map_err(|error| error.to_string())?;
+        connection
+            .query_row(
+                "SELECT COUNT(*),
+                    COALESCE(SUM(state = 'exited'), 0),
+                    COALESCE(SUM(state = 'killed'), 0),
+                    COALESCE(SUM(state IN ('failed', 'lost')), 0)
+                 FROM executions",
+                [],
+                |row| {
+                    Ok(Counts {
+                        rows: row.get::<_, i64>(0)? as u64,
+                        exited: row.get::<_, i64>(1)? as u64,
+                        killed: row.get::<_, i64>(2)? as u64,
+                        failed: row.get::<_, i64>(3)? as u64,
+                    })
+                },
+            )
+            .map_err(|error| error.to_string())
     }
 
     pub fn count(&self) -> Result<i64, String> {

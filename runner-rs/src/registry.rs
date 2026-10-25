@@ -213,10 +213,29 @@ impl Registry {
             .collect();
         executions.sort_by_key(|row| std::cmp::Reverse(row["startedAtMs"].as_u64().unwrap_or(0)));
         executions.truncate(50);
+        // Counters describe the execution plane, not this process: history is
+        // the authority, so a restart cannot reset a dashboard to zero.
+        let counts = self.store.as_ref().and_then(|store| match store.counts() {
+            Ok(counts) => Some(counts),
+            Err(error) => {
+                eprintln!("history: cannot count executions: {error}");
+                None
+            }
+        });
+        let (spawned, settled, killed, failed) = counts.map_or_else(
+            || {
+                (
+                    self.counters.spawned.load(Ordering::Relaxed),
+                    self.counters.settled.load(Ordering::Relaxed),
+                    self.counters.killed.load(Ordering::Relaxed),
+                    self.counters.failed.load(Ordering::Relaxed),
+                )
+            },
+            |counts| (counts.rows, counts.exited, counts.killed, counts.failed),
+        );
         let mut result = json!({"version":format!("rust-{}",env!("CARGO_PKG_VERSION")),"protocols":["1.0","2.0"],
             "pid":std::process::id(),"uptimeMs":self.started.elapsed().as_millis() as u64,"live":live,
-            "spawned":self.counters.spawned.load(Ordering::Relaxed),"settled":self.counters.settled.load(Ordering::Relaxed),
-            "killed":self.counters.killed.load(Ordering::Relaxed),"failed":self.counters.failed.load(Ordering::Relaxed),
+            "spawned":spawned,"settled":settled,"killed":killed,"failed":failed,
             "leases":self.boots.lock().expect("boots poisoned").len(),"maxConcurrent":self.max_concurrent,"executions":executions});
         for (key, value) in self.history_health().as_object().expect("health object") {
             result[key] = value.clone();
