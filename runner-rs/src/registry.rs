@@ -102,6 +102,13 @@ impl Registry {
         })
     }
 
+    /// Live state for the dashboard service face.
+    pub fn snapshot(&self) -> Value {
+        let mut stats = self.stats();
+        stats["executions"] = Value::Array(self.recent(50));
+        stats
+    }
+
     /// Recent executions, newest first, for the dashboard list.
     pub fn recent(&self, limit: usize) -> Vec<Value> {
         let mut rows: Vec<Value> = self

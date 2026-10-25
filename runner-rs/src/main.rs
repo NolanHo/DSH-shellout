@@ -10,11 +10,17 @@ mod legacy;
 mod protocol;
 mod registry;
 mod server;
+mod hub;
 mod store;
 
 use std::time::Duration;
 
 use server::Config;
+
+/// The dashboard markup, shared by the in-process and hub faces.
+fn dashboard_page() -> &'static str {
+    dashboard::page()
+}
 
 fn arg_value(name: &str) -> Option<String> {
     let mut args = std::env::args().skip(1);
@@ -62,6 +68,13 @@ async fn main() -> std::io::Result<()> {
         .or_else(|| std::env::var("DSH_SHELLOUT_DASHBOARD").ok())
         .unwrap_or_default();
 
+    if arg_value("--mode").as_deref() == Some("hub") {
+        let history = arg_value("--history").unwrap_or_else(|| "/root/.dsh-runner/shellout/history.sqlite".to_string());
+        let store = hub::open_store(std::path::Path::new(&history)).expect("history database");
+        let executor_socket = arg_value("--executor-socket").unwrap_or_else(|| "/root/.dsh/shellout/control.sock".to_string());
+        let hub = std::sync::Arc::new(hub::Hub { store, executor_socket });
+        return hub::serve(socket_path, hub).await;
+    }
     eprintln!("dsh-shellout-runner {} listening on {}", env!("CARGO_PKG_VERSION"), socket_path);
 
     let history_path = arg_value("--history").map(std::path::PathBuf::from).unwrap_or_else(|| {

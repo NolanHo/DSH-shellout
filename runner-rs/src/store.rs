@@ -92,6 +92,14 @@ impl Store {
         );
     }
 
+    /// Total stored rows.
+    pub fn count(&self) -> i64 {
+        let Ok(connection) = self.connection.lock() else { return 0 };
+        connection
+            .query_row("SELECT COUNT(*) FROM executions", [], |row| row.get(0))
+            .unwrap_or(0)
+    }
+
     /// Newest `limit` rows, for the dashboard after a restart.
     pub fn recent(&self, limit: usize) -> Vec<(String, String, String)> {
         let Ok(connection) = self.connection.lock() else { return Vec::new() };

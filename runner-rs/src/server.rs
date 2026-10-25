@@ -216,6 +216,7 @@ fn dispatch(
                 Err(failure) => error_reply(id, failure.code, &failure.message),
             }
         }
+        "snapshot" => reply(id, "snapshot", registry.snapshot()),
         "state" => {
             let request: ExecutionRef = match serde_json::from_value(envelope.payload) {
                 Ok(request) => request,

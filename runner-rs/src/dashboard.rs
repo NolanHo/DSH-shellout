@@ -88,7 +88,7 @@ fn percent_decode(value: &str) -> String {
 /// Selecting a row expands its detail directly underneath that row: the row is
 /// already on screen, so nothing navigates and nothing scrolls to reveal it.
 /// Only one row is open at a time.
-fn page() -> &'static str {
+pub fn page() -> &'static str {
     r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>dsh shellout runner</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
