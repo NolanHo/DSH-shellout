@@ -179,7 +179,9 @@ async function main() {
   assert(attached.hello.executions.some(row => row.executionId === survivor && row.state === 'running'))
   assert.equal((await settled(client, survivor)).exitCode, 7)
   assert.equal(readFileSync(logPath, 'utf8'), 'marker-0\nmarker-1\nmarker-2\nmarker-3\nmarker-4\n')
-  assert(client.events.some(frame => frame.method === 'settled' && frame.payload.executionId === survivor && frame.payload.exitCode === 7))
+  // The event is published by the next 250 ms poll after settlement is
+  // observed, so it can trail the state reply on the same connection.
+  await until(() => client.events.some(frame => frame.method === 'settled' && frame.payload.executionId === survivor && frame.payload.exitCode === 7), 'adopted settlement event')
   ok('SIGKILL survival, matching-pid adoption, continued capture and exit 7')
 
   const termSurvivor = await exec(client, 'echo ready; sleep 2; echo survived; exit 4')
