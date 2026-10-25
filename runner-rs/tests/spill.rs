@@ -155,6 +155,170 @@ fn larger_streams_produce_one_complete_spill_per_stream() {
     assert_eq!(lost["lossy"], true, "{lost}");
 }
 
+/// The budget is enforced against the spills of real executions, not only
+/// against a hand-built inventory: with several complete spills on disk, a new
+/// one evicts the oldest, the newest stays readable, a read of an evicted spill
+/// reports loss, and no published file is ever partial.
+#[test]
+fn the_spill_budget_evicts_the_oldest_and_keeps_the_newest_under_load() {
+    let scratch = Scratch::new("budget");
+    let spill_dir = scratch.root.join("host-spill");
+    std::fs::create_dir_all(&spill_dir).expect("spill directory");
+    // Two 4 KiB spills fit; the third pushes the oldest out.
+    let executor = Executor::start_named(
+        &scratch,
+        "executor",
+        &["--state-retention-ms", "0", "--spill-max-bytes", "8192"],
+    );
+    let mut host = executor.ready();
+    host.hello("boot-spill-budget");
+    let policy = json!({"stdoutMaxBytes": 1024, "stderrMaxBytes": 1024,
+        "spillMaxBytes": 1_048_576, "spillDir": spill_dir});
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, u64)>::new()));
+    let watcher = {
+        let stop = std::sync::Arc::clone(&stop);
+        let observed = std::sync::Arc::clone(&observed);
+        let spill_dir = spill_dir.clone();
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                for entry in std::fs::read_dir(&spill_dir)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if let Ok(metadata) = entry.metadata() {
+                        observed
+                            .lock()
+                            .expect("observed poisoned")
+                            .push((name, metadata.len()));
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        })
+    };
+
+    let mut ids = Vec::new();
+    for id in ["first", "second", "third"] {
+        host.exec(
+            id,
+            "head -c 4096 /dev/zero | tr '\\0' o",
+            json!({"capture": policy}),
+        )
+        .expect("execution admitted");
+        until(
+            || host.state(id).filter(|state| state["state"] != "running"),
+            Duration::from_secs(10),
+            "the execution settles",
+        );
+        until(
+            || {
+                spill_dir
+                    .join(format!("{id}-stdout.log"))
+                    .exists()
+                    .then_some(())
+            },
+            Duration::from_secs(10),
+            "the spill is written",
+        );
+        ids.push(id);
+    }
+
+    // The oldest spill is gone once the budget is exceeded, the newest keeps the
+    // bytes a reader was promised, and the one in between still fits.
+    until(
+        || (!spill_dir.join("first-stdout.log").exists()).then_some(()),
+        Duration::from_secs(10),
+        "the oldest spill is evicted",
+    );
+    for kept in ["second", "third"] {
+        let path = spill_dir.join(format!("{kept}-stdout.log"));
+        let bytes = std::fs::read(&path).unwrap_or_else(|error| panic!("{kept} spill: {error}"));
+        assert_eq!(bytes.len(), 4096, "{kept} keeps the complete stream");
+        assert!(
+            bytes.iter().all(|value| *value == b'o'),
+            "{kept} spill carries the stream"
+        );
+    }
+
+    // A read of the evicted execution reports loss instead of an empty stream.
+    let lost = until(
+        || {
+            let read = host
+                .request(
+                    "readStream",
+                    json!({"executionId": "first", "stream": "stdout", "offset": 0, "limit": 100_000}),
+                )
+                .expect("the read is answered");
+            (read["lossy"] == true).then_some(read)
+        },
+        Duration::from_secs(10),
+        "a read of an evicted spill reports loss",
+    );
+    assert_eq!(lost["text"], "", "{lost}");
+
+    // Eviction keeps tracking new spills: one more execution evicts the next
+    // oldest and leaves the two newest readable.
+    host.exec(
+        "fourth",
+        "head -c 4096 /dev/zero | tr '\\0' o",
+        json!({"capture": policy}),
+    )
+    .expect("execution admitted");
+    until(
+        || {
+            host.state("fourth")
+                .filter(|state| state["state"] != "running")
+        },
+        Duration::from_secs(10),
+        "the fourth execution settles",
+    );
+    until(
+        || (!spill_dir.join("second-stdout.log").exists()).then_some(()),
+        Duration::from_secs(10),
+        "the next oldest spill is evicted",
+    );
+    for kept in ["third", "fourth"] {
+        assert_eq!(
+            std::fs::read(spill_dir.join(format!("{kept}-stdout.log")))
+                .expect("a kept spill is readable")
+                .len(),
+            4096,
+            "{kept} keeps the complete stream",
+        );
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    watcher.join().expect("the watcher stops");
+
+    let observed = observed.lock().expect("observed poisoned");
+    assert!(
+        !observed.is_empty(),
+        "the watcher sampled the spill directory"
+    );
+    for (name, bytes) in observed.iter() {
+        assert!(
+            name.ends_with(".log"),
+            "a spill publication leaves no temporary file: {name}"
+        );
+        assert_eq!(
+            *bytes, 4096,
+            "{name} was readable while partially written ({bytes} bytes)"
+        );
+    }
+    let names = spill_files(&spill_dir);
+    assert_eq!(
+        names,
+        vec![
+            "fourth-stdout.log".to_string(),
+            "third-stdout.log".to_string()
+        ],
+        "the directory holds the two newest complete spills: {ids:?}"
+    );
+}
+
 /// A spill outlives the state directory, but not the retention window: the
 /// host directory stays bounded instead of accumulating every command's output.
 #[test]
