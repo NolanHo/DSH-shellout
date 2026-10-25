@@ -239,6 +239,7 @@ Runner plugin config: `socketPath`, `leaseTtlMs`, `maxConcurrent`, `settleRetent
 | `signal` aborted before spawn | `execute` throws without creating a process |
 | `signal` aborted after publication | The runner kills the group; `result().aborted === true` |
 | Spawn failure (bad cwd, missing exe) | `execute` throws the preparation error |
+| Spawn still starting after the `go` verdict | `execute` returns the handle; the command runs once and settles with its real status (never a refusal the host would retry) |
 | Output exceeds the cap | Non-lossy reads up to the cap; beyond it `lossy: true` (a truncated capture has no complete file, so no `spillPath`) |
 | Executor restarts mid-execution | The command keeps running; the host settles it with its real exit code |
 | Executor is replaced and no longer holds the execution | `done` resolves, `status: 'killed'`, stderr carries `shellout: runner lost` |

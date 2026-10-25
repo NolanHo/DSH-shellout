@@ -403,7 +403,7 @@ impl Registry {
         let admission = exec::admit(meta, &self.state_dir, store)
             .map_err(|error| Failure::new("rejected", error.to_string()))?;
         match admission.outcome {
-            SpawnOutcome::Admitted => {
+            SpawnOutcome::Admitted | SpawnOutcome::Accepted => {
                 self.counters.spawned.fetch_add(1, Ordering::Relaxed);
                 self.executions
                     .lock()
@@ -411,14 +411,15 @@ impl Registry {
                     .insert(request.execution_id.clone(), admission.execution);
                 Ok(json!({"executionId":request.execution_id}))
             }
-            SpawnOutcome::Refused(message) => Err(Failure::new("rejected", message)),
-            SpawnOutcome::Undecided(message) => {
-                // The caller was told the spawn failed. The execution is still
-                // tracked so its failure is addressable and settles on its own.
-                self.executions
-                    .lock()
-                    .expect("executions poisoned")
-                    .insert(request.execution_id.clone(), admission.execution);
+            SpawnOutcome::Refused { message, tracked } => {
+                // A pre-verdict failure stays addressable: its durable row is
+                // already terminal, and a shim that starts later is refused.
+                if tracked {
+                    self.executions
+                        .lock()
+                        .expect("executions poisoned")
+                        .insert(request.execution_id.clone(), admission.execution);
+                }
                 Err(Failure::new("rejected", message))
             }
         }

@@ -215,6 +215,17 @@ fn start_delay() {
     }
 }
 
+/// Test seam: delay the command's own `execve` after the spawn was authorized,
+/// so the executor's post-verdict window can be exercised.
+fn exec_delay() {
+    if let Some(millis) = std::env::var("DSH_SHELLOUT_SHIM_EXEC_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        thread::sleep(Duration::from_millis(millis));
+    }
+}
+
 /// The supervisor owns the command's lifetime, so an execution is live exactly
 /// while its shim is: the shim may already have reaped the direct child and
 /// still be terminating the group and draining the capture pipes.
@@ -397,7 +408,10 @@ pub fn run(state: &Path, id: &str) -> io::Result<()> {
         status.spawn_error = Some(refusal.clone());
     }
     let result = match decision {
-        Ok(()) => supervise(&dir, &meta.spec, &mut status),
+        Ok(()) => {
+            exec_delay();
+            supervise(&dir, &meta.spec, &mut status)
+        }
         Err(refusal) => Err(io::Error::other(refusal)),
     };
     if let Err(error) = &result {

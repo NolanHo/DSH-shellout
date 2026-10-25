@@ -76,6 +76,96 @@ fn deleting_the_running_binary_does_not_break_later_spawns() {
     assert_eq!(state["state"], "exited", "{state}");
 }
 
+/// Once the executor has published `go`, the command may already be starting:
+/// the timeout must answer with the execution rather than a refusal the host
+/// would retry, and settlement must carry the real exit facts.
+#[test]
+fn a_command_that_starts_after_the_go_verdict_is_accepted_and_settles_for_real() {
+    let scratch = Scratch::new("late-go");
+    let executor = Executor::start_full(
+        &scratch,
+        "executor",
+        std::path::Path::new(support::BINARY),
+        &[],
+        &[
+            ("DSH_SHELLOUT_SPAWN_GRACE_MS", "300"),
+            ("DSH_SHELLOUT_SHIM_EXEC_DELAY_MS", "1200"),
+        ],
+    );
+    let mut host = executor.ready();
+    host.hello("boot-late-go");
+    let marker = scratch.root.join("ran.marker");
+    let command = format!("echo ran > {}; exit 7", marker.display());
+    let reply = host
+        .call(
+            "exec",
+            json!({
+                "executionId": "late-go",
+                "operationId": "op-late-go",
+                "specDigest": "late-go",
+                "spec": {
+                    "argv": ["/bin/sh", "-c", command],
+                    "cwd": scratch.root,
+                    "env": {"PATH": "/usr/bin:/bin"},
+                    "timeoutMs": 10_000,
+                    "onExpiry": "kill",
+                    "graceMs": 100,
+                    "capture": {"stdoutMaxBytes": 64_000, "stderrMaxBytes": 64_000,
+                        "spillMaxBytes": 1_048_576, "spillDir": "/tmp"},
+                },
+            }),
+        )
+        .expect("the executor answered");
+    assert_eq!(
+        reply["kind"], "res",
+        "a command authorized with `go` must not be answered as rejected: {reply}"
+    );
+    assert_eq!(reply["payload"]["executionId"], "late-go");
+
+    // The command runs once, after the reply, and settles with its real code.
+    let state = until(
+        || {
+            host.state("late-go")
+                .filter(|state| state["state"] != "running")
+        },
+        Duration::from_secs(15),
+        "the late command settles",
+    );
+    assert_eq!(state["state"], "exited", "{state}");
+    assert_eq!(state["exitCode"], 7, "{state}");
+    assert!(
+        marker.exists(),
+        "the accepted command really ran instead of being killed at the timeout"
+    );
+
+    let event = host
+        .wait_event(
+            |frame| frame["method"] == "settled" && frame["payload"]["executionId"] == "late-go",
+            Duration::from_secs(5),
+        )
+        .expect("the settlement event is delivered");
+    assert_eq!(event["payload"]["status"], "exited", "{event}");
+    assert_eq!(event["payload"]["exitCode"], 7, "{event}");
+
+    // History records the outcome that happened, not a fixed `failed`.
+    let connection = rusqlite::Connection::open(scratch.history()).expect("history opens");
+    let recorded = until(
+        || {
+            connection
+                .query_row(
+                    "SELECT state, exit_code FROM executions WHERE id = 'late-go'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+                )
+                .ok()
+                .filter(|(state, _)| state != "running")
+        },
+        Duration::from_secs(5),
+        "the history row settles with the real outcome",
+    );
+    assert_eq!(recorded, ("exited".to_string(), Some(7)));
+}
+
 /// A shim that reports no spawn outcome in time is a failure the caller is
 /// told about, and the command must never start afterwards: the executor owns
 /// the decision and leaves a terminal, addressable execution behind.

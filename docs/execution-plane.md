@@ -53,17 +53,22 @@ is terminal.
 The spawn outcome has exactly one arbiter. Before starting a shim the executor
 creates `spawn.claim` with `O_EXCL`; a shim that finds a claim it did not create
 publishes its identity and waits for `spawn.verdict`, and only `go` lets it start
-the command. When the admission wait expires the executor writes `fail`, records
-a `failed` history row, and keeps the execution addressable: a shim that starts
-even later refuses the command, so an `exec` answered with a failure can never
-run it.
+the command. Until the executor writes `go`, a wait that expires writes `fail`,
+records a `failed` history row, and keeps the execution addressable: a shim that
+starts even later refuses the command, so an `exec` answered with a failure can
+never run it. Once `go` is written the command may already be starting, so the
+`exec` reply names the execution and the outcome arrives as a settlement: the
+executor never answers that `exec` with a failure, never stops the command, and
+never records a fixed `failed` row for a slow spawn. A published `spawnError` is
+the one exception — it proves the command never started, so a still-waiting
+`exec` fails synchronously.
 
 Terminal facts other than the exit status:
 
 | Field | Meaning |
 |---|---|
 | `termination` | `deadline`, `request`, `lease` or `drain` — who ended the execution |
-| `spawnError` | why the command could not be started; its presence fails `exec` synchronously |
+| `spawnError` | why the command could not be started; its presence fails a still-waiting `exec` synchronously |
 
 An execution whose stream a detached descendant keeps open is published as
 `lossy` rather than blocking: the shim bounds the join, records the loss, and

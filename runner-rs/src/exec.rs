@@ -38,11 +38,13 @@ pub struct Admission {
 pub enum SpawnOutcome {
     /// The shim reported the command's pid; the execution is live.
     Admitted,
-    /// The command never started and the execution's files are already gone.
-    Refused(String),
-    /// No spawn outcome arrived in time. The execution is tracked and settles
-    /// asynchronously, and its failure row is already durable.
-    Undecided(String),
+    /// The executor published `go`, but the shim had not reported the pid when
+    /// the wait expired. The command may already be starting, so the reply
+    /// names the execution and its outcome arrives as a settlement.
+    Accepted,
+    /// The command can never start. `tracked` keeps a pre-verdict timeout
+    /// addressable for its settlement; a reported spawn error has no files left.
+    Refused { message: String, tracked: bool },
 }
 
 /// The binary to run as a shim: the running image, never the path it was
@@ -387,7 +389,10 @@ pub fn admit(meta: Meta, state: &Path, store: &Store) -> io::Result<Admission> {
             let _ = fs::remove_dir_all(&execution.dir);
             return Ok(Admission {
                 execution,
-                outcome: SpawnOutcome::Refused(message),
+                outcome: SpawnOutcome::Refused {
+                    message,
+                    tracked: false,
+                },
             });
         }
     };
@@ -420,8 +425,9 @@ impl Execution {
     /// shim's report: a recorded pid, or why it could not start one.
     ///
     /// When the shim reports its identity the executor releases the spawn with
-    /// the one decision it owns; when no outcome arrives in time, the command is
-    /// refused or stopped and the execution keeps a terminal history row.
+    /// the one decision it owns. Until that decision a timeout is a refusal;
+    /// after `go` the command may already be starting, so the executor answers
+    /// with the execution and lets settlement carry the real outcome.
     fn await_spawn(&self, store: &Store, arbitration: bool) -> io::Result<SpawnOutcome> {
         let path = self.dir.join("status.json");
         let grace = spawn_grace();
@@ -431,13 +437,18 @@ impl Execution {
             match shim::read_json::<Status>(&path) {
                 Ok(status) => {
                     if status.spawn_error.is_some() {
+                        // A published spawn error proves the command never
+                        // started, so failing the reply cannot duplicate it.
                         let message = persist_failure(
                             self,
                             store,
                             status.spawn_error.as_deref().unwrap_or("spawn failed"),
                         );
                         let _ = fs::remove_dir_all(&self.dir);
-                        return Ok(SpawnOutcome::Refused(message));
+                        return Ok(SpawnOutcome::Refused {
+                            message,
+                            tracked: false,
+                        });
                     }
                     if status.pid.is_some() {
                         return Ok(SpawnOutcome::Admitted);
@@ -455,19 +466,24 @@ impl Execution {
                 Err(error) => eprintln!("execution {}: status read failed: {error}", self.meta.id),
             }
             if Instant::now() >= deadline {
-                let message = "the shim did not report a spawn outcome";
                 if arbitration && !authorized {
                     // Nothing was authorized, so no command can start. The
                     // durable refusal also stops a shim that starts even later.
                     shim::decide_spawn(&self.dir, shim::VERDICT_FAIL)?;
-                } else {
-                    // A live shim may have started the command; ask it to stop.
-                    let _ = fs::write(self.dir.join("kill.request"), shim::TERMINATION_REQUEST);
+                    let message =
+                        persist_failure(self, store, "the shim did not report a spawn outcome");
+                    // Keep the execution: the caller was told the spawn failed,
+                    // and the failure must stay addressable.
+                    return Ok(SpawnOutcome::Refused {
+                        message,
+                        tracked: true,
+                    });
                 }
-                persist_failure(self, store, message);
-                // Keep the execution: the caller was told the spawn failed, and
-                // the failure must stay addressable and settle on its own.
-                return Ok(SpawnOutcome::Undecided(message.into()));
+                // `go` is published (or another party arbitrates this spawn),
+                // so the command may run after this wait expires. Never answer
+                // a refusal here: the host would retry a command that already
+                // has side effects. The settlement carries the real outcome.
+                return Ok(SpawnOutcome::Accepted);
             }
             std::thread::sleep(Duration::from_millis(5));
         }
