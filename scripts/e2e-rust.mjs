@@ -166,6 +166,23 @@ async function main() {
   assert.equal((await settled(client, background)).exitCode, 0)
   ok('background descendant cannot hold settlement open')
 
+  // A settlement announced while no host connection existed must still reach
+  // the reconnecting host: the event is sent once and never repeated.
+  const replay = await exec(client, 'sleep 1; exit 5');
+  await until(() => existsSync(join(state, replay, 'status.json')), 'replay execution starts');
+  await stop(runner, 'SIGKILL');
+  await sleep(2000);
+  runner = startExecutor();
+  ;(await ready()).close();
+  const revived = await host();
+  client = revived.client;
+  const replayRow = revived.hello.executions.find(row => row.executionId === replay);
+  assert(replayRow, 'the adopted execution is reported at handshake');
+  assert.equal(replayRow.state, 'exited');
+  assert.equal(replayRow.exitCode, 5);
+  await until(() => client.events.some(frame => frame.method === 'settled' && frame.payload.executionId === replay && frame.payload.exitCode === 5), 'replayed settlement');
+  ok('a settlement nobody was subscribed for is replayed to the reconnecting host');
+
   const survivor = await exec(client, 'i=0; while [ "$i" -lt 5 ]; do echo marker-$i; i=$((i+1)); sleep 1; done; exit 7')
   const logPath = join(state, survivor, 'stdout.log')
   await until(() => existsSync(logPath) && readFileSync(logPath, 'utf8').includes('marker-0'), 'first marker')
@@ -193,17 +210,61 @@ async function main() {
   assert.equal((await settled(client, termSurvivor)).exitCode, 4)
   ok('executor SIGTERM leaves shim and command running')
 
-  // A forged identity must not adopt or signal any process.
-  await stop(runner, 'SIGTERM')
-  const mismatch = status(survivor)
-  mismatch.state = 'running'
-  mismatch.processStartTime += 1
-  writeFileSync(join(state, survivor, 'status.json'), JSON.stringify(mismatch))
-  runner = startExecutor()
+  // A forged supervisor identity must not adopt or signal any process.
+  const forged = await exec(client, 'sleep 60');
+  await until(() => existsSync(join(state, forged, 'status.json')), 'forged execution starts');
+  await sleep(300);
+  await stop(runner, 'SIGTERM');
+  const mismatch = status(forged);
+  mismatch.shimStartTime += 1;
+  writeFileSync(join(state, forged, 'status.json'), JSON.stringify(mismatch));
+  runner = startExecutor();
   ;(await ready()).close()
-  ;({ client } = await host())
-  assert.equal((await client.request('state', { executionId: survivor })).state, 'lost')
-  ok('mismatched process start time becomes lost')
+  ;({ client } = await host());
+  assert.equal((await client.request('state', { executionId: forged })).state, 'lost');
+  ok('mismatched supervisor start time becomes lost')
+  // Two executors on one state directory would each adopt the other's shims.
+  const rival = spawn(binary, ['--state', state, '--history', history, '--socket', join(root, 'rival.sock'), '--lease-ttl-ms', '60000'], {
+    cwd: root, env: { ...process.env, DSH_HOME: join(root, 'home') }, stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  let rivalError = '';
+  rival.stderr.on('data', chunk => { rivalError += chunk });
+  const [rivalCode] = await once(rival, 'exit');
+  assert.notEqual(rivalCode, 0, 'the second executor must refuse to start');
+  assert(rivalError.includes('already owned by another executor'), rivalError);
+  const stillAlive = await exec(client, 'echo owned');
+  assert.equal((await settled(client, stillAlive)).exitCode, 0);
+  ok('a second executor on the same state directory refuses to start');
+
+  // A descendant that leaves the group and keeps a pipe open cannot stall the
+  // shim: the stream is lossy and the terminal facts are published anyway.
+  const detachedStarted = Date.now();
+  const detached = await exec(client, 'setsid sleep 5 & echo x', { graceMs: 200 });
+  const detachedState = await settled(client, detached);
+  assert(Date.now() - detachedStarted < 3000, `settlement took ${Date.now() - detachedStarted} ms`);
+  assert.equal(detachedState.state, 'exited');
+  assert.equal(status(detached).stdout.lossy, true);
+  ok('a detached descendant cannot hold settlement open');
+
+  // A shim still terminating its group has already reaped its direct child;
+  // adoption must judge the supervisor, not the child.
+  const reaped = await exec(client, "trap '' TERM; (sleep 30) & exit 3", { graceMs: 6000 });
+  await sleep(1000);
+  await stop(runner, 'SIGKILL');
+  runner = startExecutor();
+  ;(await ready()).close();
+  ;({ client } = await host());
+  const reapedState = await settled(client, reaped);
+  assert.equal(reapedState.state, 'exited');
+  assert.equal(reapedState.exitCode, 3);
+  ok('a reaped child with a live supervisor survives a restart');
+
+  // A command that cannot be started fails the exec reply itself.
+  const spawnFailure = await exec(client, '/bin/true', { cwd: join(root, 'no-such-directory') }).then(() => null, error => error);
+  assert(spawnFailure, 'the exec reply must be an error');
+  assert(String(spawnFailure.message).includes('cannot start'), String(spawnFailure.message));
+  ok('a spawn failure surfaces synchronously from exec');
+
   const hub = await startHub()
   const liveStats = await (await fetch(`${hub.url}/api/stats`)).json()
   assert.equal(liveStats.executor, 'available')
@@ -224,6 +285,9 @@ async function main() {
   assert.equal(degraded.history, 'available')
   assert.equal(degraded.live, undefined)
   assert.equal((await (await fetch(`${hub.url}/api/execution?id=${basic}`)).json()).exitCode, 3)
+  const reapedDetail = await (await fetch(`${hub.url}/api/execution?id=${reaped}`)).json();
+  assert.equal(reapedDetail.state, 'exited');
+  assert.equal(reapedDetail.exitCode, 3);
   await stop(hub.child, 'SIGTERM')
   const emptyHub = await startHub(join(root, 'missing.sqlite'))
   assert((await (await fetch(`${emptyHub.url}/`)).text()).includes('History unavailable'))
