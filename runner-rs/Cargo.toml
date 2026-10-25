@@ -1,0 +1,22 @@
+[package]
+name = "dsh-shellout-runner"
+version = "0.2.0"
+edition = "2021"
+description = "Execution plane for DSH-shellout: spawns, supervises and captures agent-issued processes"
+license = "Apache-2.0"
+repository = "https://github.com/NolanHo/DSH-shellout"
+
+[[bin]]
+name = "dsh-shellout-runner"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
