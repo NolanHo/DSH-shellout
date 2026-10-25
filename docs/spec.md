@@ -1,3 +1,6 @@
+> Architecture, ownership and guarantees across the hub, executor and shim
+> processes live in [execution-plane.md](execution-plane.md).
+
 # DSH-shellout — Specification
 
 Status: **implemented (shell path)** · Version: 0.2 · Date: 2026-10-24
