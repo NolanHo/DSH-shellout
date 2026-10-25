@@ -10,7 +10,7 @@ use tokio::sync::broadcast;
 
 use crate::legacy::{is_legacy, to_spawn_spec, LegacyExecRequest};
 use crate::protocol::{
-    error_reply, read_frame, reply, write_frame, DrainRequest, Envelope, ExecRequest, ExecutionRef,
+    error_reply, reply, write_frame, DrainRequest, Envelope, ExecRequest, ExecutionRef, Frames,
     HelloRequest, PingRequest, ReadStreamRequest,
 };
 
@@ -83,6 +83,7 @@ async fn handle_connection(
     config: Config,
 ) -> std::io::Result<()> {
     let (mut reader, mut writer) = stream.into_split();
+    let mut frames = Frames::new(&mut reader);
     let mut events: Option<broadcast::Receiver<Value>> = None;
     let mut observer = false;
     let mut max_frame_bytes = config.max_frame_bytes;
@@ -90,7 +91,7 @@ async fn handle_connection(
 
     loop {
         tokio::select! {
-            frame = read_frame(&mut reader, max_frame_bytes) => {
+            frame = frames.next(max_frame_bytes) => {
                 let envelope = match frame {
                     Ok(Some(envelope)) => envelope,
                     Ok(None) => break,
@@ -331,6 +332,8 @@ fn bounded_snapshot(id: u64, method: &str, snapshot: Value, cap: usize) -> Value
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::Frames;
+    use tokio::io::AsyncWriteExt;
 
     fn config() -> Config {
         Config {
@@ -406,6 +409,43 @@ mod tests {
             assert_eq!(response["kind"], "err");
             assert!(!observer);
         }
+    }
+
+    #[tokio::test]
+    async fn a_request_split_around_an_event_still_replies() {
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        let registry = Registry::new(8, std::time::Duration::from_secs(10));
+        let task = tokio::spawn(handle_connection(server, Arc::clone(&registry), config()));
+        let (mut reader, mut writer) = client.split();
+        let mut replies = Frames::new(&mut reader);
+
+        let hello = json!({"id": 1, "kind": "req", "method": "hello",
+            "payload": {"protocol": "2.0", "clientBuild": "test", "bootId": "test"}});
+        write_frame(&mut writer, &hello, 8192).await.unwrap();
+        assert_eq!(replies.next(8192).await.unwrap().unwrap().id, 1);
+
+        // Two writes with the handler parked on the second half; the settlement
+        // event wins the select and must not consume the request bytes.
+        let body = serde_json::to_vec(
+            &json!({"id": 2, "kind": "req", "method": "state", "payload": {"executionId": "x"}}),
+        )
+        .unwrap();
+        let mut frame = u32::try_from(body.len()).unwrap().to_be_bytes().to_vec();
+        frame.extend_from_slice(&body);
+        writer.write_all(&frame[..6]).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        registry.publish(crate::protocol::event(
+            "settled",
+            json!({"executionId": "x"}),
+        ));
+        let event_frame = replies.next(8192).await.unwrap().unwrap();
+        assert_eq!(event_frame.kind, "evt");
+        writer.write_all(&frame[6..]).await.unwrap();
+
+        let reply = replies.next(8192).await.unwrap().unwrap();
+        assert_eq!(reply.id, 2);
+        assert_eq!(reply.method, "error");
+        task.abort();
     }
 
     #[test]

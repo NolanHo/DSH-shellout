@@ -10,7 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixStream};
 use tokio::sync::Semaphore;
 
-use crate::protocol::{read_frame, write_frame, DEFAULT_MAX_FRAME_BYTES};
+use crate::protocol::{write_frame, Frames, DEFAULT_MAX_FRAME_BYTES};
 use crate::store::Store;
 
 const OBSERVE_DEADLINE: Duration = Duration::from_millis(500);
@@ -44,10 +44,11 @@ impl Hub {
             )
             .await
             .ok()?;
+            // One reader for the connection: a reply and an event may arrive
+            // in the same read, and the event is skipped without losing bytes.
+            let mut frames = Frames::new(&mut stream);
             loop {
-                let frame = read_frame(&mut stream, DEFAULT_MAX_FRAME_BYTES)
-                    .await
-                    .ok()??;
+                let frame = frames.next(DEFAULT_MAX_FRAME_BYTES).await.ok()??;
                 if frame.kind == "evt" {
                     continue;
                 }
@@ -373,14 +374,16 @@ mod tests {
         let listener = UnixListener::bind(&path.0).unwrap();
         let task = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let request = read_frame(&mut stream, DEFAULT_MAX_FRAME_BYTES)
+            let (mut reader, mut writer) = stream.split();
+            let request = Frames::new(&mut reader)
+                .next(DEFAULT_MAX_FRAME_BYTES)
                 .await
                 .unwrap()
                 .unwrap();
             assert_eq!(request.kind, "req");
             assert_eq!(request.method, "observe");
             for frame in frames {
-                write_frame(&mut stream, &frame, DEFAULT_MAX_FRAME_BYTES)
+                write_frame(&mut writer, &frame, DEFAULT_MAX_FRAME_BYTES)
                     .await
                     .unwrap();
             }
@@ -419,8 +422,9 @@ mod tests {
         let listener = UnixListener::bind(&path.0).unwrap();
         let task = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let _ = read_frame(&mut stream, DEFAULT_MAX_FRAME_BYTES).await;
-            stream.write_all(&100u32.to_be_bytes()).await.unwrap();
+            let (mut reader, mut writer) = stream.split();
+            let _ = Frames::new(&mut reader).next(DEFAULT_MAX_FRAME_BYTES).await;
+            writer.write_all(&100u32.to_be_bytes()).await.unwrap();
             tokio::time::sleep(Duration::from_secs(5)).await;
         });
         let hub = path.hub();
@@ -453,9 +457,10 @@ mod tests {
         let listener = UnixListener::bind(&path.0).unwrap();
         let task = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let _ = read_frame(&mut stream, DEFAULT_MAX_FRAME_BYTES).await;
-            stream.write_all(&1u32.to_be_bytes()).await.unwrap();
-            stream.write_all(b"{").await.unwrap();
+            let (mut reader, mut writer) = stream.split();
+            let _ = Frames::new(&mut reader).next(DEFAULT_MAX_FRAME_BYTES).await;
+            writer.write_all(&1u32.to_be_bytes()).await.unwrap();
+            writer.write_all(b"{").await.unwrap();
         });
         assert!(path.hub().observe(None).await.is_none());
         task.await.unwrap();

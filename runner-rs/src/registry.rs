@@ -175,6 +175,12 @@ impl Registry {
         self.events.subscribe()
     }
 
+    /// Test hook: deliver one event to current subscribers.
+    #[cfg(test)]
+    pub fn publish(&self, event: Value) {
+        let _ = self.events.send(event);
+    }
+
     pub fn attach(&self, boot: &str) -> Vec<Value> {
         self.boots
             .lock()
