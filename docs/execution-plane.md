@@ -79,10 +79,18 @@ a retention window (`--state-retention-ms`, default 15 s) has passed, so
 readers that follow the settlement event can still fetch the tail. Keep that
 window longer than the host's `disconnectGraceMs`: a host that reconnects
 inside its grace still has to read the execution it missed. Before the deletion
-the complete capture is hard-linked into the host's `capture.spillDir` as
-`<spillDir>/<executionId>-<stream>.log`, so the `spillPath` a reader was given
-keeps working; a read whose capture is gone reports `lossy` instead of an
-empty stream.
+a stream larger than its in-memory cap is copied into the host's
+`capture.spillDir` as `<spillDir>/<executionId>-<stream>.log`, so the
+`spillPath` a reader was given keeps working; a read whose capture is gone
+reports `lossy` instead of an empty stream.
+
+The executor owns the spills it creates and reclaims them: after
+`--spill-retention-ms` (default 10 min), and oldest-first whenever the spills it
+tracks exceed `--spill-max-bytes` (default 256 MiB), so a shared directory such
+as `/tmp` stays bounded. A spill is written atomically — a hard link when the
+spill directory shares the state filesystem, otherwise a temporary file and a
+rename — so the published path never names a partially copied stream. The host
+`spillDir` only stores the files; it is not asked to clean them up.
 
 ## Executor lifetime
 
@@ -182,6 +190,9 @@ Both modes resolve paths through the same resolver. Flags override environment:
 | `--socket` | `DSH_SHELLOUT_SOCKET` | `<DSH_HOME>/shellout/control.sock` |
 | `--executor-socket` | `DSH_SHELLOUT_EXECUTOR_SOCKET` | resolved `--socket` |
 | `--listen` | `DSH_SHELLOUT_LISTEN` | `127.0.0.1:3001` (hub HTTP only) |
+| `--state-retention-ms` | — | `15000` |
+| `--spill-retention-ms` | — | `600000` |
+| `--spill-max-bytes` | — | `268435456` |
 
 Absent `DSH_HOME`, use `$HOME/.dsh`. The executor has no HTTP listener;
 `--dashboard` and `DSH_SHELLOUT_DASHBOARD` are rejected. Start the hub with `--mode hub --listen <address>`.
@@ -190,11 +201,13 @@ the executor writes private metadata before admission and spawn.
 
 Capture keeps a **prefix**, not the old in-memory tail. Each stream's file cap
 is `capture.spillMaxBytes` when nonzero, otherwise its `stdoutMaxBytes` or
-`stderrMaxBytes`. When an execution is terminal and its capture is complete, the
-executor links the log into the host's `capture.spillDir` as
-`<spillDir>/<executionId>-<stream>.log`, and `spillPath` names that host-owned
-copy, which outlives the state directory. A truncated capture has no complete
-file and reports no `spillPath`. Readers continue draining pipes after the cap;
+`stderrMaxBytes`. When an execution is terminal and its capture is complete, a
+stream that exceeded its `stdoutMaxBytes`/`stderrMaxBytes` budget is linked into
+the host's `capture.spillDir` as `<spillDir>/<executionId>-<stream>.log`, and
+`spillPath` names that host-owned copy, which outlives the state directory. A
+smaller, empty or truncated capture gets no file: the host's mirror already
+holds it, and a truncated capture has no complete copy to offer. Readers
+continue draining pipes after the cap;
 `bytes` counts observed bytes, and `truncated`/`lossy` record loss. `readStream`
 offsets are log byte offsets, with replies capped at 256 KiB and the connection's
 frame budget; a read whose state directory has already been deleted falls back to

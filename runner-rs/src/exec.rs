@@ -59,6 +59,80 @@ fn shim_program() -> io::Result<PathBuf> {
     }
 }
 
+/// The spill files this executor created, with the policy that reclaims them.
+///
+/// A spill is host-owned storage for one complete stream, so it is not deleted
+/// with the state directory. Nothing else would ever remove it: the host only
+/// reads the path. The executor therefore keeps the inventory and deletes a
+/// spill once it is older than the retention window, or oldest-first when the
+/// total exceeds the budget, so a host spill directory stays bounded.
+pub struct SpillBook {
+    records: Mutex<Vec<SpillRecord>>,
+    retention: Duration,
+    budget: u64,
+}
+
+struct SpillRecord {
+    path: PathBuf,
+    bytes: u64,
+    created: Instant,
+}
+
+impl SpillBook {
+    pub fn new(retention: Duration, budget: u64) -> Self {
+        Self {
+            records: Mutex::new(Vec::new()),
+            retention,
+            budget,
+        }
+    }
+
+    fn record(&self, path: PathBuf, bytes: u64) {
+        let mut records = self.records.lock().expect("spill records poisoned");
+        if !records.iter().any(|record| record.path == path) {
+            records.push(SpillRecord {
+                path,
+                bytes,
+                created: Instant::now(),
+            });
+        }
+    }
+
+    /// Delete the spills this executor owns that outlived the retention window
+    /// or no longer fit the budget. Called from the executor's sweep.
+    pub fn prune(&self) {
+        let mut records = self.records.lock().expect("spill records poisoned");
+        if records.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut ordered: Vec<SpillRecord> = std::mem::take(&mut *records);
+        // Newest first: the newest spills are the ones a just-finished result
+        // is most likely to reference, so the budget evicts the oldest.
+        ordered.sort_by_key(|record| std::cmp::Reverse(record.created));
+        let mut total = 0u64;
+        let mut kept = Vec::with_capacity(ordered.len());
+        for record in ordered {
+            let fresh = now.duration_since(record.created) < self.retention;
+            if fresh && total.saturating_add(record.bytes) <= self.budget {
+                total += record.bytes;
+                kept.push(record);
+                continue;
+            }
+            match fs::remove_file(&record.path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    eprintln!("spill {}: cannot remove: {error}", record.path.display());
+                    // Keep it on the inventory so a later sweep retries.
+                    kept.push(record);
+                }
+            }
+        }
+        *records = kept;
+    }
+}
+
 pub struct Execution {
     pub meta: Meta,
     pub dir: PathBuf,
@@ -67,6 +141,9 @@ pub struct Execution {
     pub announced: AtomicBool,
     cleanup_at: Mutex<Option<Instant>>,
     removed: AtomicBool,
+    /// Set once the terminal capture's spill decision is final, so a pruned
+    /// spill is not recreated by the next poll.
+    spills_ready: AtomicBool,
 }
 
 #[derive(Default)]
@@ -178,44 +255,112 @@ impl Execution {
     ///
     /// The state directory is a working copy that retention deletes; the spill
     /// is the path a reader (and the model) was told to open, so it must outlive
-    /// it. A hard link keeps the bytes without copying; a cross-device spill
-    /// falls back to a copy.
-    pub fn ensure_spills(&self) {
+    /// it. Only a stream that outgrew the host's in-memory cap needs one: the
+    /// host already retains a smaller capture in its own mirror, so an empty or
+    /// small stream leaves no file behind. A hard link keeps the bytes without
+    /// copying; a cross-device spill copies through a temporary file and renames
+    /// it, so the published path only ever names a complete capture.
+    pub fn ensure_spills(&self, book: &SpillBook) {
         let status = self.state();
-        if status.state == "running" {
+        // A settled capture's spill decision is final: retention may delete the
+        // file later, and a poll must not recreate it.
+        if status.state == "running" || self.spills_ready.load(Ordering::Relaxed) {
             return;
         }
-        for (stream, truncated) in [
-            ("stdout", status.stdout.truncated),
-            ("stderr", status.stderr.truncated),
+        let mut settled = true;
+        for (stream, facts, cap) in [
+            (
+                "stdout",
+                &status.stdout,
+                self.meta.spec.capture.stdout_max_bytes,
+            ),
+            (
+                "stderr",
+                &status.stderr,
+                self.meta.spec.capture.stderr_max_bytes,
+            ),
         ] {
-            if truncated {
+            if facts.truncated || facts.bytes <= cap as u64 {
                 continue;
             }
             let Some(target) = self.spill_path(stream) else {
                 continue;
             };
-            if target.exists() {
-                continue;
+            // A file of the wrong size is the residue of an interrupted copy,
+            // not a complete capture: replace it instead of serving it.
+            if let Ok(metadata) = fs::metadata(&target) {
+                if metadata.len() == facts.bytes {
+                    book.record(target, metadata.len());
+                    continue;
+                }
+                if let Err(error) = fs::remove_file(&target) {
+                    if error.kind() != io::ErrorKind::NotFound {
+                        eprintln!(
+                            "execution {}: cannot replace the partial {stream} spill: {error}",
+                            self.meta.id
+                        );
+                        settled = false;
+                        continue;
+                    }
+                }
             }
             if let Some(parent) = target.parent() {
-                let _ = fs::create_dir_all(parent);
+                if let Err(error) = fs::create_dir_all(parent) {
+                    eprintln!(
+                        "execution {}: cannot create the spill directory: {error}",
+                        self.meta.id
+                    );
+                    settled = false;
+                    continue;
+                }
             }
             let source = self.dir.join(format!("{stream}.log"));
             if fs::hard_link(&source, &target).is_err() {
-                if let Err(error) = fs::copy(&source, &target) {
+                if let Err(error) = copy_spill(&source, &target) {
                     if error.kind() != io::ErrorKind::NotFound {
                         eprintln!(
                             "execution {}: cannot write the {stream} spill: {error}",
                             self.meta.id
                         );
+                        settled = false;
                     }
+                    continue;
+                }
+            }
+            match fs::metadata(&target) {
+                Ok(metadata) if metadata.len() == facts.bytes => {
+                    book.record(target, metadata.len());
+                }
+                Ok(metadata) => {
+                    eprintln!(
+                        "execution {}: the {stream} spill is {} bytes, expected {}",
+                        self.meta.id,
+                        metadata.len(),
+                        facts.bytes
+                    );
+                    settled = false;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "execution {}: cannot size the {stream} spill: {error}",
+                        self.meta.id
+                    );
+                    settled = false;
                 }
             }
         }
+        if settled {
+            self.spills_ready.store(true, Ordering::Relaxed);
+        }
     }
 
-    pub fn read_stream(&self, stream: &str, offset: u64, limit: usize) -> io::Result<Value> {
+    pub fn read_stream(
+        &self,
+        stream: &str,
+        offset: u64,
+        limit: usize,
+        book: &SpillBook,
+    ) -> io::Result<Value> {
         let status = self.state();
         let truncated = if stream == "stderr" {
             status.stderr.truncated
@@ -223,7 +368,7 @@ impl Execution {
             status.stdout.truncated
         };
         if status.state != "running" {
-            self.ensure_spills();
+            self.ensure_spills(book);
         }
         // Only an existing spill is a path a reader can rely on.
         let spill = self.spill_path(stream).filter(|path| path.exists());
@@ -237,12 +382,12 @@ impl Execution {
         )
     }
 
-    pub fn detail(&self) -> Value {
+    pub fn detail(&self, book: &SpillBook) -> Value {
         let mut value = self.summary();
         value["argv"] = json!(self.meta.spec.argv);
         value["cwd"] = json!(self.meta.spec.cwd);
         for stream in ["stdout", "stderr"] {
-            match self.read_stream(stream, 0, capture::READ_LIMIT) {
+            match self.read_stream(stream, 0, capture::READ_LIMIT, book) {
                 Ok(read) => {
                     value[stream] = read["text"].clone();
                     value[format!("{stream}Lossy")] = read["lossy"].clone();
@@ -335,6 +480,38 @@ impl Execution {
     }
 }
 
+/// Copy a capture into the spill directory atomically.
+///
+/// The destination is written beside the target under a temporary name and
+/// renamed into place, so a reader either sees no spill or the complete
+/// capture — never a half-written file that reads as complete.
+fn copy_spill(source: &Path, target: &Path) -> io::Result<()> {
+    copy_spill_with(source, target, |from, to| fs::copy(from, to).map(|_| ()))
+}
+
+fn copy_spill_with(
+    source: &Path,
+    target: &Path,
+    copy: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let temporary = temporary_spill(target);
+    let _ = fs::remove_file(&temporary);
+    let result = copy(source, &temporary).and_then(|()| fs::rename(&temporary, target));
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// The sibling a copy writes before it is renamed onto `target`.
+fn temporary_spill(target: &Path) -> PathBuf {
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    target.with_file_name(format!("{name}.tmp.{}", std::process::id()))
+}
+
 pub fn admit(meta: Meta, state: &Path, store: &Store) -> io::Result<Admission> {
     let dir = state.join(&meta.id);
     fs::create_dir(&dir)?;
@@ -347,6 +524,7 @@ pub fn admit(meta: Meta, state: &Path, store: &Store) -> io::Result<Admission> {
         announced: AtomicBool::new(false),
         cleanup_at: Mutex::new(None),
         removed: AtomicBool::new(false),
+        spills_ready: AtomicBool::new(false),
     });
     if let Err(error) = execution.persist(store) {
         // No child has been spawned. Remove only the admission metadata we own
@@ -543,5 +721,62 @@ pub fn load(dir: PathBuf, store: Option<&Store>) -> io::Result<Arc<Execution>> {
         announced: AtomicBool::new(false),
         cleanup_at: Mutex::new(None),
         removed: AtomicBool::new(false),
+        spills_ready: AtomicBool::new(false),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_interrupted_spill_copy_never_publishes_a_partial_file() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(".test-state/spill-atomic");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("scratch");
+        let source = root.join("stdout.log");
+        let bytes: Vec<u8> = (0..4096).map(|index| b'a' + (index % 26) as u8).collect();
+        fs::write(&source, &bytes).expect("source");
+        let target = root.join("execution-stdout.log");
+
+        let error = copy_spill_with(&source, &target, |from, to| {
+            let half = fs::read(from)?;
+            fs::write(to, &half[..half.len() / 2])?;
+            Err(io::Error::other("copy interrupted"))
+        })
+        .expect_err("an interrupted copy is reported");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(
+            !target.exists(),
+            "a reader must never see an interrupted copy as the complete spill"
+        );
+        assert!(
+            !temporary_spill(&target).exists(),
+            "an interrupted copy leaves no temporary file"
+        );
+
+        copy_spill(&source, &target).expect("the retry publishes the capture");
+        assert_eq!(fs::read(&target).expect("spill"), bytes);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn the_spill_budget_evicts_the_oldest_files_first() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(".test-state/spill-budget");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("scratch");
+        let book = SpillBook::new(Duration::from_secs(600), 10);
+        let older = root.join("older-stdout.log");
+        let newer = root.join("newer-stdout.log");
+        fs::write(&older, b"123456").expect("older spill");
+        book.record(older.clone(), 6);
+        std::thread::sleep(Duration::from_millis(5));
+        fs::write(&newer, b"abcdef").expect("newer spill");
+        book.record(newer.clone(), 6);
+
+        book.prune();
+        assert!(!older.exists(), "the oldest spill is evicted first");
+        assert!(newer.exists(), "the newest spill stays inside the budget");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
 }

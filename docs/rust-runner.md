@@ -15,7 +15,7 @@ operating-system work:
 | Process creation | executor spawns a detached shim; shim starts the command with `setsid` |
 | Output capture | shim drains stdout/stderr into append-only files in the execution state directory |
 | Capture limits | `spillMaxBytes` caps each file; zero uses each stream's capture budget; retains the prefix |
-| Spill | a complete capture is hard-linked into the host's `spillDir` and survives the state directory |
+| Spill | only a stream beyond its in-memory cap is copied into the host's `spillDir`, atomically, and reclaimed by `--spill-retention-ms`/`--spill-max-bytes` |
 | Lossy reads | per-stream truncation and invalid UTF-8 are reported, never hidden |
 | Deadline | shim enforces `timeoutMs` independently of the executor |
 | Termination | shim sends `SIGTERM` to the group, then `SIGKILL` after `graceMs` |
@@ -23,8 +23,8 @@ operating-system work:
 | Adoption | a restarted executor re-adopts a live shim and settles it from `status.json` |
 | Leases | a host boot's executions are terminated when its lease expires |
 | Ownership | one executor per state directory, claimed with `flock` on `<state>/.lock` |
-| Retention | a settled execution's directory is deleted once its history row is durable (`--state-retention-ms`, default 15 s) |
-| Spawn admission | the executor claims the spawn (`O_EXCL`); the shim starts only after `go`, and a timeout refuses the command and records `failed` |
+| Retention | a settled execution's directory is deleted once its history row is durable (`--state-retention-ms`, default 15 s); host spills follow `--spill-retention-ms` |
+| Spawn admission | the executor claims the spawn (`O_EXCL`); the shim starts only after `go`; a pre-verdict timeout refuses the command, a post-verdict one reports the execution and settles it for real |
 | Deployment | the shim runs the image through `/proc/self/exe`, so replacing the binary file does not break later executions |
 
 The executor holds no sessions, model connection, HTTP surface or harness dependency.

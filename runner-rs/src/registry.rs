@@ -41,6 +41,7 @@ pub struct Registry {
     store: Option<Arc<Store>>,
     state_dir: PathBuf,
     state_retention: Duration,
+    spills: exec::SpillBook,
     persistence_error: Mutex<Option<String>>,
 }
 
@@ -49,6 +50,14 @@ pub struct Registry {
 /// must outlast the host's `disconnectGraceMs`: a host that reconnects inside
 /// its grace still has to be able to read the execution it missed.
 pub const DEFAULT_STATE_RETENTION: Duration = Duration::from_secs(15);
+
+/// How long the executor keeps a host-owned spill file after creating it. A
+/// spill only exists for output larger than the host's in-memory cap, and it is
+/// the path a finished result points at; the window bounds that promise.
+pub const DEFAULT_SPILL_RETENTION: Duration = Duration::from_secs(600);
+
+/// Total size of the spills this executor keeps before it evicts the oldest.
+pub const DEFAULT_SPILL_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 
 impl Registry {
     #[cfg(test)]
@@ -67,6 +76,7 @@ impl Registry {
             store: None,
             state_dir: PathBuf::new(),
             state_retention: DEFAULT_STATE_RETENTION,
+            spills: exec::SpillBook::new(DEFAULT_SPILL_RETENTION, DEFAULT_SPILL_BUDGET_BYTES),
             persistence_error: Mutex::new(None),
         })
     }
@@ -85,12 +95,34 @@ impl Registry {
             DEFAULT_STATE_RETENTION,
         )
     }
+    #[cfg(test)]
     pub fn with_retention(
         max_concurrent: usize,
         lease_ttl: Duration,
         store: Option<Arc<Store>>,
         state_dir: PathBuf,
         state_retention: Duration,
+    ) -> std::io::Result<Arc<Self>> {
+        Self::with_spill_policy(
+            max_concurrent,
+            lease_ttl,
+            store,
+            state_dir,
+            state_retention,
+            DEFAULT_SPILL_RETENTION,
+            DEFAULT_SPILL_BUDGET_BYTES,
+        )
+    }
+
+    /// Build a registry with the spill retention and budget the deployment wants.
+    pub fn with_spill_policy(
+        max_concurrent: usize,
+        lease_ttl: Duration,
+        store: Option<Arc<Store>>,
+        state_dir: PathBuf,
+        state_retention: Duration,
+        spill_retention: Duration,
+        spill_budget: u64,
     ) -> std::io::Result<Arc<Self>> {
         std::fs::create_dir_all(&state_dir)?;
         let (events, _) = broadcast::channel(1024);
@@ -107,6 +139,7 @@ impl Registry {
             store,
             state_dir,
             state_retention,
+            spills: exec::SpillBook::new(spill_retention, spill_budget),
             persistence_error: Mutex::new(None),
         });
         registry.adopt()?;
@@ -250,7 +283,7 @@ impl Registry {
             .ok()?
             .get(id)
             .filter(|execution| execution.running())
-            .map(|execution| execution.detail())
+            .map(|execution| execution.detail(&self.spills))
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Value> {
@@ -433,17 +466,17 @@ impl Registry {
         limit: usize,
     ) -> Result<Value, Failure> {
         self.get(id)?
-            .read_stream(stream, offset, limit)
+            .read_stream(stream, offset, limit, &self.spills)
             .map_err(|error| Failure::new("capture", error.to_string()))
     }
 
     pub fn read_output(&self, id: &str) -> Result<Value, Failure> {
         let execution = self.get(id)?;
         let out = execution
-            .read_stream("stdout", 0, crate::capture::READ_LIMIT)
+            .read_stream("stdout", 0, crate::capture::READ_LIMIT, &self.spills)
             .map_err(|e| Failure::new("capture", e.to_string()))?;
         let err = execution
-            .read_stream("stderr", 0, crate::capture::READ_LIMIT)
+            .read_stream("stderr", 0, crate::capture::READ_LIMIT, &self.spills)
             .map_err(|e| Failure::new("capture", e.to_string()))?;
         let stdout = out["text"].as_str().unwrap_or("");
         let stderr = err["text"].as_str().unwrap_or("");
@@ -492,6 +525,9 @@ impl Registry {
 
     pub fn sweep(&self) {
         self.poll();
+        // Spills are host-owned files that outlive the state directory, so
+        // nothing but this pass ever reclaims them.
+        self.spills.prune();
         let now = Instant::now();
         let expired: Vec<_> = self
             .boots
@@ -558,7 +594,7 @@ impl Registry {
     /// window for a reader following its settlement event has passed.
     fn retire(&self, execution: &Execution) {
         // The host-owned spill must exist before the working copy is deleted.
-        execution.ensure_spills();
+        execution.ensure_spills(&self.spills);
         if execution.running()
             || execution.dirty.load(Ordering::Relaxed)
             || !execution.announced.load(Ordering::Relaxed)

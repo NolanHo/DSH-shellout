@@ -167,7 +167,8 @@ Ordering: the runner sends `settled` **after** the final output bytes are readab
   `lossy: true` with the spill path — which the seam already permits.
 - `spillPath` names the complete stream in the host's configured `spillDir`, which outlives the
   runner's ephemeral state directory; a capture that is gone is reported as `lossy`, never as a
-  clean empty read.
+  clean empty read. A stream that did not exceed its in-memory cap has no file, and the runner
+  reclaims the files it owns after `--spill-retention-ms` or its `--spill-max-bytes` budget.
 - `readOutput()` consumes from a cursor over the same bytes, appending a stderr section exactly as
   the local executor does.
 - Before `done` resolves, the poller performs one final drain so no tail is lost; `settled` is only

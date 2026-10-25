@@ -139,7 +139,7 @@ fn main() -> std::io::Result<()> {
                     None
                 }
             };
-            let registry = registry::Registry::with_retention(
+            let registry = registry::Registry::with_spill_policy(
                 config.max_concurrent,
                 Duration::from_millis(config.lease_ttl_ms),
                 store,
@@ -148,6 +148,11 @@ fn main() -> std::io::Result<()> {
                     "--state-retention-ms",
                     registry::DEFAULT_STATE_RETENTION.as_millis() as u64,
                 )),
+                Duration::from_millis(arg_number(
+                    "--spill-retention-ms",
+                    registry::DEFAULT_SPILL_RETENTION.as_millis() as u64,
+                )),
+                arg_number("--spill-max-bytes", registry::DEFAULT_SPILL_BUDGET_BYTES),
             )?;
             eprintln!(
                 "dsh-shellout-runner {} listening on {}",
