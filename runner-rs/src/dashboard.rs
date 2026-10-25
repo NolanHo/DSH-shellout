@@ -106,6 +106,9 @@ header{flex:none;display:flex;flex-wrap:wrap;gap:14px;align-items:center;padding
 .tools{flex:none;display:flex;gap:8px;align-items:center;padding:8px 12px;border-bottom:1px solid var(--line)}
 .tools input{flex:1;background:#0b0d11;border:1px solid #242833;border-radius:8px;color:var(--ink);padding:5px 9px;font:12px/1.4 ui-monospace,Menlo,monospace}
 .tools input:focus{outline:none;border-color:var(--accent)}
+.filters{flex:none;display:flex;gap:6px;padding:8px 12px 0}
+.fbtn{background:#171a21;border:1px solid #242833;border-radius:8px 8px 0 0;color:var(--dim);padding:5px 14px;font-size:12px;cursor:pointer;border-bottom:none}
+.fbtn.on{background:var(--bg);border-color:var(--accent);color:#cfe0ff}
 .toggle{background:#171a21;border:1px solid #242833;border-radius:8px;color:var(--dim);padding:4px 10px;font-size:11px;cursor:pointer}
 .toggle.on{border-color:var(--accent);color:#cfe0ff}
 #listScroll{flex:1;min-height:0;overflow:auto}
@@ -136,13 +139,18 @@ pre{margin:0 0 12px;padding:11px 13px;background:#0b0d11;border:1px solid #22262
   <span class="meta" id="sub">connecting…</span>
   <div class="pills" id="pills"></div>
 </header>
+<div class="filters" id="filters">
+  <button class="fbtn on" data-filter="all">全部 <b data-count="all">0</b></button>
+  <button class="fbtn" data-filter="running">运行中 <b data-count="running">0</b></button>
+  <button class="fbtn" data-filter="finished">已结束 <b data-count="finished">0</b></button>
+</div>
 <div class="tools">
   <input id="filter" placeholder="filter by command…" autocomplete="off">
   <button class="toggle on" id="follow" title="pause the two-second refresh">follow</button>
 </div>
 <div id="listScroll">
-  <table><thead><tr><th>exec</th><th>command</th><th>state</th><th>exit</th><th>time</th></tr></thead>
-  <tbody id="rows"><tr><td colspan="5" class="empty">no executions yet</td></tr></tbody></table>
+  <table><thead><tr><th>exec</th><th>command</th><th>state</th><th>exit</th><th>started</th><th>duration</th></tr></thead>
+  <tbody id="rows"><tr><td colspan="6" class="empty">no executions yet</td></tr></tbody></table>
 </div>
 <script>
 const fmt = (ms) => ms == null ? '\u2014' : ms < 1000 ? ms + ' ms' : (ms / 1000).toFixed(1) + ' s'
@@ -150,9 +158,16 @@ const esc = (text) => String(text).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<'
 let selected = null
 let tab = 'stdout'
 let filter = ''
+let kind = 'all'
 let follow = true
 let rowsCache = []
 let detailCache = null
+
+const clock = (ms) => {
+  if (ms == null) return '\u2014'
+  const d = new Date(ms)
+  return d.toLocaleTimeString([], { hour12: false })
+}
 
 const commandLine = (execution) => {
   const argv = execution.argv || []
@@ -197,12 +212,24 @@ function detailMarkup(d) {
 
 function render() {
   const needle = filter.trim().toLowerCase()
-  const visible = needle === '' ? rowsCache : rowsCache.filter(e => commandLine(e).toLowerCase().includes(needle))
+  const byKind = kind === 'running' ? rowsCache.filter(e => e.state === 'running')
+    : kind === 'finished' ? rowsCache.filter(e => e.state !== 'running')
+    : rowsCache
+  const visible = needle === '' ? byKind : byKind.filter(e => commandLine(e).toLowerCase().includes(needle))
+  const counts = {
+    all: rowsCache.length,
+    running: rowsCache.filter(e => e.state === 'running').length,
+    finished: rowsCache.filter(e => e.state !== 'running').length,
+  }
+  for (const [key, value] of Object.entries(counts)) {
+    const node = document.querySelector(`[data-count="${key}"]`)
+    if (node) node.textContent = String(value)
+  }
   const scroll = document.getElementById('listScroll')
   const keepTop = scroll.scrollTop
   const rows = document.getElementById('rows')
   if (visible.length === 0) {
-    rows.innerHTML = `<tr><td colspan="5" class="empty">${rowsCache.length === 0 ? 'no executions yet' : 'nothing matches the filter'}</td></tr>`
+    rows.innerHTML = `<tr><td colspan="6" class="empty">${rowsCache.length === 0 ? 'no executions yet' : 'nothing matches the filter'}</td></tr>`
     return
   }
   let html = ''
@@ -212,10 +239,11 @@ function render() {
       <td class="cmd" title="${esc(commandLine(e))}">${esc(commandLine(e))}</td>
       <td><span class="badge ${e.state}">${e.state}</span></td>
       <td>${e.exitCode == null ? '\u2014' : e.exitCode}</td>
+      <td>${clock(e.startedAtMs)}</td>
       <td>${fmt(e.durationMs != null ? e.durationMs : e.ageMs)}</td>
     </tr>`
     if (e.id === selected) {
-      html += `<tr class="detail" data-detail><td colspan="5">${detailMarkup(detailCache)}</td></tr>`
+      html += `<tr class="detail" data-detail><td colspan="6">${detailMarkup(detailCache)}</td></tr>`
     }
   }
   rows.innerHTML = html
@@ -235,10 +263,7 @@ function render() {
 async function loadList() {
   const { executions } = await (await fetch('/api/executions', { cache: 'no-store' })).json()
   rowsCache = executions
-  if (selected === null && executions[0]) {
-    selected = executions[0].id
-    await loadDetail()
-  } else if (selected !== null && !executions.some(e => e.id === selected)) {
+  if (selected !== null && !executions.some(e => e.id === selected)) {
     detailCache = null
   }
   render()
@@ -267,6 +292,13 @@ function toggle(id) {
   })
 }
 
+for (const button of document.querySelectorAll('.fbtn')) {
+  button.addEventListener('click', () => {
+    kind = button.dataset.filter
+    for (const other of document.querySelectorAll('.fbtn')) other.classList.toggle('on', other === button)
+    render()
+  })
+}
 document.getElementById('follow').addEventListener('click', (event) => {
   follow = !follow
   event.target.classList.toggle('on', follow)

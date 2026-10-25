@@ -7,7 +7,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 use tokio::sync::broadcast;
@@ -54,6 +54,10 @@ pub struct Execution {
     pub started: Instant,
     /// When it settled.
     pub settled_at: Mutex<Option<Instant>>,
+    /// Wall-clock start, for the dashboard's started column.
+    pub started_wall: SystemTime,
+    /// Wall-clock settlement.
+    pub settled_wall: Mutex<Option<SystemTime>>,
     /// Captured stdout.
     pub stdout: Arc<Mutex<CaptureState>>,
     /// Captured stderr.
@@ -134,6 +138,8 @@ impl Execution {
             "signal": state.signal,
             "ageMs": self.started.elapsed().as_millis() as u64,
             "durationMs": finished.map(|at| at.saturating_duration_since(self.started).as_millis() as u64),
+            "startedAtMs": epoch_millis(self.started_wall),
+            "finishedAtMs": self.settled_wall.lock().ok().and_then(|guard| *guard).map(epoch_millis),
             "stdout": stdout,
             "stderr": stderr,
             "lossy": stdout_lossy || stderr_lossy,
@@ -231,6 +237,8 @@ pub fn spawn_execution(
         cwd: spec.cwd.clone(),
         started: Instant::now(),
         settled_at: Mutex::new(None),
+        started_wall: SystemTime::now(),
+        settled_wall: Mutex::new(None),
         operation_id,
         digest,
         boot_id: boot_id.clone(),
@@ -280,6 +288,9 @@ pub fn spawn_execution(
         if let Ok(mut guard) = supervisor.settled_at.lock() {
             *guard = Some(Instant::now());
         }
+        if let Ok(mut guard) = supervisor.settled_wall.lock() {
+            *guard = Some(SystemTime::now());
+        }
         let status = if killed { "killed" } else { "exited" };
         if killed {
             counters.killed.fetch_add(1, Ordering::Relaxed);
@@ -323,6 +334,11 @@ fn pump<R: Read + Send + 'static>(
             }
         }
     })
+}
+
+/// Epoch milliseconds for a wall-clock instant.
+fn epoch_millis(at: SystemTime) -> u64 {
+    at.duration_since(UNIX_EPOCH).map(|since| since.as_millis() as u64).unwrap_or(0)
 }
 
 /// Wait for the child and return its exit status.
