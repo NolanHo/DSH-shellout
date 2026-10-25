@@ -165,6 +165,54 @@ impl Execution {
             "detail":status.error})
     }
 
+    /// The host-owned spill path for one stream; `None` when the spec names none.
+    fn spill_path(&self, stream: &str) -> Option<PathBuf> {
+        let directory = self.meta.spec.capture.spill_dir.trim();
+        (!directory.is_empty())
+            .then(|| Path::new(directory).join(format!("{}-{stream}.log", self.meta.id)))
+    }
+
+    /// Link the finished capture into the host's spill directory.
+    ///
+    /// The state directory is a working copy that retention deletes; the spill
+    /// is the path a reader (and the model) was told to open, so it must outlive
+    /// it. A hard link keeps the bytes without copying; a cross-device spill
+    /// falls back to a copy.
+    pub fn ensure_spills(&self) {
+        let status = self.state();
+        if status.state == "running" {
+            return;
+        }
+        for (stream, truncated) in [
+            ("stdout", status.stdout.truncated),
+            ("stderr", status.stderr.truncated),
+        ] {
+            if truncated {
+                continue;
+            }
+            let Some(target) = self.spill_path(stream) else {
+                continue;
+            };
+            if target.exists() {
+                continue;
+            }
+            if let Some(parent) = target.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let source = self.dir.join(format!("{stream}.log"));
+            if fs::hard_link(&source, &target).is_err() {
+                if let Err(error) = fs::copy(&source, &target) {
+                    if error.kind() != io::ErrorKind::NotFound {
+                        eprintln!(
+                            "execution {}: cannot write the {stream} spill: {error}",
+                            self.meta.id
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     pub fn read_stream(&self, stream: &str, offset: u64, limit: usize) -> io::Result<Value> {
         let status = self.state();
         let truncated = if stream == "stderr" {
@@ -172,7 +220,19 @@ impl Execution {
         } else {
             status.stdout.truncated
         };
-        capture::read_stream(&self.dir, stream, offset, limit, truncated)
+        if status.state != "running" {
+            self.ensure_spills();
+        }
+        // Only an existing spill is a path a reader can rely on.
+        let spill = self.spill_path(stream).filter(|path| path.exists());
+        capture::read_stream(
+            &self.dir,
+            spill.as_deref(),
+            stream,
+            offset,
+            limit,
+            truncated,
+        )
     }
 
     pub fn detail(&self) -> Value {

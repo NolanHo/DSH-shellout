@@ -536,6 +536,8 @@ impl Registry {
     /// Delete the files of a settled execution once its row is durable and the
     /// window for a reader following its settlement event has passed.
     fn retire(&self, execution: &Execution) {
+        // The host-owned spill must exist before the working copy is deleted.
+        execution.ensure_spills();
         if execution.running()
             || execution.dirty.load(Ordering::Relaxed)
             || !execution.announced.load(Ordering::Relaxed)

@@ -96,7 +96,7 @@ export interface CapturePolicy {
   readonly stderrMaxBytes: number
   /** Whole-stream cap for a spill file; a larger stream discards its spill. */
   readonly spillMaxBytes: number
-  /** Directory the runner writes spill files to. */
+  /** Directory the runner links the completed capture into; it outlives the runner's state. */
   readonly spillDir: string
 }
 
@@ -143,7 +143,10 @@ export interface StreamRead {
   readonly nextOffset: number
   /** True when the requested offset slid out of the retained window. */
   readonly lossy: boolean
-  /** Complete-stream file the runner currently keeps, when it keeps one. */
+  /**
+   * Complete-stream file in the host's `spillDir`, when the capture is complete.
+   * It outlives the runner's state directory, so a reader may open it later.
+   */
   readonly spillPath?: string
 }
 

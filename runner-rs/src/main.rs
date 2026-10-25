@@ -42,6 +42,7 @@ fn arg_number(name: &str, default: u64) -> u64 {
 
 struct Paths {
     state: PathBuf,
+    spill: PathBuf,
     history: PathBuf,
     socket: String,
     executor_socket: String,
@@ -59,6 +60,7 @@ impl Paths {
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("DSH_SHELLOUT_STATE").map(PathBuf::from))
             .unwrap_or_else(|| base.join("state"));
+        let spill = base.join("spill");
         let history = arg_value("--history")
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("DSH_SHELLOUT_HISTORY").map(PathBuf::from))
@@ -74,6 +76,7 @@ impl Paths {
             .unwrap_or_else(|| "127.0.0.1:3001".into());
         Self {
             state,
+            spill,
             history,
             socket,
             executor_socket,
@@ -127,7 +130,7 @@ fn main() -> std::io::Result<()> {
                 timeout_ms: arg_number("--timeout-ms", 120_000),
                 max_timeout_ms: arg_number("--max-timeout-ms", 600_000),
                 max_output_bytes: arg_number("--max-output-bytes", 64_000) as usize,
-                spill_dir: paths.state.display().to_string(),
+                spill_dir: paths.spill.display().to_string(),
             };
             let store = match store::Store::open(&paths.history) {
                 Ok(store) => Some(Arc::new(store)),

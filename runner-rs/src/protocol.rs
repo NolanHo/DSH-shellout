@@ -49,7 +49,8 @@ pub struct CapturePolicy {
     pub stderr_max_bytes: usize,
     /// File cap for either stream; zero uses the per-stream retention cap.
     pub spill_max_bytes: u64,
-    /// Legacy spill directory; durable capture always lives in the state directory.
+    /// Host-owned directory the completed capture is linked into; it outlives
+    /// the execution's state directory. Empty disables the spill file.
     pub spill_dir: String,
 }
 
