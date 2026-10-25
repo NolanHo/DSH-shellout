@@ -71,6 +71,7 @@ pnpm test         # protocol, registry, server, client, mirror, seam behaviour
 pnpm typecheck
 pnpm -r build
 pnpm test:e2e     # isolated harness instance: runner + host, seven checks
+pnpm test:e2e:host-rust  # the host plugin against the Rust executor, restarts included
 ```
 
 For an **agent-level** check, `scripts/isolated-web.mjs --port 3107` starts a runner and a full web
