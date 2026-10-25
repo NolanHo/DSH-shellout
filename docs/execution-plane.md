@@ -53,6 +53,9 @@ after the child is reaped; the executor writes the same record to history.
   `status.json` when the shim finishes.
 * When the pid is gone or the start time differs (pid reuse), the execution is
   marked `lost` — a fact, not a guess.
+* A directory whose shim has not published `status.json` yet is adopted as
+  `running`, because the shim writes its identity as its first act. If nothing
+  is published within the startup grace, the execution is marked `lost`.
 * SIGTERM: the executor stops serving and exits without signalling shims or commands.
   On adoption, a host boot receives a fresh lease window to reconnect; deadlines
   remain owned by the shim while the executor is absent.
