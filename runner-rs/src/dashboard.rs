@@ -5,84 +5,6 @@
 //! exposes environment variables: a command's environment can carry credentials,
 //! while its argv and output are what an operator needs to explain a run.
 
-use std::sync::Arc;
-
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-
-use crate::registry::Registry;
-
-/// Serve the dashboard until the process stops.
-pub async fn serve(address: String, registry: Arc<Registry>) -> std::io::Result<()> {
-    let listener = match TcpListener::bind(&address).await {
-        Ok(listener) => listener,
-        Err(error) => {
-            eprintln!("dashboard: cannot bind {address}: {error}");
-            return Err(error);
-        }
-    };
-    eprintln!("dashboard listening on http://{address}");
-    loop {
-        let (mut socket, _) = listener.accept().await?;
-        let registry = Arc::clone(&registry);
-        tokio::spawn(async move {
-            let mut buffer = [0u8; 4096];
-            let read = socket.read(&mut buffer).await.unwrap_or(0);
-            let request = String::from_utf8_lossy(&buffer[..read]);
-            let target = request.split_whitespace().nth(1).unwrap_or("/");
-            let (path, query) = match target.split_once('?') {
-                Some((path, query)) => (path, query),
-                None => (target, ""),
-            };
-            let id = query
-                .split('&')
-                .find_map(|pair| pair.strip_prefix("id="))
-                .map(percent_decode)
-                .unwrap_or_default();
-            let (status, content_type, body) = match path {
-                "/api/stats" => ("200 OK", "application/json", registry.stats().to_string()),
-                "/api/executions" => (
-                    "200 OK",
-                    "application/json",
-                    serde_json::json!({ "executions": registry.recent(50) }).to_string(),
-                ),
-                "/api/execution" => match registry.detail(&id) {
-                    Some(detail) => ("200 OK", "application/json", detail.to_string()),
-                    None => ("404 Not Found", "application/json", "{\"error\":\"unknown execution\"}".to_string()),
-                },
-                "/health" => ("200 OK", "text/plain", "ok".to_string()),
-                "/" => ("200 OK", "text/html; charset=utf-8", page().to_string()),
-                _ => ("404 Not Found", "text/plain", "not found".to_string()),
-            };
-            let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = socket.write_all(response.as_bytes()).await;
-            let _ = socket.shutdown().await;
-        });
-    }
-}
-
-/// Decode `%XX` escapes from a query value.
-fn percent_decode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(&value[index + 1..index + 3], 16) {
-                out.push(byte);
-                index += 3;
-                continue;
-            }
-        }
-        out.push(bytes[index]);
-        index += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 /// The single-page dashboard.
 ///
 /// Selecting a row expands its detail directly underneath that row: the row is
@@ -182,11 +104,13 @@ const commandLine = (execution) => {
 async function loadStats() {
   const stats = await (await fetch('/api/stats', { cache: 'no-store' })).json()
   document.getElementById('sub').textContent =
-    `${stats.version} \u00b7 protocol ${stats.protocols.join('/')} \u00b7 up ${fmt(stats.uptimeMs)} \u00b7 pid ${stats.pid}`
+    `executor: ${stats.executor} · history: ${stats.history}` +
+    (stats.historyWritable === false ? ' · history writes unavailable' : '') +
+    (stats.version ? ` · ${stats.version}` : '')
   const pills = [['live', stats.live], ['spawned', stats.spawned], ['settled', stats.settled],
     ['killed', stats.killed], ['failed', stats.failed], ['leases', stats.leases], ['limit', stats.maxConcurrent]]
   document.getElementById('pills').innerHTML = pills
-    .map(([k, v]) => `<span class="pill">${k}<b>${v}</b></span>`).join('')
+    .map(([k, v]) => `<span class="pill">${k}<b>${v == null ? 'unavailable' : v}</b></span>`).join('')
 }
 
 function detailMarkup(d) {
@@ -200,7 +124,7 @@ function detailMarkup(d) {
         ${d.signal == null ? '' : `<span>signal <b>${d.signal}</b></span>`}
         <span>${fmt(d.durationMs != null ? d.durationMs : d.ageMs)}</span>
         <span>CWD ${esc(d.cwd)}</span>
-        ${d.lossy ? '<span class="flag">output truncated (tail kept)</span>' : ''}
+        ${d.lossy || d.stdoutLossy || d.stderrLossy || d.stdoutTruncated || d.stderrTruncated ? '<span class="flag">output incomplete (capture or display limit)</span>' : ''}
         <span>${esc(d.id)}</span>
       </div>
       <pre>$ ${esc((d.argv || []).join(' '))}</pre>

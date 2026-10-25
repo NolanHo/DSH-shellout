@@ -12,33 +12,34 @@ operating-system work:
 
 | Concern | Implementation |
 |---|---|
-| Process creation | `exec` in a new session (`setsid`), so the process group id equals the pid |
-| Output capture | one reader thread per stream into a bounded in-memory tail |
-| Spill | per-execution, per-stream file capped by `capture.spillMaxBytes`; dropped when exceeded |
-| Lossy reads | a read below the retained window reports `lossy` and returns the tail |
-| Deadline | `timeoutMs` watchdog; `onExpiry: "kill"` terminates at expiry |
-| Termination | `SIGTERM` to the group, then `SIGKILL` after `graceMs` if anything survives |
-| Settlement | one `settled` event carrying `status`, `exitCode`, `signal` |
+| Process creation | executor spawns a detached shim; shim starts the command with `setsid` |
+| Output capture | shim drains stdout/stderr into append-only files in the execution state directory |
+| Capture limits | `spillMaxBytes` caps each file; zero uses each stream's capture budget; retains the prefix |
+| Lossy reads | per-stream truncation and invalid UTF-8 are reported, never hidden |
+| Deadline | shim enforces `timeoutMs` independently of the executor |
+| Termination | shim sends `SIGTERM` to the group, then `SIGKILL` after `graceMs` |
+| Settlement | atomic `status.json`, retried history write, and one `settled` event |
 | Leases | a host boot's executions are terminated when its lease expires |
 
-It holds no sessions, no model connection, no web surface and no harness dependency.
+The executor holds no sessions, model connection, HTTP surface or harness dependency.
+The separate `--mode hub` owns the dashboard and opens history read-only.
+See [execution-plane.md](execution-plane.md) for paths, flags and restart guarantees.
 
 ## Build and run
 
 ```sh
 cargo build --release --manifest-path runner-rs/Cargo.toml
-./runner-rs/target/release/dsh-shellout-runner \
-  --socket /root/.dsh/shellout/control.sock \
-  --cwd /root/dsh-web/app \
-  --lease-ttl-ms 60000 \
-  --max-concurrent 64
+DSH_HOME="$PWD/.runtime" ./runner-rs/target/release/dsh-shellout-runner \
+  --cwd "$PWD" --lease-ttl-ms 60000 --max-concurrent 64
+DSH_HOME="$PWD/.runtime" ./runner-rs/target/release/dsh-shellout-runner \
+  --mode hub --listen 127.0.0.1:3001
 ```
 
 Supervisor unit:
 
 ```ini
 [program:dsh-runner]
-command=/opt/dsh-shellout/dsh-shellout-runner --socket /root/.dsh/shellout/control.sock --cwd /root/dsh-web/app
+command=/opt/dsh-shellout/dsh-shellout-runner --socket /srv/dsh/shellout/control.sock --state /srv/dsh/shellout/state --history /srv/dsh/shellout/history.sqlite --cwd /srv/dsh/app
 autostart=true
 autorestart=true
 startsecs=1
@@ -48,16 +49,22 @@ killasgroup=true
 
 ## Parity with the Node runner
 
-Both implementations satisfy the same host contract; `scripts/e2e-rust.mjs` runs the isolation
-suite against the binary and `scripts/e2e.mjs` runs it against the Node runner. The checks that
-must hold for either:
+Both implementations speak the host protocol. `scripts/e2e-rust.mjs` runs an
+isolated wire-level suite without a harness checkout or a running service:
 
-- stdout, stderr and exit code reach the host unchanged
-- a core-burning command in the runner leaves the host event loop idle
-- a command that leaves a descendant still reports its own exit
-- the host process has no child in the execution's group
-- after the host dies, lease expiry terminates the group
-- a lost runner settles its live executions as `killed` with a provider note
+- stdout, stderr, offset reads and real exit code
+- byte caps and durable per-stream flags
+- deadline TERM-to-KILL escalation and background descendant cleanup
+- executor SIGKILL while a command writes one marker per second; continued
+  capture, adoption by the replacement executor, and the real terminal exit code
+- executor SIGTERM leaves the command running
+- mismatched process start times become `lost`
+- read-only hub observation, summary/detail split, percent-decoded IDs, and
+  history-only/missing-history degradation
+
+Fixtures are created and removed inside the worktree. Existing services are not
+used. The TypeScript host suite remains `pnpm test`; the Node runner's separate
+harness suite remains `scripts/e2e.mjs`.
 
 ## Boundaries
 

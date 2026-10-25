@@ -33,10 +33,11 @@ matters about the execution in files:
 
 ```
 <state>/<executionId>/
-  meta.json     argv, cwd, env keys, deadline policy, capture budgets  (written before spawn)
-  status.json   pid, pgid, startedAt, finishedAt, exitCode, signal, state
-  stdout.log    append-only capture
-  stderr.log    append-only capture
+  meta.json     argv, cwd, complete env, stdin, deadline and capture policy, boot/operation identity
+  status.json   command pid/pgid/start time, shim identity, timestamps, terminal and stream facts
+  stdout.log    append-only, byte-capped capture
+  stderr.log    append-only, byte-capped capture
+  kill.request  durable termination request, consumed by the shim
 ```
 
 `status.json` is replaced with `write`+`rename`, so a reader never sees a torn
@@ -52,8 +53,9 @@ after the child is reaped; the executor writes the same record to history.
   `status.json` when the shim finishes.
 * When the pid is gone or the start time differs (pid reuse), the execution is
   marked `lost` — a fact, not a guess.
-* SIGTERM: the executor tells live shims to stop waiting (they keep the command
-  running), then exits. Nothing is killed by the executor's own shutdown.
+* SIGTERM: the executor stops serving and exits without signalling shims or commands.
+  On adoption, a host boot receives a fresh lease window to reconnect; deadlines
+  remain owned by the shim while the executor is absent.
 
 ## Hub lifetime
 
@@ -77,3 +79,47 @@ cap.
 | executor restart | **survive**, settle with the real exit code | preserved | live rows return on reconnect |
 | shim crash | that execution is lost | row marked `lost` | visible |
 | history write failure | unaffected | the failure is reported in the API and logged, never silent | visible |
+
+## Configuration and capture
+
+Both modes resolve paths through the same resolver. Flags override environment:
+
+| Flag | Environment | Default |
+|---|---|---|
+| `--state` | `DSH_SHELLOUT_STATE` | `<DSH_HOME>/shellout/state` |
+| `--history` | `DSH_SHELLOUT_HISTORY` | `<DSH_HOME>/shellout/history.sqlite` |
+| `--socket` | `DSH_SHELLOUT_SOCKET` | `<DSH_HOME>/shellout/control.sock` |
+| `--executor-socket` | `DSH_SHELLOUT_EXECUTOR_SOCKET` | resolved `--socket` |
+| `--listen` | `DSH_SHELLOUT_LISTEN` | `127.0.0.1:3001` (hub HTTP only) |
+
+Absent `DSH_HOME`, use `$HOME/.dsh`. The executor has no HTTP listener;
+`--dashboard` is removed. Start the hub with `--mode hub --listen <address>`.
+Shim inputs are only `--mode shim --state <directory> --id <executionId>`;
+the executor writes private metadata before admission and spawn.
+
+Capture keeps a **prefix**, not the old in-memory tail. Each stream's file cap
+is `capture.spillMaxBytes` when nonzero, otherwise its `stdoutMaxBytes` or
+`stderrMaxBytes`. `spillDir` remains accepted as protocol input but never redirects
+durable capture outside the execution directory. Readers continue draining pipes
+after the cap; `bytes` counts observed bytes, and `truncated`/`lossy` record loss.
+`readStream` offsets are log byte offsets, with replies capped at 256 KiB and the
+connection's frame budget. A complete log may be returned as `spillPath`.
+On direct-child exit the shim terminates remaining group members before publishing
+terminal status, so a background descendant cannot keep the capture pipes open.
+
+The hub allows eight concurrent observations, with one 500 ms total deadline
+including semaphore queueing, connection, and all frame I/O. A request uses
+`kind: req`, `method: observe`, and optional `payload.executionId` for live detail.
+Observer connections cannot become host connections; only host `hello` registers
+a lease and subscribes to events. List/snapshot replies exclude output. History
+lists have at most 50 summaries and 256 KiB total; oversized metadata or invalid
+stored argv becomes an explicit error summary, never a silently skipped row.
+Individual summaries are limited to 5 KiB; oversized IDs have `idTruncated: true`.
+History detail uses a primary-key lookup, not a recent-row scan.
+
+Admission is refused if its history row cannot be written. Settlement writes are
+retried on the polling loop and logged with the execution ID. Executor observation
+and hub statistics expose `historyWritable` and `historyError`. When the executor
+is unavailable, counters are absent rather than zero and `executor` is
+`unreachable`; missing/unreadable history yields `history: unavailable` and a
+minimal page instead of a hub panic. The hub never reconciles or writes rows.

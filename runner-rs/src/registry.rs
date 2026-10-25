@@ -1,369 +1,483 @@
-//! Execution table: idempotent admission, per-boot leases, settlement events.
-
+//! Admission, adoption, leases and settlement reporting. Shims own execution.
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
-use crate::exec::{spawn_execution, Counters, Execution};
-use crate::store::Store;
+use crate::exec::{self, Counters, Execution};
 use crate::protocol::ExecRequest;
+use crate::shim::Meta;
+use crate::store::Store;
 
-/// Admission or lookup failure carrying a wire error code.
 pub struct Failure {
-    /// Wire error code.
     pub code: &'static str,
-    /// Human-readable detail.
     pub message: String,
 }
-
 impl Failure {
     fn new(code: &'static str, message: impl Into<String>) -> Self {
-        Failure { code, message: message.into() }
+        Self {
+            code,
+            message: message.into(),
+        }
     }
 }
 
-/// The runner's ownership table.
 pub struct Registry {
     executions: Mutex<HashMap<String, Arc<Execution>>>,
-    operations: Mutex<HashMap<String, String>>,
+    admission: Mutex<()>,
     boots: Mutex<HashMap<String, Instant>>,
     events: broadcast::Sender<Value>,
     max_concurrent: usize,
     lease_ttl: Duration,
-    counters: Arc<Counters>,
+    counters: Counters,
     started: Instant,
     store: Option<Arc<Store>>,
+    state_dir: PathBuf,
+    persistence_error: Mutex<Option<String>>,
 }
 
 impl Registry {
-    /// Create a registry; the returned receiver observes settlement events.
-    pub fn new(max_concurrent: usize, lease_ttl: Duration) -> (Arc<Registry>, broadcast::Receiver<Value>) {
-        Self::with_store(max_concurrent, lease_ttl, None)
-    }
-
-    /// Create a registry that persists every execution to `store`.
-    pub fn with_store(
-        max_concurrent: usize,
-        lease_ttl: Duration,
-        store: Option<Arc<Store>>,
-    ) -> (Arc<Registry>, broadcast::Receiver<Value>) {
-        let (events, receiver) = broadcast::channel(1024);
-        let registry = Arc::new(Registry {
+    #[cfg(test)]
+    pub fn new(max_concurrent: usize, lease_ttl: Duration) -> Arc<Self> {
+        let (events, _) = broadcast::channel(16);
+        Arc::new(Self {
             executions: Mutex::new(HashMap::new()),
-            operations: Mutex::new(HashMap::new()),
+            admission: Mutex::new(()),
             boots: Mutex::new(HashMap::new()),
             events,
             max_concurrent,
             lease_ttl,
-            counters: Arc::new(Counters::default()),
+            counters: Counters::default(),
             started: Instant::now(),
-            store,
-        });
-        (registry, receiver)
-    }
-
-    /// Snapshot for the dashboard.
-    pub fn stats(&self) -> Value {
-        let executions: Vec<Value> = self
-            .executions
-            .lock()
-            .map(|guard| {
-                guard
-                    .values()
-                    .filter(|execution| execution.state().running)
-                    .map(|execution| {
-                        json!({
-                            "id": execution.id,
-                            "command": execution.program,
-                            "state": "running",
-                            "ageMs": execution.started.elapsed().as_millis() as u64,
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let leases = self.boots.lock().map(|boots| boots.len()).unwrap_or(0);
-        json!({
-            "version": format!("rust-{}", env!("CARGO_PKG_VERSION")),
-            "protocols": ["1.0", "2.0"],
-            "pid": std::process::id(),
-            "uptimeMs": self.started.elapsed().as_millis() as u64,
-            "live": executions.len(),
-            "spawned": self.counters.spawned.load(std::sync::atomic::Ordering::Relaxed),
-            "settled": self.counters.settled.load(std::sync::atomic::Ordering::Relaxed),
-            "killed": self.counters.killed.load(std::sync::atomic::Ordering::Relaxed),
-            "failed": self.counters.failed.load(std::sync::atomic::Ordering::Relaxed),
-            "leases": leases,
-            "maxConcurrent": self.max_concurrent,
-            "executions": executions,
+            store: None,
+            state_dir: PathBuf::new(),
+            persistence_error: Mutex::new(None),
         })
     }
-
-    /// Live state for the dashboard service face.
-    pub fn snapshot(&self) -> Value {
-        let mut stats = self.stats();
-        stats["executions"] = Value::Array(self.recent(50));
-        stats
+    pub fn with_store(
+        max_concurrent: usize,
+        lease_ttl: Duration,
+        store: Option<Arc<Store>>,
+        state_dir: PathBuf,
+    ) -> std::io::Result<Arc<Self>> {
+        std::fs::create_dir_all(&state_dir)?;
+        let (events, _) = broadcast::channel(1024);
+        let registry = Arc::new(Self {
+            executions: Mutex::new(HashMap::new()),
+            admission: Mutex::new(()),
+            boots: Mutex::new(HashMap::new()),
+            events,
+            max_concurrent,
+            lease_ttl,
+            counters: Counters::default(),
+            started: Instant::now(),
+            store,
+            state_dir,
+            persistence_error: Mutex::new(None),
+        });
+        registry.adopt()?;
+        Ok(registry)
     }
 
-    /// Recent executions, newest first, for the dashboard list.
-    pub fn recent(&self, limit: usize) -> Vec<Value> {
-        let mut rows: Vec<Value> = self
-            .executions
-            .lock()
-            .map(|guard| guard.values().map(|execution| execution.detail()).collect())
-            .unwrap_or_default();
-        // Fold in persisted history so a restart does not empty the list.
-        if let Some(store) = self.store.as_ref() {
-            let live: std::collections::HashSet<String> =
-                rows.iter().map(|row| row["id"].as_str().unwrap_or_default().to_string()).collect();
-            for (id, _, document) in store.recent(limit) {
-                if live.contains(&id) {
-                    continue;
+    fn adopt(&self) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(&self.state_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            match exec::load(entry.path()) {
+                Ok(execution) => {
+                    if execution.running() {
+                        eprintln!(
+                            "execution {}: adopted pid {:?}",
+                            execution.meta.id,
+                            execution.state().pid
+                        );
+                        self.boots
+                            .lock()
+                            .expect("boots poisoned")
+                            .entry(execution.meta.boot_id.clone())
+                            .or_insert(Instant::now() + self.lease_ttl);
+                    }
+                    self.executions
+                        .lock()
+                        .expect("executions poisoned")
+                        .insert(execution.meta.id.clone(), execution);
                 }
-                if let Ok(value) = serde_json::from_str::<Value>(&document) {
-                    rows.push(value);
-                }
+                Err(error) => eprintln!(
+                    "execution {}: recovery failed: {error}",
+                    entry.file_name().to_string_lossy()
+                ),
             }
         }
-        rows.sort_by_key(|row| std::cmp::Reverse(row["startedAtMs"].as_u64().unwrap_or(0)));
-        rows.truncate(limit);
-        rows
+        self.poll();
+        Ok(())
     }
 
-    /// One execution with its captured output.
-    pub fn detail(&self, execution_id: &str) -> Option<Value> {
-        if let Some(detail) = self
-            .executions
+    pub fn history_health(&self) -> Value {
+        let mut health = self
+            .store
+            .as_ref()
+            .map(|store| store.health())
+            .unwrap_or_else(
+                || json!({"historyWritable":false,"historyError":"history database unavailable"}),
+            );
+        if let Some(error) = self
+            .persistence_error
             .lock()
-            .ok()
-            .and_then(|guard| guard.get(execution_id).map(|execution| execution.detail()))
+            .expect("persistence error poisoned")
+            .as_ref()
         {
-            return Some(detail);
+            health["historyWritable"] = json!(false);
+            health["historyError"] = json!(error);
         }
-        let store = self.store.as_ref()?;
-        store
-            .recent(500)
-            .into_iter()
-            .find(|(id, _, _)| id == execution_id)
-            .and_then(|(_, _, document)| serde_json::from_str(&document).ok())
+        health
     }
 
-    /// Subscribe to settlement events.
+    pub fn snapshot(&self) -> Value {
+        let guard = self.executions.lock().expect("executions poisoned");
+        let live = guard
+            .values()
+            .filter(|execution| execution.running())
+            .count();
+        let mut executions: Vec<_> = guard
+            .values()
+            .map(|execution| execution.summary())
+            .collect();
+        executions.sort_by_key(|row| std::cmp::Reverse(row["startedAtMs"].as_u64().unwrap_or(0)));
+        executions.truncate(50);
+        let mut result = json!({"version":format!("rust-{}",env!("CARGO_PKG_VERSION")),"protocols":["1.0","2.0"],
+            "pid":std::process::id(),"uptimeMs":self.started.elapsed().as_millis() as u64,"live":live,
+            "spawned":self.counters.spawned.load(Ordering::Relaxed),"settled":self.counters.settled.load(Ordering::Relaxed),
+            "killed":self.counters.killed.load(Ordering::Relaxed),"failed":self.counters.failed.load(Ordering::Relaxed),
+            "leases":self.boots.lock().expect("boots poisoned").len(),"maxConcurrent":self.max_concurrent,"executions":executions});
+        for (key, value) in self.history_health().as_object().expect("health object") {
+            result[key] = value.clone();
+        }
+        result
+    }
+
+    /// Observe never merges history: only the hub owns that policy.
+    pub fn detail(&self, id: &str) -> Option<Value> {
+        self.executions
+            .lock()
+            .ok()?
+            .get(id)
+            .filter(|execution| execution.running())
+            .map(|execution| execution.detail())
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<Value> {
         self.events.subscribe()
     }
 
-    /// Start or refresh one boot's lease and report its live executions.
-    pub fn attach(&self, boot_id: &str) -> Vec<Value> {
-        if let Ok(mut boots) = self.boots.lock() {
-            boots.insert(boot_id.to_string(), Instant::now() + self.lease_ttl);
-        }
-        let executions = self.executions.lock().ok();
-        executions
-            .map(|guard| {
-                guard
-                    .values()
-                    .filter(|execution| execution.boot_id == boot_id)
-                    .map(|execution| {
-                        let state = execution.state();
-                        json!({
-                            "executionId": execution.id,
-                            "state": if state.running { "running" } else if state.killed { "killed" } else { "exited" },
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+    pub fn attach(&self, boot: &str) -> Vec<Value> {
+        self.boots
+            .lock()
+            .expect("boots poisoned")
+            .insert(boot.into(), Instant::now() + self.lease_ttl);
+        self.executions.lock().expect("executions poisoned").values()
+            .filter(|execution| execution.meta.boot_id == boot)
+            .map(|execution| json!({"executionId":execution.meta.id,"state":execution.state().state})).collect()
     }
 
-    /// Refresh a boot's lease.
-    pub fn ping(&self, boot_id: &str) -> Result<(), Failure> {
-        let mut boots = self.boots.lock().map_err(|_| Failure::new("internal", "registry poisoned"))?;
-        if !boots.contains_key(boot_id) {
-            return Err(Failure::new("protocol", format!("unknown boot {boot_id}; reconnect with hello")));
-        }
-        boots.insert(boot_id.to_string(), Instant::now() + self.lease_ttl);
+    pub fn ping(&self, boot: &str) -> Result<(), Failure> {
+        let mut boots = self
+            .boots
+            .lock()
+            .map_err(|_| Failure::new("internal", "boots poisoned"))?;
+        let deadline = boots
+            .get_mut(boot)
+            .ok_or_else(|| Failure::new("protocol", "unknown boot; reconnect with hello"))?;
+        *deadline = Instant::now() + self.lease_ttl;
         Ok(())
     }
 
-    /// Admit one execution, or return the existing one for a retried operation.
-    pub fn exec(&self, request: ExecRequest, boot_id: &str) -> Result<Value, Failure> {
-        if let Ok(operations) = self.operations.lock() {
-            if let Some(existing) = operations.get(&request.operation_id) {
-                let executions = self.executions.lock().map_err(|_| Failure::new("internal", "registry poisoned"))?;
-                let execution = executions
-                    .get(existing)
-                    .ok_or_else(|| Failure::new("internal", "operation lost its execution"))?;
-                if execution.digest != request.spec_digest {
-                    return Err(Failure::new("rejected", "operation id reused with a different spec"));
-                }
-                return Ok(json!({ "executionId": execution.id }));
-            }
-        }
-        let live = self.live_count();
-        if live >= self.max_concurrent {
-            return Err(Failure::new("rejected", format!("runner is at its {}-execution limit", self.max_concurrent)));
-        }
-        let execution = spawn_execution(
-            request.spec,
-            request.execution_id.clone(),
-            request.operation_id.clone(),
-            request.spec_digest.clone(),
-            boot_id.to_string(),
-            self.events.clone(),
-            Arc::clone(&self.counters),
-            self.store.clone(),
-        )
-        .map_err(|error| Failure::new("rejected", format!("spawn failed: {error}")))?;
-        if let Ok(mut executions) = self.executions.lock() {
-            executions.insert(request.execution_id.clone(), Arc::clone(&execution));
-        }
-        if let Ok(mut operations) = self.operations.lock() {
-            operations.insert(request.operation_id.clone(), request.execution_id.clone());
-        }
-        Ok(json!({ "executionId": execution.id }))
-    }
-
-    /// Read one captured stream at an offset.
-    pub fn read_stream(&self, execution_id: &str, stream: &str, offset: u64, limit: usize) -> Result<Value, Failure> {
-        let execution = self.get(execution_id)?;
-        let capture = if stream == "stderr" { &execution.stderr } else { &execution.stdout };
-        let capture = capture.lock().map_err(|_| Failure::new("internal", "capture poisoned"))?;
-        let read = capture.read_from(offset, limit);
-        let mut value = json!({
-            "text": read.text,
-            "nextOffset": read.next_offset,
-            "lossy": read.lossy,
-        });
-        if let Some(path) = read.spill_path {
-            value["spillPath"] = Value::String(path);
-        }
-        Ok(value)
-    }
-
-    /// Consuming read over both streams, formatted like the harness executor.
-    pub fn read_output(&self, execution_id: &str) -> Result<Value, Failure> {
-        let execution = self.get(execution_id)?;
-        let stdout = {
-            let capture = execution.stdout.lock().map_err(|_| Failure::new("internal", "capture poisoned"))?;
-            capture.read_from(0, usize::MAX)
-        };
-        let stderr = {
-            let capture = execution.stderr.lock().map_err(|_| Failure::new("internal", "capture poisoned"))?;
-            capture.read_from(0, usize::MAX)
-        };
-        let separator = if !stdout.text.is_empty() && !stdout.text.ends_with('\n') { "\n" } else { "" };
-        let delta = if stderr.text.is_empty() {
-            stdout.text
-        } else {
-            format!("{}{}[stderr]\n{}", stdout.text, separator, stderr.text)
-        };
-        Ok(json!({ "delta": delta, "lossy": stdout.lossy || stderr.lossy }))
-    }
-
-    /// Request termination.
-    pub fn kill(&self, execution_id: &str) -> Result<Value, Failure> {
-        let execution = self.get(execution_id)?;
-        Ok(json!({ "requested": execution.kill() }))
-    }
-
-    /// Terminal facts at call time.
-    pub fn state(&self, execution_id: &str) -> Result<Value, Failure> {
-        let execution = self.get(execution_id)?;
-        let state = execution.state();
-        Ok(json!({
-            "state": if state.running { "running" } else if state.killed { "killed" } else { "exited" },
-            "exitCode": state.exit_code,
-            "signal": state.signal,
-        }))
-    }
-
-    /// Terminate live executions and wait for them to settle.
-    pub fn drain(&self, timeout_ms: u64) -> Value {
-        for execution in self.snapshot_live() {
-            execution.kill();
-        }
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        while Instant::now() < deadline && self.live_count() > 0 {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        json!({ "live": self.live_count() })
-    }
-
-    /// Terminate executions whose boot lease expired.
-    pub fn sweep(&self) {
-        self.retain_recent();
-        self.sweep_leases();
-    }
-
-    /// Keep the newest finished executions' captures so the dashboard can show
-    /// them; drop the oldest beyond the retention window.
-    fn retain_recent(&self) {
-        const RETAINED: usize = 200;
-        let Ok(mut executions) = self.executions.lock() else { return };
-        let mut finished: Vec<(String, std::time::Instant)> = executions
-            .values()
-            .filter(|execution| !execution.state().running)
-            .map(|execution| (execution.id.clone(), execution.started))
-            .collect();
-        if finished.len() <= RETAINED {
-            return;
-        }
-        finished.sort_by_key(|(_, started)| *started);
-        for (id, _) in finished.into_iter().take(executions.len().saturating_sub(RETAINED)) {
-            executions.remove(&id);
-        }
-    }
-
-    /// Terminate executions whose boot lease expired (internal).
-    fn sweep_leases(&self) {
-        let now = Instant::now();
-        let expired: Vec<String> = self
-            .boots
+    pub fn exec(&self, request: ExecRequest, boot: &str) -> Result<Value, Failure> {
+        let _admission = self
+            .admission
             .lock()
-            .map(|boots| boots.iter().filter(|(_, deadline)| **deadline <= now).map(|(boot, _)| boot.clone()).collect())
-            .unwrap_or_default();
-        for boot in expired {
-            for execution in self.snapshot_live().into_iter().filter(|execution| execution.boot_id == boot) {
-                execution.kill();
-                let _ = self.events.send(crate::protocol::event(
-                    "settled",
-                    json!({
-                        "executionId": execution.id,
-                        "status": "failed",
-                        "exitCode": null,
-                        "signal": null,
-                        "detail": "lost: owning boot no longer holds a lease",
-                    }),
+            .map_err(|_| Failure::new("internal", "admission poisoned"))?;
+        let executions = self
+            .executions
+            .lock()
+            .map_err(|_| Failure::new("internal", "executions poisoned"))?;
+        if let Some(existing) = executions
+            .values()
+            .find(|execution| execution.meta.operation_id == request.operation_id)
+        {
+            if existing.meta.digest != request.spec_digest {
+                return Err(Failure::new(
+                    "rejected",
+                    "operation id reused with a different spec",
                 ));
             }
-            if let Ok(mut boots) = self.boots.lock() {
-                boots.remove(&boot);
+            return Ok(json!({"executionId":existing.meta.id}));
+        }
+        if executions.contains_key(&request.execution_id) {
+            return Err(Failure::new("rejected", "execution id already exists"));
+        }
+        if executions
+            .values()
+            .filter(|execution| execution.running())
+            .count()
+            >= self.max_concurrent
+        {
+            return Err(Failure::new(
+                "rejected",
+                "executor concurrent execution limit reached",
+            ));
+        }
+        drop(executions);
+        if !valid_id(&request.execution_id)
+            || request.spec.argv.is_empty()
+            || request.spec.argv[0].is_empty()
+        {
+            return Err(Failure::new(
+                "rejected",
+                "invalid execution id or empty argv",
+            ));
+        }
+        let store = self.store.as_ref().ok_or_else(|| {
+            Failure::new("history", "history database unavailable; admission refused")
+        })?;
+        let meta = Meta {
+            id: request.execution_id.clone(),
+            operation_id: request.operation_id,
+            digest: request.spec_digest,
+            boot_id: boot.into(),
+            spec: request.spec,
+        };
+        let execution = exec::admit(meta, &self.state_dir, store)
+            .map_err(|error| Failure::new("rejected", error.to_string()))?;
+        self.counters.spawned.fetch_add(1, Ordering::Relaxed);
+        self.executions
+            .lock()
+            .expect("executions poisoned")
+            .insert(request.execution_id.clone(), execution);
+        Ok(json!({"executionId":request.execution_id}))
+    }
+
+    pub fn read_stream(
+        &self,
+        id: &str,
+        stream: &str,
+        offset: u64,
+        limit: usize,
+    ) -> Result<Value, Failure> {
+        self.get(id)?
+            .read_stream(stream, offset, limit)
+            .map_err(|error| Failure::new("capture", error.to_string()))
+    }
+
+    pub fn read_output(&self, id: &str) -> Result<Value, Failure> {
+        let execution = self.get(id)?;
+        let out = execution
+            .read_stream("stdout", 0, crate::capture::READ_LIMIT)
+            .map_err(|e| Failure::new("capture", e.to_string()))?;
+        let err = execution
+            .read_stream("stderr", 0, crate::capture::READ_LIMIT)
+            .map_err(|e| Failure::new("capture", e.to_string()))?;
+        let stdout = out["text"].as_str().unwrap_or("");
+        let stderr = err["text"].as_str().unwrap_or("");
+        let separator = if !stdout.is_empty() && !stdout.ends_with('\n') {
+            "\n"
+        } else {
+            ""
+        };
+        Ok(
+            json!({"delta": if stderr.is_empty() { stdout.to_string() } else { format!("{stdout}{separator}[stderr]\n{stderr}") },
+            "lossy":out["lossy"] == true || err["lossy"] == true}),
+        )
+    }
+
+    pub fn kill(&self, id: &str) -> Result<Value, Failure> {
+        Ok(
+            json!({"requested":self.get(id)?.kill().map_err(|error| Failure::new("capture",error.to_string()))?}),
+        )
+    }
+
+    pub fn state(&self, id: &str) -> Result<Value, Failure> {
+        let status = self.get(id)?.state();
+        Ok(json!({"state":status.state,"exitCode":status.exit_code,"signal":status.signal}))
+    }
+
+    pub fn drain(&self, timeout_ms: u64) -> Value {
+        for execution in self.all() {
+            if let Err(error) = execution.kill() {
+                eprintln!("execution {}: kill failed: {error}", execution.meta.id);
             }
+        }
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        while Instant::now() < deadline {
+            self.poll();
+            if self.all().iter().all(|execution| !execution.running()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        json!({"live":self.all().iter().filter(|execution| execution.running()).count()})
+    }
+
+    pub fn sweep(&self) {
+        self.poll();
+        let now = Instant::now();
+        let expired: Vec<_> = self
+            .boots
+            .lock()
+            .expect("boots poisoned")
+            .iter()
+            .filter(|(_, deadline)| **deadline <= now)
+            .map(|(boot, _)| boot.clone())
+            .collect();
+        for boot in expired {
+            for execution in self
+                .all()
+                .into_iter()
+                .filter(|execution| execution.meta.boot_id == boot && execution.running())
+            {
+                if let Err(error) = execution.kill() {
+                    eprintln!(
+                        "execution {}: lease termination failed: {error}",
+                        execution.meta.id
+                    );
+                }
+            }
+            self.boots.lock().expect("boots poisoned").remove(&boot);
         }
     }
 
-    fn get(&self, execution_id: &str) -> Result<Arc<Execution>, Failure> {
+    fn poll(&self) {
+        let mut persistence_error = None;
+        for execution in self.all() {
+            execution.refresh();
+            if execution.dirty.load(Ordering::Relaxed) {
+                let result = self
+                    .store
+                    .as_ref()
+                    .ok_or_else(|| "history database unavailable".to_string())
+                    .and_then(|store| execution.persist(store));
+                if let Err(error) = result {
+                    eprintln!(
+                        "execution {}: history write failed (will retry): {error}",
+                        execution.meta.id
+                    );
+                    persistence_error = Some(format!("execution {}: {error}", execution.meta.id));
+                }
+            }
+            let status = execution.state();
+            if status.state != "running" && !execution.announced.swap(true, Ordering::Relaxed) {
+                match status.state.as_str() {
+                    "killed" => &self.counters.killed,
+                    "exited" => &self.counters.settled,
+                    _ => &self.counters.failed,
+                }
+                .fetch_add(1, Ordering::Relaxed);
+                let _ = self.events.send(crate::protocol::event(
+                    "settled",
+                    json!({"executionId":execution.meta.id,
+                    "status":if status.state == "lost" { "failed" } else { &status.state },
+                    "exitCode":status.exit_code,"signal":status.signal,"detail":status.error}),
+                ));
+            }
+        }
+        *self
+            .persistence_error
+            .lock()
+            .expect("persistence error poisoned") = persistence_error;
+    }
+
+    fn all(&self) -> Vec<Arc<Execution>> {
         self.executions
             .lock()
-            .map_err(|_| Failure::new("internal", "registry poisoned"))?
-            .get(execution_id)
+            .expect("executions poisoned")
+            .values()
             .cloned()
-            .ok_or_else(|| Failure::new("unknown-execution", format!("no execution {execution_id}")))
+            .collect()
     }
-
-    fn live_count(&self) -> usize {
-        self.snapshot_live().len()
-    }
-
-    fn snapshot_live(&self) -> Vec<Arc<Execution>> {
+    fn get(&self, id: &str) -> Result<Arc<Execution>, Failure> {
         self.executions
             .lock()
-            .map(|executions| executions.values().filter(|execution| execution.state().running).cloned().collect())
-            .unwrap_or_default()
+            .map_err(|_| Failure::new("internal", "executions poisoned"))?
+            .get(id)
+            .cloned()
+            .ok_or_else(|| Failure::new("unknown-execution", format!("no execution {id}")))
+    }
+}
+
+fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && Path::new(id).components().count() == 1
+        && id != "."
+        && id != ".."
+        && !id.contains('/')
+        && !id.contains('\0')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn admission_store_failure_is_returned_without_spawning() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".test-state/admission-failure");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("history.sqlite");
+        drop(Store::open(&db).unwrap());
+        let store = Arc::new(Store::open_read_only(&db).unwrap());
+        let registry =
+            Registry::with_store(4, Duration::from_secs(60), Some(store), dir.join("state"))
+                .unwrap();
+        let request: ExecRequest = serde_json::from_value(json!({"executionId":"rejected","operationId":"op","specDigest":"digest",
+            "spec":{"argv":["/bin/sh","-c","exit 0"],"cwd":dir,"env":{},"timeoutMs":500,"onExpiry":"kill","graceMs":10,
+            "capture":{"stdoutMaxBytes":100,"stderrMaxBytes":100,"spillMaxBytes":0,"spillDir":dir}}})).unwrap();
+        let error = registry
+            .exec(request, "boot")
+            .expect_err("admission must fail");
+        assert!(error.message.contains("history admission write failed"));
+        assert!(registry.attach("boot").is_empty());
+        assert_eq!(registry.history_health()["historyWritable"], false);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_settlement_is_retained_and_retried() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".test-state/settlement-retry");
+        let state = dir.join("state");
+        let execution_dir = state.join("retry");
+        std::fs::create_dir_all(&execution_dir).unwrap();
+        let db = dir.join("history.sqlite");
+        let store = Arc::new(Store::open(&db).unwrap());
+        let meta: Meta = serde_json::from_value(json!({"id":"retry","operationId":"op","digest":"d","bootId":"boot",
+            "argv":["/bin/sh"],"cwd":dir,"env":{},"timeoutMs":100,"onExpiry":"kill","graceMs":10,
+            "capture":{"stdoutMaxBytes":10,"stderrMaxBytes":10,"spillMaxBytes":0,"spillDir":state}})).unwrap();
+        crate::shim::atomic_json(&execution_dir.join("meta.json"), &meta).unwrap();
+        crate::shim::atomic_json(&execution_dir.join("status.json"), &json!({"state":"exited","pid":null,"pgid":null,
+            "processStartTime":null,"shimPid":0,"shimStartTime":0,"startedAt":1,"finishedAt":2,"exitCode":7,"signal":null,
+            "stdout":{"bytes":4,"lossy":true,"truncated":true},"stderr":{"bytes":0,"lossy":false,"truncated":false},"error":null})).unwrap();
+        std::fs::write(execution_dir.join("stdout.log"), "kept").unwrap();
+        let blocker = rusqlite::Connection::open(&db).unwrap();
+        blocker.execute_batch("CREATE TRIGGER fail_save BEFORE INSERT ON executions BEGIN SELECT RAISE(FAIL, 'injected settlement failure'); END;").unwrap();
+        let registry =
+            Registry::with_store(4, Duration::from_secs(60), Some(Arc::clone(&store)), state)
+                .unwrap();
+        assert_eq!(registry.history_health()["historyWritable"], false);
+        assert!(registry.history_health()["historyError"]
+            .as_str()
+            .unwrap()
+            .contains("retry"));
+        assert_eq!(store.count().unwrap(), 0);
+        blocker.execute_batch("DROP TRIGGER fail_save").unwrap();
+        registry.sweep();
+        let saved = store.detail("retry").unwrap().unwrap();
+        assert_eq!(saved["exitCode"], 7);
+        assert_eq!(saved["stdout"], "kept");
+        assert_eq!(saved["stdoutTruncated"], true);
+        assert_eq!(registry.history_health()["historyWritable"], true);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

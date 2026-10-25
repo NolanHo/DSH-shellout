@@ -67,7 +67,12 @@ pub fn is_legacy(payload: &serde_json::Value) -> bool {
 }
 
 /// Convert a legacy spec into the resolved spawn spec the rest of the runner uses.
-pub fn to_spawn_spec(spec: LegacySpec, grace_ms: u64, spill_max: u64, spill_dir: &str) -> SpawnSpec {
+pub fn to_spawn_spec(
+    spec: LegacySpec,
+    grace_ms: u64,
+    spill_max: u64,
+    spill_dir: &str,
+) -> SpawnSpec {
     let mut env: BTreeMap<String, String> = std::env::vars()
         .filter(|(key, _)| !is_sensitive(key))
         .collect();

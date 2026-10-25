@@ -1,182 +1,246 @@
-/**
- * End-to-end check for the Rust runner on an isolated harness instance.
- *
- * Same host scenarios as `scripts/e2e.mjs`, but the execution plane is the
- * Rust binary instead of the Node runner. Creates its own DSH_HOME and socket
- * under the system temp directory; nothing touches a running harness.
- *
- * Usage: node scripts/e2e-rust.mjs [--binary target/debug/dsh-shellout-runner] [--keep]
- */
-
-import { execFileSync, spawn } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+/** Isolated Rust execution-plane scenarios; no harness or service dependency. */
+import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
+import { once } from 'node:events'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import net from 'node:net'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-const HERE = dirname(fileURLToPath(import.meta.url))
-const REPO = resolve(HERE, '..')
-const HARNESS = process.env.DSH_HARNESS_CLONE ?? '/root/dsh-web/app'
-const SHARED_PROFILE = process.env.DSH_SHARED_PROFILE ?? '/root/.dsh/profiles/web'
-const keep = process.argv.includes('--keep')
-const binaryIndex = process.argv.indexOf('--binary')
-const binary = resolve(REPO, binaryIndex >= 0 ? process.argv[binaryIndex + 1] : 'runner-rs/target/debug/dsh-shellout-runner')
-
-const root = mkdtempSync(join(tmpdir(), 'dsh-so-rust-'))
-const home = join(root, 'home')
+const repo = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+const index = process.argv.indexOf('--binary')
+const binary = resolve(repo, index < 0 ? 'runner-rs/target/debug/dsh-shellout-runner' : process.argv[index + 1])
+const temp = join(repo, '.task-tmp')
+mkdirSync(temp, { recursive: true })
+const root = mkdtempSync(join(temp, 'e2e-'))
+const state = join(root, 'state')
 const socket = join(root, 'control.sock')
-const RESULT = 'SHELLOUT-RESULT '
+const history = join(root, 'history.sqlite')
+const children = new Set()
+const clients = new Set()
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+let serial = 0
+let stderr = ''
 
-function log(step, detail) {
-  process.stdout.write(`${step}: ${typeof detail === 'string' ? detail : JSON.stringify(detail)}\n`)
-}
-
-function fail(step, detail) {
-  log(`${step} FAILED`, detail)
-  cleanup(1)
-}
-
-function assert(condition, step, detail) {
-  if (!condition) fail(step, detail)
-  log(`${step} ok`, detail)
-}
-
-function cleanup(code) {
-  if (!keep) rmSync(root, { recursive: true, force: true })
-  else process.stdout.write(`kept: ${root}\n`)
-  process.exit(code)
-}
-
-function makeProfile(name, entries) {
-  const dir = join(home, 'profiles', name)
-  mkdirSync(join(dir, 'node_modules'), { recursive: true })
-  for (const [local, target] of [
-    ['dsh-shellout', join(REPO, 'packages/host')],
-    ['dsh-shellout-protocol', join(REPO, 'packages/protocol')],
-    ['dsh-shellout-testapp', join(REPO, 'packages/testapp')],
-  ]) {
-    try { symlinkSync(target, join(dir, 'node_modules', local)) } catch { /* already linked */ }
+async function until(fn, label, timeout = 12_000) {
+  const end = Date.now() + timeout
+  while (Date.now() < end) {
+    const value = await fn()
+    if (value) return value
+    await sleep(50)
   }
-  writeFileSync(join(dir, 'package.json'), JSON.stringify({
-    name: `dsh-profile-${name}`,
-    private: true,
-    type: 'module',
-    dsh: { profile: { bundles: ['@deepseek-ai/dsh-base'] } },
-  }, null, 2))
-  writeFileSync(join(dir, 'cordis.yml'), '[]\n')
-  writeFileSync(join(dir, 'cordis.patch.yml'), `${entries.join('\n')}\n`)
+  throw new Error(`timeout: ${label}\n${stderr}`)
 }
-
-function spawnProfile(profile, env) {
-  const child = spawn(process.execPath, ['--import', 'tsx/esm', 'apps/cli/src/bin.ts', '--profile', profile], {
-    cwd: HARNESS,
-    env: { ...process.env, DSH_HOME: home, DSH_TELEMETRY_DISABLED: '1', ...env },
-    stdio: ['ignore', 'pipe', 'pipe'],
+function startExecutor() {
+  const child = spawn(binary, ['--state', state, '--history', history, '--socket', socket, '--lease-ttl-ms', '60000'], {
+    cwd: root, env: { ...process.env, DSH_HOME: join(root, 'home') }, stdio: ['ignore', 'ignore', 'pipe'],
   })
-  let output = ''
-  child.stdout.on('data', (chunk) => { output += String(chunk) })
-  child.stderr.on('data', (chunk) => { output += String(chunk) })
+  children.add(child)
+  child.once('exit', () => children.delete(child))
+  child.stderr.on('data', chunk => { stderr += chunk })
+  return child
+}
+async function stop(child, signal) {
+  if (child.exitCode !== null || child.signalCode !== null) return
+  const exited = once(child, 'exit')
+  child.kill(signal)
+  await exited
+}
+async function connect() {
+  const stream = net.createConnection(socket)
+  await new Promise((resolve, reject) => { stream.once('connect', resolve); stream.once('error', reject) })
+  stream.removeAllListeners('error')
+  clients.add(stream)
+  let buffer = Buffer.alloc(0)
+  let next = 0
+  const waiting = new Map()
+  const events = []
+  stream.on('data', chunk => {
+    buffer = Buffer.concat([buffer, chunk])
+    while (buffer.length >= 4 && buffer.length >= 4 + buffer.readUInt32BE(0)) {
+      const length = buffer.readUInt32BE(0)
+      const frame = JSON.parse(buffer.subarray(4, 4 + length).toString())
+      buffer = buffer.subarray(4 + length)
+      if (frame.kind === 'evt') { events.push(frame); continue }
+      const pending = waiting.get(frame.id)
+      if (!pending) continue
+      waiting.delete(frame.id)
+      clearTimeout(pending.timer)
+      if (frame.kind === 'err') pending.reject(new Error(JSON.stringify(frame.payload)))
+      else if (frame.kind !== 'res' || frame.method !== pending.method) pending.reject(new Error('bad reply correlation'))
+      else pending.resolve(frame.payload)
+    }
+  })
+  const closed = () => {
+    clients.delete(stream)
+    for (const pending of waiting.values()) { clearTimeout(pending.timer); pending.reject(new Error('executor disconnected')) }
+    waiting.clear()
+  }
+  stream.on('error', closed)
+  stream.on('close', closed)
   return {
-    child,
-    output: () => output,
-    results: () => output.split('\n')
-      .filter(entry => entry.includes(RESULT))
-      .map((entry) => JSON.parse(entry.slice(entry.indexOf(RESULT) + RESULT.length))),
+    events,
+    close: () => stream.destroy(),
+    request(method, payload = {}) {
+      return new Promise((resolve, reject) => {
+        const id = ++next
+        const body = Buffer.from(JSON.stringify({ id, kind: 'req', method, payload }))
+        const header = Buffer.alloc(4)
+        header.writeUInt32BE(body.length)
+        const timer = setTimeout(() => { waiting.delete(id); reject(new Error(`RPC timeout: ${method}`)) }, 5000)
+        waiting.set(id, { resolve, reject, timer, method })
+        stream.write(Buffer.concat([header, body]))
+      })
+    },
   }
 }
-
-function startHost(scenario, extraEnv = {}, options = {}) {
-  const hostSocket = options.socketPath ?? socket
-  makeProfile('shellout-host', [
-    '- id: bash-sandbox',
-    '  disabled: true',
-    '- insert:',
-    '    - id: shellout',
-    "      name: 'dsh-shellout'",
-    '      config:',
-    `        socketPath: ${hostSocket}`,
-    '        mirrorPollMs: 50',
-    '        connectRetryMs: 3000',
-    '        disconnectGraceMs: 2500',
-    '    - id: shellout-testapp',
-    "      name: 'dsh-shellout-testapp'",
-  ])
-  return spawnProfile('shellout-host', { DSH_SHELLOUT_SCENARIO: scenario, ...extraEnv })
+async function ready() {
+  return until(async () => { try { const client = await connect(); await client.request('observe'); return client } catch { return null } }, 'executor ready')
 }
-
-async function waitForResult(handle, predicate, timeoutMs, label) {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    const match = handle.results().find(predicate)
-    if (match !== undefined) return match
-    if (handle.child.exitCode !== null) break
-    await new Promise(r => setTimeout(r, 50))
-  }
-  fail(label, `no matching result\n${handle.output()}`)
+async function host() {
+  const client = await connect()
+  const hello = await client.request('hello', { protocol: '2.0', clientBuild: 'e2e', bootId: 'survival-host', maxFrameBytes: 8 * 1024 * 1024 })
+  return { client, hello }
 }
-
-async function runScenario(scenario, timeoutMs = 30_000, extraEnv = {}) {
-  const handle = startHost(scenario, extraEnv)
-  const value = await waitForResult(handle, entry => entry.exitCode !== undefined
-    || entry.maxLagMs !== undefined
-    || entry.stdout !== undefined, timeoutMs, `scenario ${scenario}`)
-  handle.child.kill('SIGKILL')
-  return value
+async function exec(client, command, overrides = {}) {
+  const id = `e2e-${++serial}`
+  await client.request('exec', { executionId: id, operationId: `op-${id}`, specDigest: command,
+    spec: { argv: ['/bin/sh', '-c', command], cwd: root, env: { PATH: '/usr/bin:/bin' }, timeoutMs: 10000,
+      onExpiry: 'kill', graceMs: 100, capture: { stdoutMaxBytes: 64000, stderrMaxBytes: 64000, spillMaxBytes: 1048576, spillDir: state }, ...overrides } })
+  return id
 }
+async function settled(client, id) {
+  return until(async () => { const value = await client.request('state', { executionId: id }); return value.state !== 'running' && value }, `settlement ${id}`)
+}
+const status = id => JSON.parse(readFileSync(join(state, id, 'status.json'), 'utf8'))
+function ok(label) { console.log(`PASS ${label}`) }
 
-function alive(pid) {
-  try { process.kill(pid, 0); return true } catch { return false }
+async function startHub(database = history) {
+  const reservation = net.createServer()
+  reservation.listen(0, '127.0.0.1')
+  await once(reservation, 'listening')
+  const port = reservation.address().port
+  await new Promise(resolve => reservation.close(resolve))
+  const child = spawn(binary, ['--mode', 'hub', '--listen', `127.0.0.1:${port}`, '--executor-socket', socket, '--history', database], {
+    cwd: root, env: { ...process.env, DSH_HOME: join(root, 'home') }, stdio: ['ignore', 'ignore', 'pipe'],
+  })
+  children.add(child)
+  child.once('exit', () => children.delete(child))
+  child.stderr.on('data', chunk => { stderr += chunk })
+  const url = `http://127.0.0.1:${port}`
+  await until(async () => { try { return (await fetch(`${url}/health`)).ok } catch { return false } }, 'hub ready')
+  return { child, url }
 }
 
 async function main() {
-  mkdirSync(join(home, 'profiles'), { recursive: true })
-  log('root', root)
-  assert(existsSync(binary), 'rust binary present', binary)
+  let runner = startExecutor()
+  const observer = await ready()
+  assert.equal((await observer.request('observe')).leases, 0)
+  observer.close()
+  let { client } = await host()
+  const basic = await exec(client, 'printf "hello\\n"; printf "oops\\n" >&2; exit 3')
+  assert.equal((await settled(client, basic)).exitCode, 3)
+  assert.equal((await client.request('readStream', { executionId: basic, stream: 'stdout', offset: 0, limit: 2 })).text, 'he')
+  assert.equal((await client.request('readStream', { executionId: basic, stream: 'stdout', offset: 2, limit: 100 })).text, 'llo\n')
+  assert.equal((await client.request('readStream', { executionId: basic, stream: 'stderr', offset: 0, limit: 100 })).text, 'oops\n')
+  ok('stdout/stderr offsets and real exit code')
 
-  const runner = spawn(binary, ['--socket', socket, '--cwd', root, '--lease-ttl-ms', '4000'], { stdio: ['ignore', 'pipe', 'pipe'] })
-  let runnerOutput = ''
-  runner.stdout.on('data', (chunk) => { runnerOutput += String(chunk) })
-  runner.stderr.on('data', (chunk) => { runnerOutput += String(chunk) })
-  const deadline = Date.now() + 30_000
-  while (!existsSync(socket) && Date.now() < deadline) await new Promise(r => setTimeout(r, 100))
-  if (!existsSync(socket)) fail('rust runner boot', runnerOutput)
-  log('rust runner boot', { pid: runner.pid, socket })
+  const capped = await exec(client, 'printf 123456789; printf abcdef >&2', {
+    capture: { stdoutMaxBytes: 4, stderrMaxBytes: 3, spillMaxBytes: 0, spillDir: state },
+  })
+  await settled(client, capped)
+  const cappedOut = await client.request('readStream', { executionId: capped, stream: 'stdout', offset: 0, limit: 100 })
+  assert.equal(cappedOut.text, '1234')
+  assert.equal(cappedOut.lossy, true)
+  assert.equal(status(capped).stdout.bytes, 9)
+  assert.equal(status(capped).stderr.truncated, true)
+  ok('file byte cap and per-stream truncation facts')
 
-  const basic = await runScenario('basic')
-  assert(basic.exitCode === 3, 'basic exit code (rust)', basic.exitCode)
-  assert(basic.stdout === 'hello\n', 'basic stdout (rust)', JSON.stringify(basic.stdout))
-  assert(basic.stderr === 'oops\n', 'basic stderr (rust)', JSON.stringify(basic.stderr))
+  const timed = await exec(client, "trap '' TERM; while :; do sleep 1; done", { timeoutMs: 200, graceMs: 100 })
+  const deadlineResult = await settled(client, timed)
+  assert.equal(deadlineResult.state, 'killed')
+  assert.equal(deadlineResult.signal, 9)
+  ok('deadline TERM-to-KILL escalation')
 
-  // The command must be a child of the Rust runner, not of the host.
-  const lagHandle = startHost('lag')
-  let runnerChildren = []
-  const sampleDeadline = Date.now() + 25_000
-  while (Date.now() < sampleDeadline && runnerChildren.length === 0) {
-    runnerChildren = execFileSync('bash', ['-c', `pgrep -P ${String(runner.pid)} -a || true`], { encoding: 'utf8' })
-      .split('\n').map(line => line.trim()).filter(Boolean)
-    if (runnerChildren.length === 0) await new Promise(r => setTimeout(r, 100))
-  }
-  const lag = await waitForResult(lagHandle, entry => entry.maxLagMs !== undefined, 40_000, 'scenario lag (rust)')
-  lagHandle.child.kill('SIGKILL')
-  assert(runnerChildren.length > 0, 'command runs under the rust runner', runnerChildren[0]?.slice(0, 90) ?? 'none')
-  assert(lag.maxLagMs < 250, 'host event loop under load (rust)', `${String(lag.maxLagMs)} ms max lag`)
+  const background = await exec(client, 'sleep 600 & echo started')
+  assert.equal((await settled(client, background)).exitCode, 0)
+  ok('background descendant cannot hold settlement open')
 
-  const background = await runScenario('background')
-  assert(background.stdout.includes('started'), 'background descendant command (rust)', JSON.stringify(background.stdout))
+  const survivor = await exec(client, 'i=0; while [ "$i" -lt 5 ]; do echo marker-$i; i=$((i+1)); sleep 1; done; exit 7')
+  const logPath = join(state, survivor, 'stdout.log')
+  await until(() => existsSync(logPath) && readFileSync(logPath, 'utf8').includes('marker-0'), 'first marker')
+  const before = readFileSync(logPath, 'utf8').length
+  await stop(runner, 'SIGKILL')
+  await until(() => readFileSync(logPath, 'utf8').length > before, 'shim writes after executor SIGKILL')
+  runner = startExecutor()
+  ;(await ready()).close()
+  const attached = await host()
+  client = attached.client
+  assert(attached.hello.executions.some(row => row.executionId === survivor && row.state === 'running'))
+  assert.equal((await settled(client, survivor)).exitCode, 7)
+  assert.equal(readFileSync(logPath, 'utf8'), 'marker-0\nmarker-1\nmarker-2\nmarker-3\nmarker-4\n')
+  assert(client.events.some(frame => frame.method === 'settled' && frame.payload.executionId === survivor && frame.payload.exitCode === 7))
+  ok('SIGKILL survival, matching-pid adoption, continued capture and exit 7')
 
-  const pidFile = join(root, 'hold.pid')
-  const hold = startHost('hold-then-die', { DSH_SHELLOUT_PIDFILE: pidFile })
-  const holdInfo = await waitForResult(hold, entry => entry.started === true, 30_000, 'hold-then-die (rust)')
-  await new Promise(r => setTimeout(r, 800))
-  const children = execFileSync('bash', ['-c', `pgrep -P ${String(holdInfo.hostPid)} || true`], { encoding: 'utf8' }).trim()
-  assert(children === '', 'host has no children (rust)', children === '' ? 'none' : children)
-  const commandPid = Number(readFileSync(pidFile, 'utf8').trim())
-  assert(alive(commandPid), 'descendant alive before lease expiry (rust)', `pid ${String(commandPid)}`)
-  await new Promise(r => setTimeout(r, 7_000))
-  assert(!alive(commandPid), 'lease expiry terminated the group (rust)', `pid ${String(commandPid)} alive=${String(alive(commandPid))}`)
+  const termSurvivor = await exec(client, 'echo ready; sleep 2; echo survived; exit 4')
+  await until(() => existsSync(join(state, termSurvivor, 'stdout.log')), 'TERM survivor starts')
+  await stop(runner, 'SIGTERM')
+  runner = startExecutor()
+  ;(await ready()).close()
+  ;({ client } = await host())
+  assert.equal((await settled(client, termSurvivor)).exitCode, 4)
+  ok('executor SIGTERM leaves shim and command running')
 
-  runner.kill('SIGTERM')
-  cleanup(0)
+  // A forged identity must not adopt or signal any process.
+  await stop(runner, 'SIGTERM')
+  const mismatch = status(survivor)
+  mismatch.state = 'running'
+  mismatch.processStartTime += 1
+  writeFileSync(join(state, survivor, 'status.json'), JSON.stringify(mismatch))
+  runner = startExecutor()
+  ;(await ready()).close()
+  ;({ client } = await host())
+  assert.equal((await client.request('state', { executionId: survivor })).state, 'lost')
+  ok('mismatched process start time becomes lost')
+  const hub = await startHub()
+  const liveStats = await (await fetch(`${hub.url}/api/stats`)).json()
+  assert.equal(liveStats.executor, 'available')
+  assert.equal(liveStats.historyWritable, true)
+  const list = await (await fetch(`${hub.url}/api/executions`)).json()
+  assert(list.executions.every(row => row.stdout === undefined && row.stderr === undefined))
+  const encodedId = [...capped].map(char => `%${char.charCodeAt(0).toString(16)}`).join('')
+  const cappedDetail = await (await fetch(`${hub.url}/api/execution?id=${encodedId}`)).json()
+  assert.equal(cappedDetail.stdout, '1234')
+  assert.equal(cappedDetail.stdoutLossy, true)
+  assert.equal(cappedDetail.stderrTruncated, true)
+  ok('hub observer, output-free summaries, percent-decoded detail and durable stream flags')
+  await stop(runner, 'SIGTERM')
+  assert((await fetch(`${hub.url}/`)).ok)
+  assert.equal(await (await fetch(`${hub.url}/health`)).text(), 'ok')
+  const degraded = await (await fetch(`${hub.url}/api/stats`)).json()
+  assert.equal(degraded.executor, 'unreachable')
+  assert.equal(degraded.history, 'available')
+  assert.equal(degraded.live, undefined)
+  assert.equal((await (await fetch(`${hub.url}/api/execution?id=${basic}`)).json()).exitCode, 3)
+  await stop(hub.child, 'SIGTERM')
+  const emptyHub = await startHub(join(root, 'missing.sqlite'))
+  assert((await (await fetch(`${emptyHub.url}/`)).text()).includes('History unavailable'))
+  assert.equal((await (await fetch(`${emptyHub.url}/api/stats`)).json()).history, 'unavailable')
+  await stop(emptyHub.child, 'SIGTERM')
+  ok('hub history-only degradation and missing-history page')
+  console.log('Rust execution-plane e2e: all scenarios passed')
 }
 
-main().catch(error => { log('error', error instanceof Error ? error.message : String(error)); cleanup(1) })
+try { await main() } finally {
+  for (const stream of clients) stream.destroy()
+  for (const child of children) await stop(child, 'SIGTERM')
+  // Only isolated executions created here; request cleanup if an assertion failed.
+  if (existsSync(state)) {
+    const { readdirSync } = await import('node:fs')
+    for (const id of readdirSync(state)) {
+      try { if (status(id).state === 'running') writeFileSync(join(state, id, 'kill.request'), '') } catch { /* never admitted */ }
+    }
+    await sleep(400)
+  }
+  rmSync(root, { recursive: true, force: true })
+}

@@ -6,11 +6,8 @@
 
 use std::io;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-
-/// Protocol revision this binary speaks.
-pub const PROTOCOL_VERSION: &str = "2.0";
 
 /// Largest frame accepted when the caller does not negotiate a smaller one.
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
@@ -35,9 +32,6 @@ pub struct Envelope {
 pub struct HelloRequest {
     /// Protocol revision the host speaks.
     pub protocol: String,
-    /// Host build label, for diagnostics.
-    #[serde(default)]
-    pub client_build: String,
     /// Identity of the host boot; executions belong to it.
     pub boot_id: String,
     /// Largest frame the host accepts.
@@ -46,21 +40,21 @@ pub struct HelloRequest {
 }
 
 /// How much of each stream is retained and spilled.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CapturePolicy {
-    /// In-memory cap for stdout; overflow keeps the tail.
+    /// File retention cap for stdout when spill is disabled.
     pub stdout_max_bytes: usize,
-    /// In-memory cap for stderr; overflow keeps the tail.
+    /// File retention cap for stderr when spill is disabled.
     pub stderr_max_bytes: usize,
-    /// Whole-stream cap for a spill file; a larger stream discards its spill.
+    /// File cap for either stream; zero uses the per-stream retention cap.
     pub spill_max_bytes: u64,
-    /// Directory spill files are written to.
+    /// Legacy spill directory; durable capture always lives in the state directory.
     pub spill_dir: String,
 }
 
 /// One fully resolved execution: everything needed to exec, no harness policy.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpawnSpec {
     /// Executable and arguments.
@@ -158,8 +152,12 @@ pub async fn read_frame<R: AsyncRead + Unpin>(
     }
     let mut body = vec![0u8; length];
     reader.read_exact(&mut body).await?;
-    let envelope: Envelope = serde_json::from_slice(&body)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("bad frame body: {error}")))?;
+    let envelope: Envelope = serde_json::from_slice(&body).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("bad frame body: {error}"),
+        )
+    })?;
     Ok(Some(envelope))
 }
 

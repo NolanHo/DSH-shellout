@@ -1,412 +1,288 @@
-//! Process execution: spawn in its own session, capture both streams, enforce
-//! the deadline, and report terminal facts exactly once.
-
-use std::io::{Read, Write};
-use std::os::unix::process::ExitStatusExt;
-use std::process::{Child, Command, Stdio};
+//! Executor-side file-backed execution handles. The shim owns all child I/O.
+use std::fs;
+use std::io;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde_json::json;
-use tokio::sync::broadcast;
+use serde_json::{json, Value};
 
-use crate::capture::CaptureState;
+use crate::capture;
+use crate::shim::{self, Meta, Status, StreamStatus};
 use crate::store::{Record, Store};
-use crate::protocol::SpawnSpec;
 
-/// Terminal facts of one execution.
-#[derive(Clone, Debug)]
-pub struct Terminal {
-    /// Still running.
-    pub running: bool,
-    /// Ended because a termination was requested (kill, deadline, teardown).
-    pub killed: bool,
-    /// Exit code when the process exited normally.
-    pub exit_code: Option<i32>,
-    /// Terminating signal number, when signal-killed.
-    pub signal: Option<i32>,
-}
-
-impl Terminal {
-    fn running() -> Self {
-        Terminal { running: true, killed: false, exit_code: None, signal: None }
-    }
-}
-
-/// One live (or settled) execution.
 pub struct Execution {
-    /// Execution identity chosen by the host.
-    pub id: String,
-    /// Idempotency key of the spawn.
-    pub operation_id: String,
-    /// Digest of the spawn spec.
-    pub digest: String,
-    /// Host boot that owns this execution.
-    pub boot_id: String,
-    /// `argv[0]` for the dashboard.
-    pub program: String,
-    /// Full argv, for the dashboard detail view.
-    pub argv: Vec<String>,
-    /// Working directory the command ran in.
-    pub cwd: String,
-    /// When the process was created.
-    pub started: Instant,
-    /// When it settled.
-    pub settled_at: Mutex<Option<Instant>>,
-    /// Wall-clock start, for the dashboard's started column.
-    pub started_wall: SystemTime,
-    /// Wall-clock settlement.
-    pub settled_wall: Mutex<Option<SystemTime>>,
-    /// Captured stdout.
-    pub stdout: Arc<Mutex<CaptureState>>,
-    /// Captured stderr.
-    pub stderr: Arc<Mutex<CaptureState>>,
-    /// Terminal facts.
-    pub terminal: Arc<Mutex<Terminal>>,
-    killed_by_request: Arc<AtomicBool>,
-    pid: Arc<Mutex<Option<i32>>>,
-    grace_ms: u64,
+    pub meta: Meta,
+    pub dir: PathBuf,
+    status: Mutex<Status>,
+    pub dirty: AtomicBool,
+    pub announced: AtomicBool,
 }
 
-/// Totals the dashboard reports.
 #[derive(Default)]
 pub struct Counters {
-    /// Spawns that reached the operating system.
     pub spawned: AtomicU64,
-    /// Executions that exited on their own.
     pub settled: AtomicU64,
-    /// Executions terminated by a request or the deadline.
     pub killed: AtomicU64,
-    /// Executions that failed after admission.
     pub failed: AtomicU64,
 }
 
 impl Execution {
-    /// Current terminal facts.
-    pub fn state(&self) -> Terminal {
-        self.terminal.lock().map(|guard| guard.clone()).unwrap_or(Terminal {
-            running: true,
-            killed: false,
-            exit_code: None,
-            signal: None,
-        })
+    pub fn state(&self) -> Status {
+        self.status
+            .lock()
+            .expect("execution status poisoned")
+            .clone()
     }
 
-    /// Request termination of the execution's process group.
-    pub fn kill(&self) -> bool {
-        if !self.state().running {
-            return false;
+    pub fn running(&self) -> bool {
+        self.state().state == "running"
+    }
+
+    pub fn kill(&self) -> io::Result<bool> {
+        if !self.running() {
+            return Ok(false);
         }
-        self.killed_by_request.store(true, Ordering::SeqCst);
-        self.signal_group(libc::SIGTERM);
-        let pid = self.pid.lock().ok().and_then(|guard| *guard);
-        let grace = self.grace_ms;
-        let terminal = Arc::clone(&self.terminal);
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(grace.max(1)));
-            let running = terminal.lock().map(|guard| guard.running).unwrap_or(false);
-            if running {
-                if let Some(pid) = pid {
-                    signal_group(pid, libc::SIGKILL);
+        // A durable request, consumed by the shim; executor never owns signals.
+        fs::write(self.dir.join("kill.request"), [])?;
+        Ok(true)
+    }
+
+    pub fn refresh(&self) {
+        if !self.running() {
+            return;
+        }
+        match shim::read_json::<Status>(&self.dir.join("status.json")) {
+            Ok(mut next) => {
+                if next.state == "running" && !shim::is_live(&next) {
+                    // Re-read after the liveness check: publication may have
+                    // raced the command's exit and removal from /proc.
+                    if let Ok(latest) = shim::read_json::<Status>(&self.dir.join("status.json")) {
+                        next = latest;
+                    }
+                    if next.state == "running"
+                        && !shim::matches_process(next.shim_pid, next.shim_start_time)
+                    {
+                        next.state = "lost".into();
+                        next.finished_at = Some(shim::now_ms());
+                        next.error = Some("shim process disappeared".into());
+                    }
+                }
+                if next.state != "running" {
+                    self.dirty.store(true, Ordering::Relaxed);
+                }
+                *self.status.lock().expect("execution status poisoned") = next;
+            }
+            Err(error) => eprintln!("execution {}: status read failed: {error}", self.meta.id),
+        }
+    }
+
+    pub fn summary(&self) -> Value {
+        let status = self.state();
+        // Keep every individual summary bounded, even with very large argv.
+        let command: String = self
+            .meta
+            .spec
+            .argv
+            .first()
+            .map(String::as_str)
+            .unwrap_or("")
+            .chars()
+            .take(256)
+            .collect();
+        json!({"id": self.meta.id, "command": command, "state":status.state,
+            "exitCode":status.exit_code,"signal":status.signal,
+            "startedAtMs":status.started_at,"finishedAtMs":status.finished_at,
+            "ageMs":shim::now_ms().saturating_sub(status.started_at),
+            "durationMs":status.finished_at.map(|end| end.saturating_sub(status.started_at)),
+            "lossy":status.stdout.lossy || status.stderr.lossy,
+            "stdoutLossy":status.stdout.lossy,"stderrLossy":status.stderr.lossy,
+            "stdoutTruncated":status.stdout.truncated,"stderrTruncated":status.stderr.truncated})
+    }
+
+    pub fn read_stream(&self, stream: &str, offset: u64, limit: usize) -> io::Result<Value> {
+        let status = self.state();
+        let truncated = if stream == "stderr" {
+            status.stderr.truncated
+        } else {
+            status.stdout.truncated
+        };
+        capture::read_stream(&self.dir, stream, offset, limit, truncated)
+    }
+
+    pub fn detail(&self) -> Value {
+        let mut value = self.summary();
+        value["argv"] = json!(self.meta.spec.argv);
+        value["cwd"] = json!(self.meta.spec.cwd);
+        for stream in ["stdout", "stderr"] {
+            match self.read_stream(stream, 0, capture::READ_LIMIT) {
+                Ok(read) => {
+                    value[stream] = read["text"].clone();
+                    value[format!("{stream}Lossy")] = read["lossy"].clone();
+                    value[format!("{stream}SpillPath")] = read["spillPath"].clone();
+                }
+                Err(error) => {
+                    value["error"] = json!(error.to_string());
                 }
             }
-        });
-        true
+        }
+        value["lossy"] = json!(value["stdoutLossy"] == true || value["stderrLossy"] == true);
+        value
     }
 
-    /// One execution as the dashboard shows it, including captured output.
-    pub fn detail(&self) -> serde_json::Value {
-        let state = self.state();
-        let read = |capture: &Arc<Mutex<CaptureState>>| {
-            capture
-                .lock()
-                .map(|guard| guard.read_from(0, usize::MAX))
-                .map(|read| (read.text, read.lossy, read.spill_path))
-                .unwrap_or_default()
+    pub fn record(&self) -> io::Result<Record> {
+        let status = self.state();
+        let read = |stream: &str| -> io::Result<(String, bool)> {
+            let bytes = match fs::read(self.dir.join(format!("{stream}.log"))) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+                Err(error) => return Err(error),
+            };
+            let text = String::from_utf8_lossy(&bytes);
+            let invalid = matches!(&text, std::borrow::Cow::Owned(_));
+            Ok((text.into_owned(), invalid))
         };
-        let (stdout, stdout_lossy, stdout_spill) = read(&self.stdout);
-        let (stderr, stderr_lossy, stderr_spill) = read(&self.stderr);
-        let finished = self.settled_at.lock().ok().and_then(|guard| *guard);
-        json!({
-            "id": self.id,
-            "argv": self.argv,
-            "command": self.program,
-            "cwd": self.cwd,
-            "state": if state.running { "running" } else if state.killed { "killed" } else { "exited" },
-            "exitCode": state.exit_code,
-            "signal": state.signal,
-            "ageMs": self.started.elapsed().as_millis() as u64,
-            "durationMs": finished.map(|at| at.saturating_duration_since(self.started).as_millis() as u64),
-            "startedAtMs": epoch_millis(self.started_wall),
-            "finishedAtMs": self.settled_wall.lock().ok().and_then(|guard| *guard).map(epoch_millis),
-            "stdout": stdout,
-            "stderr": stderr,
-            "lossy": stdout_lossy || stderr_lossy,
-            "stdoutSpillPath": stdout_spill,
-            "stderrSpillPath": stderr_spill,
+        let (stdout, out_invalid) = read("stdout")?;
+        let (stderr, err_invalid) = read("stderr")?;
+        let stdout_lossy = status.stdout.lossy || status.stdout.truncated || out_invalid;
+        let stderr_lossy = status.stderr.lossy || status.stderr.truncated || err_invalid;
+        Ok(Record {
+            id: self.meta.id.clone(),
+            argv: serde_json::to_string(&self.meta.spec.argv)?,
+            cwd: self.meta.spec.cwd.clone(),
+            started_at: status.started_at,
+            finished_at: status.finished_at,
+            state: status.state,
+            exit_code: status.exit_code.map(i64::from),
+            signal: status.signal.map(i64::from),
+            stdout,
+            stderr,
+            lossy: stdout_lossy || stderr_lossy,
+            stdout_lossy,
+            stderr_lossy,
+            stdout_truncated: status.stdout.truncated,
+            stderr_truncated: status.stderr.truncated,
         })
     }
 
-    fn signal_group(&self, signal: i32) {
-        if let Ok(guard) = self.pid.lock() {
-            if let Some(pid) = *guard {
-                signal_group(pid, signal);
-            }
-        }
+    pub fn persist(&self, store: &Store) -> Result<(), String> {
+        store.save(&self.record().map_err(|error| error.to_string())?)?;
+        self.dirty.store(false, Ordering::Relaxed);
+        Ok(())
     }
 }
 
-/// Signal one process group.
-fn signal_group(pid: i32, signal: i32) {
-    // SAFETY: `kill` with a negative pid addresses the process group led by
-    // `pid`; a failure means the group is already gone, which callers tolerate.
-    unsafe {
-        libc::kill(-pid, signal);
-    }
-}
-
-/// Spawn one execution from a resolved spec.
-///
-/// The child becomes a session leader, so its process group id equals its pid
-/// and a single `kill(-pid, …)` reaches every descendant.
-pub fn spawn_execution(
-    spec: SpawnSpec,
-    execution_id: String,
-    operation_id: String,
-    digest: String,
-    boot_id: String,
-    events: broadcast::Sender<serde_json::Value>,
-    counters: Arc<Counters>,
-    store: Option<Arc<Store>>,
-) -> std::io::Result<Arc<Execution>> {
-    let mut command = Command::new(&spec.argv[0]);
-    command
-        .args(&spec.argv[1..])
-        .current_dir(&spec.cwd)
-        .env_clear()
-        .envs(&spec.env)
-        .stdin(if spec.stdin.is_some() { Stdio::piped() } else { Stdio::null() })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // SAFETY: `setsid` is async-signal-safe and runs in the forked child before
-    // exec; it makes the child a session leader with no controlling terminal.
-    unsafe {
-        use std::os::unix::process::CommandExt;
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-
-    let mut child = command.spawn()?;
-    let pid = child.id() as i32;
-
-    if let Some(input) = spec.stdin.clone() {
-        if let Some(mut stdin) = child.stdin.take() {
-            thread::spawn(move || {
-                let _ = stdin.write_all(input.as_bytes());
-            });
-        }
-    }
-
-    let stdout = Arc::new(Mutex::new(CaptureState::new(
-        spec.capture.stdout_max_bytes,
-        spec.capture.spill_max_bytes,
-        &spec.capture.spill_dir,
-        &execution_id,
-        "stdout",
-    )));
-    let stderr = Arc::new(Mutex::new(CaptureState::new(
-        spec.capture.stderr_max_bytes,
-        spec.capture.spill_max_bytes,
-        &spec.capture.spill_dir,
-        &execution_id,
-        "stderr",
-    )));
-
-    let stdout_reader = pump(child.stdout.take(), Arc::clone(&stdout));
-    let stderr_reader = pump(child.stderr.take(), Arc::clone(&stderr));
-
-    counters.spawned.fetch_add(1, Ordering::Relaxed);
-    let save = move |execution: &Execution, state: &str| {
-        let Some(store) = store.as_ref() else { return };
-        let state_facts = execution.state();
-        let read = |capture: &Arc<Mutex<CaptureState>>| {
-            capture.lock().map(|guard| guard.read_from(0, usize::MAX)).map(|read| read.text).unwrap_or_default()
-        };
-        store.save(&Record {
-            id: execution.id.clone(),
-            argv: serde_json::to_string(&execution.argv).unwrap_or_else(|_| "[]".to_string()),
-            cwd: execution.cwd.clone(),
-            started_at: epoch_millis(execution.started_wall),
-            finished_at: execution.settled_wall.lock().ok().and_then(|guard| *guard).map(epoch_millis),
-            state: state.to_string(),
-            exit_code: state_facts.exit_code.map(i64::from),
-            signal: state_facts.signal.map(i64::from),
-            stdout: read(&execution.stdout),
-            stderr: read(&execution.stderr),
-            lossy: false,
-        });
+pub fn admit(meta: Meta, state: &Path, store: &Store) -> io::Result<Arc<Execution>> {
+    let dir = state.join(&meta.id);
+    fs::create_dir(&dir)?;
+    shim::atomic_json(&dir.join("meta.json"), &meta)?;
+    let status = Status {
+        state: "running".into(),
+        pid: None,
+        pgid: None,
+        process_start_time: None,
+        shim_pid: 0,
+        shim_start_time: 0,
+        started_at: shim::now_ms(),
+        finished_at: None,
+        exit_code: None,
+        signal: None,
+        stdout: StreamStatus::default(),
+        stderr: StreamStatus::default(),
+        error: None,
     };
     let execution = Arc::new(Execution {
-        id: execution_id.clone(),
-        program: spec.argv.first().cloned().unwrap_or_default(),
-        argv: spec.argv.clone(),
-        cwd: spec.cwd.clone(),
-        started: Instant::now(),
-        settled_at: Mutex::new(None),
-        started_wall: SystemTime::now(),
-        settled_wall: Mutex::new(None),
-        operation_id,
-        digest,
-        boot_id: boot_id.clone(),
-        stdout,
-        stderr,
-        terminal: Arc::new(Mutex::new(Terminal::running())),
-        killed_by_request: Arc::new(AtomicBool::new(false)),
-        pid: Arc::new(Mutex::new(Some(pid))),
-        grace_ms: spec.grace_ms,
+        meta,
+        dir,
+        status: Mutex::new(status),
+        dirty: AtomicBool::new(false),
+        announced: AtomicBool::new(false),
     });
-
-    save(&execution, "running");
-    if spec.on_expiry == "kill" {
-        let watchdog = Arc::clone(&execution);
-        let timeout_ms = spec.timeout_ms;
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(timeout_ms.max(1)));
-            watchdog.kill();
+    if let Err(error) = execution.persist(store) {
+        // No child has been spawned. Remove only the admission metadata we own
+        // so a corrected request can retry the same execution id.
+        fs::remove_file(execution.dir.join("meta.json"))?;
+        fs::remove_dir(&execution.dir)?;
+        return Err(io::Error::other(format!(
+            "history admission write failed: {error}"
+        )));
+    }
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .arg("--mode")
+        .arg("shim")
+        .arg("--state")
+        .arg(state)
+        .arg("--id")
+        .arg(&execution.meta.id)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: detach the shim from executor's session and controlling terminal.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
         });
     }
-
-    let supervisor = Arc::clone(&execution);
-    let save_handle = save;
-    thread::spawn(move || {
-        let outcome = wait_child(child);
-        let _ = stdout_reader.join();
-        let _ = stderr_reader.join();
-        // Settlement waits for the *group* to be empty, not just the direct
-        // child: a detached descendant keeps the managed range alive, and the
-        // host's isolation story depends on that boundary being honest.
-        await_group_empty(pid, Duration::from_millis(2_000));
-        let killed = supervisor.killed_by_request.load(Ordering::SeqCst);
-        let (exit_code, signal) = match outcome {
-            Ok(status) => (
-                status.code(),
-                status.signal(),
-            ),
-            Err(_) => (None, None),
-        };
-        if let Ok(mut guard) = supervisor.terminal.lock() {
-            guard.running = false;
-            guard.killed = killed;
-            guard.exit_code = exit_code;
-            guard.signal = signal;
+    match command.spawn() {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
         }
-        if let Ok(mut guard) = supervisor.pid.lock() {
-            *guard = None;
+        Err(error) => {
+            let mut status = execution.status.lock().expect("execution status poisoned");
+            status.state = "failed".into();
+            status.finished_at = Some(shim::now_ms());
+            status.error = Some(error.to_string());
+            shim::atomic_json(&execution.dir.join("status.json"), &*status)?;
+            execution.dirty.store(true, Ordering::Relaxed);
         }
-        if let Ok(mut guard) = supervisor.settled_at.lock() {
-            *guard = Some(Instant::now());
-        }
-        if let Ok(mut guard) = supervisor.settled_wall.lock() {
-            *guard = Some(SystemTime::now());
-        }
-        let status = if killed { "killed" } else { "exited" };
-        if killed {
-            counters.killed.fetch_add(1, Ordering::Relaxed);
-        } else if exit_code == Some(0) {
-            counters.settled.fetch_add(1, Ordering::Relaxed);
-        } else {
-            counters.failed.fetch_add(1, Ordering::Relaxed);
-        }
-        save_handle(&supervisor, status);
-        let _ = events.send(crate::protocol::event(
-            "settled",
-            json!({
-                "executionId": supervisor.id,
-                "status": status,
-                "exitCode": exit_code,
-                "signal": signal,
-            }),
-        ));
-    });
-
+    }
     Ok(execution)
 }
 
-/// Drain one pipe into its capture in a thread.
-fn pump<R: Read + Send + 'static>(
-    stream: Option<R>,
-    capture: Arc<Mutex<CaptureState>>,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let Some(mut stream) = stream else { return };
-        let mut buffer = [0u8; 16 * 1024];
-        loop {
-            match stream.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(read) => {
-                    if let Ok(mut capture) = capture.lock() {
-                        capture.push(&buffer[..read]);
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
+pub fn load(dir: PathBuf) -> io::Result<Arc<Execution>> {
+    let meta: Meta = shim::read_json(&dir.join("meta.json"))?;
+    let mut status: Status = match shim::read_json(&dir.join("status.json")) {
+        Ok(status) => status,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Status {
+            state: "lost".into(),
+            pid: None,
+            pgid: None,
+            process_start_time: None,
+            shim_pid: 0,
+            shim_start_time: 0,
+            started_at: shim::now_ms(),
+            finished_at: Some(shim::now_ms()),
+            exit_code: None,
+            signal: None,
+            stdout: StreamStatus::default(),
+            stderr: StreamStatus::default(),
+            error: Some("admission interrupted before shim status".into()),
+        },
+        Err(error) => return Err(error),
+    };
+    if status.state == "running" && !shim::is_live(&status) {
+        let latest: Status = shim::read_json(&dir.join("status.json"))?;
+        status = latest;
+        if status.state == "running" && !shim::is_live(&status) {
+            status.state = "lost".into();
+            status.finished_at = Some(shim::now_ms());
+            status.error = Some("recorded process identity no longer exists".into());
         }
-    })
-}
-
-/// Epoch milliseconds for a wall-clock instant.
-fn epoch_millis(at: SystemTime) -> u64 {
-    at.duration_since(UNIX_EPOCH).map(|since| since.as_millis() as u64).unwrap_or(0)
-}
-
-/// Wait for the child and return its exit status.
-fn wait_child(mut child: Child) -> std::io::Result<std::process::ExitStatus> {
-    child.wait()
-}
-
-/// Poll until the process group led by `pid` holds no live member.
-///
-/// `kill(-pgid, 0)` answers "does any non-zombie member remain"; the loop is
-/// bounded so a group held open by an adopted child cannot block settlement.
-fn await_group_empty(pid: i32, bound: Duration) {
-    let deadline = std::time::Instant::now() + bound;
-    loop {
-        // SAFETY: signal 0 probes group membership without delivering anything.
-        let alive = unsafe { libc::kill(-pid, 0) } == 0;
-        if !alive || std::time::Instant::now() >= deadline {
-            return;
-        }
-        thread::sleep(Duration::from_millis(10));
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn signal_group_of_a_dead_group_is_tolerated() {
-        signal_group(999_999_999, libc::SIGTERM);
-    }
-
-    #[test]
-    fn group_probe_returns_for_a_missing_group() {
-        let started = std::time::Instant::now();
-        await_group_empty(999_999_999, Duration::from_millis(500));
-        assert!(started.elapsed() < Duration::from_millis(100));
-    }
-
-    #[test]
-    fn terminal_starts_running() {
-        let terminal = Terminal::running();
-        assert!(terminal.running);
-        assert_eq!(terminal.exit_code, None);
-    }
+    Ok(Arc::new(Execution {
+        meta,
+        dir,
+        status: Mutex::new(status),
+        dirty: AtomicBool::new(true),
+        announced: AtomicBool::new(false),
+    }))
 }
