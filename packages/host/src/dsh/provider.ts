@@ -28,22 +28,65 @@ import { specDigest, type ExecSpec } from 'dsh-shellout-protocol'
 import { ShelloutClient } from '../core/client.js'
 import { RemoteExecution } from '../core/execution.js'
 
+/** Local executor settings used by the fallback path. */
+export interface LocalExecutorConfig {
+  /** Default working directory for commands. */
+  cwd?: string
+  /** Default foreground timeout in milliseconds. */
+  timeoutMs?: number
+  /** Upper bound on a per-call timeout. */
+  maxTimeoutMs?: number
+  /** Per-stream in-memory output cap. */
+  maxOutputBytes?: number
+  /** Per-stream spill-file cap. */
+  maxSpillBytes?: number
+  /** Termination grace period. */
+  graceMs?: number
+}
+
 /** Plugin configuration; every field is optional. */
 export interface ShelloutConfig {
   /** Runner socket path; defaults to `$DSH_HOME/shellout/control.sock`. */
   socketPath?: string
-  /** Bound on the startup handshake. */
+  /** Bound on one startup handshake attempt. */
   connectTimeoutMs?: number
+  /** How long to keep retrying the runner at startup before deciding. */
+  connectRetryMs?: number
+  /** Delay before reconnecting after a mid-run connection loss; `0` disables reconnect. */
+  reconnectDelayMs?: number
+  /**
+   * How long a lost runner connection may stay down before its live executions
+   * are settled as lost. A reconnect inside the window keeps them running.
+   */
+  disconnectGraceMs?: number
   /** Output poll cadence, in milliseconds. */
   mirrorPollMs?: number
   /** Bytes retained per stream for synchronous reads. */
   mirrorRetainBytes?: number
   /** Boot-lease ping cadence. */
   heartbeatMs?: number
+  /**
+   * What to do when the runner never answers at startup: `local` keeps the
+   * agent's shell by running commands in this process, `none` refuses to load.
+   */
+  fallback?: 'local' | 'none'
+  /** Settings for the fallback executor. */
+  local?: LocalExecutorConfig
 }
 
 /** Configuration after defaulting. */
-export interface ResolvedShelloutConfig extends Required<ShelloutConfig> {}
+export interface ResolvedShelloutConfig {
+  readonly socketPath: string
+  readonly connectTimeoutMs: number
+  readonly connectRetryMs: number
+  readonly reconnectDelayMs: number
+  readonly disconnectGraceMs: number
+  readonly mirrorPollMs: number
+  readonly mirrorRetainBytes: number
+  readonly heartbeatMs: number
+  readonly fallback: 'local' | 'none'
+  readonly local: Omit<Required<LocalExecutorConfig>, 'cwd'> & { readonly cwd?: string }
+}
 
 /**
  * Apply defaults to a plugin configuration.
@@ -56,9 +99,21 @@ export function resolveConfig(config: ShelloutConfig = {}, env: NodeJS.ProcessEn
   return {
     socketPath: config.socketPath ?? join(home, 'shellout', 'control.sock'),
     connectTimeoutMs: config.connectTimeoutMs ?? 5_000,
+    connectRetryMs: config.connectRetryMs ?? 10_000,
+    reconnectDelayMs: config.reconnectDelayMs ?? 2_000,
+    disconnectGraceMs: config.disconnectGraceMs ?? 10_000,
     mirrorPollMs: config.mirrorPollMs ?? 150,
     mirrorRetainBytes: config.mirrorRetainBytes ?? 1_048_576,
     heartbeatMs: config.heartbeatMs ?? 5_000,
+    fallback: config.fallback ?? 'local',
+    local: {
+      ...config.local?.cwd === undefined ? {} : { cwd: config.local.cwd },
+      timeoutMs: config.local?.timeoutMs ?? 120_000,
+      maxTimeoutMs: config.local?.maxTimeoutMs ?? 600_000,
+      maxOutputBytes: config.local?.maxOutputBytes ?? 64_000,
+      maxSpillBytes: config.local?.maxSpillBytes ?? 67_108_864,
+      graceMs: config.local?.graceMs ?? 3_000,
+    },
   }
 }
 
@@ -67,6 +122,9 @@ export class ShelloutExecutor extends ShellExecutor {
   private readonly bootId = randomUUID()
   private readonly live = new Set<RemoteExecution>()
   private readonly detachClose: () => void
+  private readonly detachDisconnect: () => void
+  private readonly detachReconnect: () => void
+  private lossTimer: NodeJS.Timeout | undefined
 
   /**
    * @param ctx - owning context.
@@ -75,10 +133,9 @@ export class ShelloutExecutor extends ShellExecutor {
    */
   constructor(ctx: Context, private readonly config: ResolvedShelloutConfig, private readonly client: ShelloutClient) {
     super(ctx)
-    this.detachClose = client.onClose(() => {
-      for (const execution of this.live) execution.abortLost('shellout: runner lost')
-      this.live.clear()
-    })
+    this.detachClose = client.onClose(() => { this.settleAllLost() })
+    this.detachDisconnect = client.onDisconnect(() => { this.beginLossGrace() })
+    this.detachReconnect = client.onReconnect(() => { this.recover() })
   }
 
   /** The runner's sandbox mode, when its executor confines. */
@@ -150,7 +207,45 @@ export class ShelloutExecutor extends ShellExecutor {
   /** Close the connection and settle every live execution. */
   async [Symbol.asyncDispose](): Promise<void> {
     this.detachClose()
+    this.detachDisconnect()
+    this.detachReconnect()
+    if (this.lossTimer !== undefined) clearTimeout(this.lossTimer)
     this.client.close()
+  }
+
+  /** Start the window in which a reconnect still saves the live executions. */
+  private beginLossGrace(): void {
+    if (this.lossTimer !== undefined) return
+    this.lossTimer = setTimeout(() => {
+      this.lossTimer = undefined
+      this.settleAllLost()
+    }, this.config.disconnectGraceMs)
+    this.lossTimer.unref()
+  }
+
+  /** A reconnect inside the grace window: keep what the runner still holds. */
+  private recover(): void {
+    if (this.lossTimer !== undefined) {
+      clearTimeout(this.lossTimer)
+      this.lossTimer = undefined
+    }
+    const held = new Set(this.client.executions.map(entry => entry.executionId))
+    for (const execution of [...this.live]) {
+      if (!held.has(execution.executionId)) {
+        execution.abortLost('shellout: runner lost')
+        this.live.delete(execution)
+      }
+    }
+  }
+
+  /** Settle every live execution because the runner is gone for good. */
+  private settleAllLost(): void {
+    if (this.lossTimer !== undefined) {
+      clearTimeout(this.lossTimer)
+      this.lossTimer = undefined
+    }
+    for (const execution of this.live) execution.abortLost('shellout: runner lost')
+    this.live.clear()
   }
 }
 

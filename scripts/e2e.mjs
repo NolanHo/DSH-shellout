@@ -115,7 +115,10 @@ function startRunner() {
 }
 
 /** The host profile replaces the local shell executor — the production switch in one row. */
-function startHost(scenario, extraEnv = {}) {
+function startHost(scenario, extraEnv = {}, options = {}) {
+  const hostSocket = options.socketPath ?? socket
+  const fallback = options.fallback ?? 'local'
+  const retryMs = options.connectRetryMs ?? 10_000
   makeProfile('shellout-host', [
     '- id: bash-sandbox',
     '  disabled: true',
@@ -123,8 +126,11 @@ function startHost(scenario, extraEnv = {}) {
     '    - id: shellout',
     "      name: 'dsh-shellout'",
     '      config:',
-    `        socketPath: ${socket}`,
+    `        socketPath: ${hostSocket}`,
     '        mirrorPollMs: 50',
+    `        fallback: ${fallback}`,
+    `        connectRetryMs: ${String(retryMs)}`,
+    '        disconnectGraceMs: 2500',
     '    - id: shellout-testapp',
     "      name: 'dsh-shellout-testapp'",
   ])
@@ -144,7 +150,11 @@ async function waitForResult(handle, predicate, timeoutMs, label) {
 
 /** Run one scenario to completion. */
 async function runScenario(scenario, timeoutMs = 30_000, extraEnv = {}) {
-  const handle = startHost(scenario, extraEnv)
+  return await runScenarioWithOptions(scenario, timeoutMs, extraEnv, {})
+}
+
+async function runScenarioWithOptions(scenario, timeoutMs, extraEnv, options) {
+  const handle = startHost(scenario, extraEnv, options)
   const value = await waitForResult(handle, entry => entry.exitCode !== undefined
     || entry.maxLagMs !== undefined
     || entry.stdout !== undefined
@@ -189,6 +199,13 @@ async function main() {
   assert(alive(commandPid), 'surviving descendant alive before the lease expires', `pid ${String(commandPid)}`)
   await new Promise(r => setTimeout(r, 7_000))
   assert(!alive(commandPid), 'lease expiry terminated the group', `pid ${String(commandPid)} alive=${String(alive(commandPid))}`)
+
+  // Fallback: with no runner listening, the host must still run commands.
+  const fallback = await runScenarioWithOptions('basic', 60_000, {}, {
+    socketPath: join(root, 'missing.sock'), fallback: 'local', connectRetryMs: 3_000,
+  })
+  assert(fallback.exitCode === 3 && fallback.stdout === 'hello\n', 'fallback runs commands locally when the runner is absent',
+    `exit=${String(fallback.exitCode)} stdout=${JSON.stringify(fallback.stdout)}`)
 
   const crash = startHost('runner-crash')
   await waitForResult(crash, entry => entry.started === true, 30_000, 'runner-crash start')

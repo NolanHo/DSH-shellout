@@ -9,7 +9,8 @@
  * @module dsh-shellout-runner/core/server
  */
 
-import { chmod, unlink } from 'node:fs/promises'
+import { chmod, mkdir, unlink } from 'node:fs/promises'
+import { dirname } from 'node:path'
 import { createServer, type Server, type Socket } from 'node:net'
 import {
   DEFAULT_MAX_FRAME_BYTES,
@@ -80,6 +81,7 @@ export class RunnerServer {
    */
   static async listen(options: RunnerServerOptions): Promise<RunnerServer> {
     const maxFrameBytes = options.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES
+    await mkdir(dirname(options.socketPath), { recursive: true, mode: 0o700 })
     await removeStaleSocket(options.socketPath)
     const server = createServer()
     const instance = new RunnerServer(options, server)

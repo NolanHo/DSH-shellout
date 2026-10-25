@@ -29,6 +29,19 @@ Interactive terminals (PTY), MCP servers, language servers, subagent CLIs, and p
 stay in the host: they do not poll process liveness, and moving them is a separate decision. See
 [the spec](docs/spec.md) for the exact boundary.
 
+## Resilience
+
+The runner is the preferred execution path, not a hard dependency of the agent's shell.
+
+- **Startup**: if the runner does not answer within `connectRetryMs` (default 10 s), the plugin
+  logs one warning naming the socket and mounts the stock in-process executor instead. The agent
+  keeps its shell; the degraded mode is visible in the log, never silent. Set `fallback: none`
+  to refuse to load instead.
+- **Mid-run loss**: a dropped connection gets `disconnectGraceMs` (default 10 s) to recover.
+  A reconnect keeps the executions the runner still holds; if the window passes, they settle as
+  `killed` with a `shellout: runner lost` note, and the next commands run in this process until a
+  reconnect succeeds.
+
 ## Status
 
 Implementation complete for the shell path; the contract lives in [docs/spec.md](docs/spec.md).

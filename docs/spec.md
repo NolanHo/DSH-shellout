@@ -178,6 +178,13 @@ Ordering: the runner sends `settled` **after** the final output bytes are readab
   (`shellout: runner lost`), matching the seam's provider-failure shape. No adoption is attempted:
   a process-group id you did not spawn is not proof of ownership.
 - **Protocol/version mismatch** → the host refuses to start and reports an actionable message.
+- **Runner unavailable at startup** → after `connectRetryMs` (default 10 s) the plugin logs one
+  warning naming the socket and mounts the stock in-process executor, so the agent keeps a working
+  shell. `fallback: 'none'` restores fail-loud behaviour. The fallback is a startup decision and
+  is never silent.
+- **Connection lost at runtime** → `disconnectGraceMs` (default 10 s) to recover. A reconnect keeps
+  the executions the runner still holds (reconciled against its handshake list); otherwise they
+  settle as `killed` with the provider note and later commands run in-process until reconnected.
 - **Concurrency limit** → the runner admits at most `maxConcurrent` executions (default 64) and
   answers `busy` beyond that; the host surfaces it as a preparation failure.
 

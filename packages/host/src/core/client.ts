@@ -56,6 +56,9 @@ export class ShelloutClient {
   private readonly pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>()
   private readonly eventListeners = new Set<(event: SettledEvent) => void>()
   private readonly closeListeners = new Set<() => void>()
+  private readonly disconnectListeners = new Set<() => void>()
+  private readonly reconnectListeners = new Set<() => void>()
+  private latest: HelloResponse
   private heartbeat: NodeJS.Timeout | undefined
   private closed = false
   private current: Socket
@@ -68,6 +71,7 @@ export class ShelloutClient {
     private readonly handshake: HelloResponse,
   ) {
     this.current = socket
+    this.latest = handshake
     this.attach(socket)
     this.heartbeat = setInterval(() => { void this.ping() }, options.heartbeatMs ?? handshake.heartbeatMs)
     this.heartbeat.unref()
@@ -87,9 +91,9 @@ export class ShelloutClient {
     return new ShelloutClient(socket, options, handshake.descriptor, handshake)
   }
 
-  /** Executions the runner held for this boot at handshake time. */
+  /** Executions the runner held for this boot at the most recent handshake. */
   get executions(): HelloResponse['executions'] {
-    return this.handshake.executions
+    return this.latest.executions
   }
 
   /** Heartbeat and lease facts answered by the runner. */
@@ -142,6 +146,26 @@ export class ShelloutClient {
   onClose(listener: () => void): () => void {
     this.closeListeners.add(listener)
     return () => { this.closeListeners.delete(listener) }
+  }
+
+  /**
+   * Subscribe to a lost connection that may still recover.
+   * @param listener - called once per loss.
+   * @returns a disposer.
+   */
+  onDisconnect(listener: () => void): () => void {
+    this.disconnectListeners.add(listener)
+    return () => { this.disconnectListeners.delete(listener) }
+  }
+
+  /**
+   * Subscribe to a successful reconnect.
+   * @param listener - called once per recovered connection.
+   * @returns a disposer.
+   */
+  onReconnect(listener: () => void): () => void {
+    this.reconnectListeners.add(listener)
+    return () => { this.reconnectListeners.delete(listener) }
   }
 
   /** Stop the heartbeat and close the socket. */
@@ -200,11 +224,13 @@ export class ShelloutClient {
   private onSocketClosed(): void {
     if (this.closed) return
     const reconnect = this.options.reconnectDelayMs
-    if (reconnect === undefined) {
+    if (reconnect === undefined || reconnect <= 0) {
       this.failPending('runner connection closed')
       this.notifyClosed()
       return
     }
+    this.failPending('runner connection closed')
+    for (const listener of this.disconnectListeners) listener()
     setTimeout(() => { void this.reconnect() }, reconnect)
   }
 
@@ -213,8 +239,10 @@ export class ShelloutClient {
     try {
       const socket = await openSocket(this.options.socketPath, this.options.connectTimeoutMs ?? 5_000)
       const handshake = await handshakeOn(socket, this.options)
+      this.latest = handshake
       this.current = socket
       this.attach(socket)
+      for (const listener of this.reconnectListeners) listener()
     } catch {
       if (this.closed) return
       setTimeout(() => { void this.reconnect() }, this.options.reconnectDelayMs ?? 1_000)

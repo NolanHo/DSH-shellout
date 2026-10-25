@@ -29,7 +29,8 @@
     "node": ">=22"
   },
   "dependencies": {
-    "dsh-shellout-protocol": "workspace:*"
+    "dsh-shellout-protocol": "workspace:*",
+    "@deepseek-ai/dsh-bash-local": "^0.2.1-rc.2"
   },
   "devDependencies": {
     "dsh-shellout-runner": "workspace:*",

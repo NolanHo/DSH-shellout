@@ -35,6 +35,8 @@ const harness = arg('--harness', '/root/dsh-web/app')
 const credentials = arg('--credentials', '/root/.dsh/.credentials.yaml')
 const profileName = arg('--profile', 'shellout-web')
 const runnerProfile = arg('--runner-profile', 'shellout-runner')
+const reusePatch = args.includes('--reuse-patch')
+const socketOverride = arg('--socket', '')
 
 const root = mkdtempSync(join(tmpdir(), 'dsh-so-web-'))
 const home = join(root, 'home')
@@ -65,8 +67,17 @@ patch = patch
   .replace(/\/root\/\.dsh\/metadata-index\.sqlite/g, join(home, 'metadata-index.sqlite'))
   .replace(/\/root\/\.dsh\/session-query\.sqlite/g, join(home, 'session-query.sqlite'))
   .replace(/\/root\/\.dsh\/sessions\.sqlite/g, join(home, 'sessions.sqlite'))
-// 4. Replace the local executor with the runner client.
-patch += [
+// 4. Optionally reuse the copied patch as-is (dry run of an already-configured
+//    profile), else replace the local executor with the runner client.
+if (reusePatch) {
+  writeFileSync(patchPath, patch)
+  mkdirSync(join(home, 'profiles'), { recursive: true })
+  if (existsSync(credentials)) {
+    cpSync(credentials, join(home, '.credentials.yaml'))
+    chmodSync(join(home, '.credentials.yaml'), 0o600)
+  }
+}
+if (!reusePatch) patch += [
   '',
   '- id: bash-sandbox',
   '  disabled: true',
@@ -75,11 +86,11 @@ patch += [
   '    - id: shellout',
   "      name: 'dsh-shellout'",
   '      config:',
-  `        socketPath: ${join(root, 'control.sock')}`,
+  `        socketPath: ${socketOverride === '' ? join(root, 'control.sock') : socketOverride}`,
   '        mirrorPollMs: 50',
   '',
 ].join('\n')
-writeFileSync(patchPath, patch)
+if (!reusePatch) writeFileSync(patchPath, patch)
 
 // 5. Credentials: a private copy inside the isolated home.
 if (existsSync(credentials)) {
