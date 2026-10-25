@@ -165,6 +165,9 @@ Ordering: the runner sends `settled` **after** the final output bytes are readab
   (default 150 ms) and appends to a bounded buffer (default 1 MiB, configurable).
 - `observed` reads are served from the retained window. An offset below the retained head yields
   `lossy: true` with the spill path — which the seam already permits.
+- `spillPath` names the complete stream in the host's configured `spillDir`, which outlives the
+  runner's ephemeral state directory; a capture that is gone is reported as `lossy`, never as a
+  clean empty read.
 - `readOutput()` consumes from a cursor over the same bytes, appending a stderr section exactly as
   the local executor does.
 - Before `done` resolves, the poller performs one final drain so no tail is lost; `settled` is only
@@ -177,8 +180,8 @@ Ordering: the runner sends `settled` **after** the final output bytes are readab
 - **Normal host shutdown** → `drain` (SIGTERM to live groups, wait `disposeGraceMs`), then
   `shutdown`. Executions still running are terminated and their fates recorded.
 - **Host crash / connection loss** → lease expiry → the runner terminates every execution of that
-  boot, verifies each process group is empty, and records the outcome as
-  `lost: host boot expired`. A reconnect within the lease resumes the same boot; a reconnect after
+  boot, verifies each process group is empty, and records the outcome as `killed` with
+  `termination: "lease"`. A reconnect within the lease resumes the same boot; a reconnect after
   expiry starts a new lease and cannot address the old executions.
 - **Executor restart** → supervised commands keep running. A replacement executor re-adopts every
   shim whose recorded start time still matches, and the host reconciles from the handshake: an
@@ -236,10 +239,10 @@ Runner plugin config: `socketPath`, `leaseTtlMs`, `maxConcurrent`, `settleRetent
 | `signal` aborted before spawn | `execute` throws without creating a process |
 | `signal` aborted after publication | The runner kills the group; `result().aborted === true` |
 | Spawn failure (bad cwd, missing exe) | `execute` throws the preparation error |
-| Output exceeds the cap | Non-lossy reads up to the cap; beyond it `lossy: true` plus `spillPath` |
+| Output exceeds the cap | Non-lossy reads up to the cap; beyond it `lossy: true` (a truncated capture has no complete file, so no `spillPath`) |
 | Executor restarts mid-execution | The command keeps running; the host settles it with its real exit code |
 | Executor is replaced and no longer holds the execution | `done` resolves, `status: 'killed'`, stderr carries `shellout: runner lost` |
-| Host dies mid-execution | Runner terminates the group at lease expiry and records `lost: host boot expired` |
+| Host dies mid-execution | Runner terminates the group at lease expiry; history records `killed` with `termination: "lease"` |
 | Socket reconnect inside lease | Executions continue; host reconciles via `state` and resumes mirroring |
 | Duplicate `exec` (same operation) | One process; same `executionId` returned |
 | `kill` after settlement | Returns `{ requested: false }` |

@@ -39,6 +39,8 @@ matters about the execution in files:
   stdout.log    append-only, byte-capped capture
   stderr.log    append-only, byte-capped capture
   kill.request  durable termination request, consumed by the shim
+  spawn.claim   the party that arbitrates this spawn's outcome
+  spawn.verdict go / fail — the claim owner's one decision
 ```
 
 `status.json` is replaced with `write`+`rename`, so a reader never sees a torn
@@ -47,6 +49,14 @@ act, then the command's pid/pgid once spawned, and the terminal facts after the
 child exits; the executor writes the same record to history. It never rewrites
 an unchanged record, and it clears `meta.json`'s environment once the execution
 is terminal.
+
+The spawn outcome has exactly one arbiter. Before starting a shim the executor
+creates `spawn.claim` with `O_EXCL`; a shim that finds a claim it did not create
+publishes its identity and waits for `spawn.verdict`, and only `go` lets it start
+the command. When the admission wait expires the executor writes `fail`, records
+a `failed` history row, and keeps the execution addressable: a shim that starts
+even later refuses the command, so an `exec` answered with a failure can never
+run it.
 
 Terminal facts other than the exit status:
 
@@ -63,7 +73,11 @@ A settled execution's directory is deleted once its history row is durable and
 a retention window (`--state-retention-ms`, default 15 s) has passed, so
 readers that follow the settlement event can still fetch the tail. Keep that
 window longer than the host's `disconnectGraceMs`: a host that reconnects
-inside its grace still has to read the execution it missed.
+inside its grace still has to read the execution it missed. Before the deletion
+the complete capture is hard-linked into the host's `capture.spillDir` as
+`<spillDir>/<executionId>-<stream>.log`, so the `spillPath` a reader was given
+keeps working; a read whose capture is gone reports `lossy` instead of an
+empty stream.
 
 ## Executor lifetime
 
@@ -89,7 +103,11 @@ inside its grace still has to read the execution it missed.
 * History is a projection of the state directory. A `running` row with no
   directory behind it becomes `lost` at startup, and a row only ever moves
   from `running` to a terminal state: a terminal row is never rewritten or
-  regressed.
+  regressed. An execution id whose row is already terminal is refused, never
+  silently reused.
+* Admission does not block the runtime: the executor waits for the shim's
+  first report on a blocking thread and holds no admission lock while it
+  waits, so an unrelated request is answered while a spawn is in flight.
 * SIGTERM: the executor stops serving and exits without signalling shims or commands.
   On adoption, a host boot receives a fresh lease window to reconnect; deadlines
   remain owned by the shim while the executor is absent.
@@ -97,9 +115,11 @@ inside its grace still has to read the execution it missed.
 Settlement is replayable. A `settled` event is sent once; if it is emitted while
 no connection is subscribed, the execution would stay `running` on every host
 that missed it. The `hello` reply therefore carries each held execution's
-terminal facts (`state`, `exitCode`, `signal`, `termination`, `detail`), and a
-host settles from those facts on reconnect; the connection also re-announces
-the settlement through the event channel once it is subscribed.
+terminal facts (`state`, `exitCode`, `signal`, `termination`, `detail`), and the
+executor replays the retained settlements of that boot on the connection that
+just handshaked for it — never by broadcast, so an unrelated host's stream stays
+its own. A connection that falls behind the settlement channel is dropped so its
+host re-handshakes and recovers the facts; events are never silently skipped.
 
 ## Hub lifetime
 
@@ -108,6 +128,8 @@ the settlement through the event channel once it is subscribed.
   subscription, a total deadline, and a cap on concurrent calls.
 * `/` and `/health` never call the executor; `/api/*` degrade to history-only
   and report `executor: "unreachable"` instead of inventing zeroes.
+* Dashboard counters are derived from history, so an executor restart cannot
+  reset them and a refused spawn is counted like any other failure.
 
 ## Deployment prerequisites
 
@@ -124,6 +146,10 @@ terminates supervised commands with it:
   including process start, the state-directory scan and the handshake. A
   restart that is merely slower than the window is indistinguishable from a
   lost runner, and its executions settle as `killed`.
+* Deployment replaces the binary file and restarts the executor. A running
+  executor starts each shim through `/proc/self/exe`, the image it is already
+  executing, so unlinking or renaming the old path does not break later
+  executions; the restart is what moves the service to the new build.
 
 ## Wire budget
 
@@ -159,13 +185,17 @@ the executor writes private metadata before admission and spawn.
 
 Capture keeps a **prefix**, not the old in-memory tail. Each stream's file cap
 is `capture.spillMaxBytes` when nonzero, otherwise its `stdoutMaxBytes` or
-`stderrMaxBytes`. `spillDir` remains accepted as protocol input but never redirects
-durable capture outside the execution directory. Readers continue draining pipes
-after the cap; `bytes` counts observed bytes, and `truncated`/`lossy` record loss.
-`readStream` offsets are log byte offsets, with replies capped at 256 KiB and the
-connection's frame budget. A complete log may be returned as `spillPath`.
-On direct-child exit the shim terminates remaining group members before publishing
-terminal status, so a background descendant cannot keep the capture pipes open.
+`stderrMaxBytes`. When an execution is terminal and its capture is complete, the
+executor links the log into the host's `capture.spillDir` as
+`<spillDir>/<executionId>-<stream>.log`, and `spillPath` names that host-owned
+copy, which outlives the state directory. A truncated capture has no complete
+file and reports no `spillPath`. Readers continue draining pipes after the cap;
+`bytes` counts observed bytes, and `truncated`/`lossy` record loss. `readStream`
+offsets are log byte offsets, with replies capped at 256 KiB and the connection's
+frame budget; a read whose state directory has already been deleted falls back to
+the spill, and reports `lossy` when even that is gone. On direct-child exit the
+shim terminates remaining group members before publishing terminal status, so a
+background descendant cannot keep the capture pipes open.
 
 The hub allows eight concurrent observations, with one 500 ms total deadline
 including semaphore queueing, connection, and all frame I/O. A request uses
