@@ -18,6 +18,7 @@ afterEach(async () => {
 
 interface Wiring {
   readonly backend: FakeBackend
+  readonly client: ShelloutClient
   readonly executor: ShelloutExecutor
   /** Drop every proxied connection, as an executor crash would. */
   disconnect(): void
@@ -86,10 +87,30 @@ async function boot(): Promise<Wiring> {
     registry.dispose()
     await rm(dir, { recursive: true, force: true })
   })
-  return { backend, executor, disconnect, restartRunner }
+  return { backend, client, executor, disconnect, restartRunner }
 }
 
 const asShell = (executor: ShelloutExecutor): ShellExecutor => executor as unknown as ShellExecutor
+
+/** Poll until `probe` answers, as a reconnect and its handshake take a moment. */
+async function until(probe: () => boolean, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (!probe()) {
+    if (Date.now() >= deadline) throw new Error('condition not reached')
+    await new Promise(resolve => { setTimeout(resolve, 10) })
+  }
+}
+
+/** A spawn spec the fake backend accepts verbatim. */
+const SPEC = {
+  argv: ['bash', '-c', 'true'],
+  cwd: '/tmp',
+  env: { PATH: '/usr/bin:/bin' },
+  timeoutMs: 5_000,
+  onExpiry: 'kill' as const,
+  graceMs: 3_000,
+  capture: { stdoutMaxBytes: 4_096, stderrMaxBytes: 4_096, spillMaxBytes: 1_048_576, spillDir: '/tmp' },
+}
 
 describe('host recovery after an executor restart', () => {
   it('settles an execution that ended while the host was disconnected', async () => {
@@ -121,5 +142,22 @@ describe('host recovery after an executor restart', () => {
     expect(result.exitCode).toBeNull()
     expect(execution.status).toBe('killed')
     expect(result.stderr.text).toContain('shellout: runner lost')
+  })
+})
+
+describe('settlement replay on reconnect', () => {
+  it('delivers the settlement the runner replays at the handshake', async () => {
+    const { client, backend, disconnect } = await boot()
+    const settled: string[] = []
+    client.onSettled(event => { settled.push(event.executionId) })
+    await client.request('exec', {
+      operationId: 'op-replay', executionId: 'replay', spec: SPEC, specDigest: 'digest',
+    })
+    // The host connection drops, and the execution ends while no connection is
+    // subscribed: its settlement exists only in the runner's retained record.
+    disconnect()
+    backend.executions[0]?.complete(5)
+    await until(() => client.executions.some(row => row.executionId === 'replay' && row.state !== 'running'))
+    expect(settled).toContain('replay')
   })
 })

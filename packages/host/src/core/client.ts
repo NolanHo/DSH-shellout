@@ -87,8 +87,11 @@ export class ShelloutClient {
     const socket = await openSocket(options.socketPath, options.connectTimeoutMs ?? 5_000)
     const probe = { id: 0 }
     void probe
-    const handshake = await handshakeOn(socket, options)
-    return new ShelloutClient(socket, options, handshake.descriptor, handshake)
+    const { hello, trailing } = await handshakeOn(socket, options)
+    const client = new ShelloutClient(socket, options, hello.descriptor, hello)
+    for (const frame of trailing) client.dispatch(frame)
+    socket.resume()
+    return client
   }
 
   /** Executions the runner held for this boot at the most recent handshake. */
@@ -238,10 +241,15 @@ export class ShelloutClient {
     if (this.closed) return
     try {
       const socket = await openSocket(this.options.socketPath, this.options.connectTimeoutMs ?? 5_000)
-      const handshake = await handshakeOn(socket, this.options)
-      this.latest = handshake
+      const { hello, trailing } = await handshakeOn(socket, this.options)
+      this.latest = hello
       this.current = socket
       this.attach(socket)
+      // The runner replays this boot's retained settlements on this connection,
+      // behind the handshake reply; they are dispatched before the socket is
+      // read again, so a settlement announced while this host was away arrives.
+      for (const frame of trailing) this.dispatch(frame)
+      socket.resume()
       for (const listener of this.reconnectListeners) listener()
     } catch {
       if (this.closed) return
@@ -284,25 +292,37 @@ async function openSocket(path: string, timeoutMs: number): Promise<Socket> {
   return socket
 }
 
+/** A completed handshake: the reply, and whatever arrived behind it. */
+interface Handshake {
+  /** The runner's hello reply. */
+  readonly hello: HelloResponse
+  /** Frames decoded after the reply; dispatch them once the connection is attached. */
+  readonly trailing: Envelope[]
+}
+
 /**
  * Perform the handshake on a fresh socket.
+ *
+ * The runner writes this boot's retained settlement replays right behind the
+ * reply. The socket is left paused after the reply so those bytes stay buffered
+ * until the caller has attached its handler and dispatched `trailing`: handshake
+ * frames are never dropped in the gap between the two.
  * @param socket - connected socket.
  * @param options - boot identity and build label.
- * @returns the runner's hello reply.
+ * @returns the runner's hello reply and the frames behind it.
  * @throws ShelloutRpcError on a protocol mismatch or a malformed reply.
  */
-async function handshakeOn(socket: Socket, options: ClientOptions): Promise<HelloResponse> {
+async function handshakeOn(socket: Socket, options: ClientOptions): Promise<Handshake> {
   const decoder = new FrameDecoder()
-  const reply = await new Promise<Envelope>((resolve, reject) => {
+  const handshake = await new Promise<{ reply: Envelope; trailing: Envelope[] }>((resolve, reject) => {
     const onData = (chunk: Buffer): void => {
       try {
-        for (const frame of decoder.push(chunk)) {
-          if (frame.id === 1) {
-            socket.off('data', onData)
-            resolve(frame)
-            return
-          }
-        }
+        const frames = decoder.push(chunk)
+        const index = frames.findIndex(frame => frame.id === 1)
+        if (index < 0) return
+        socket.off('data', onData)
+        socket.pause()
+        resolve({ reply: frames[index] as Envelope, trailing: frames.slice(index + 1) })
       } catch (error: unknown) {
         reject(toRpcError(error))
       }
@@ -322,15 +342,15 @@ async function handshakeOn(socket: Socket, options: ClientOptions): Promise<Hell
     }))
   })
   socket.removeAllListeners('data')
-  if (reply.kind === 'err') {
-    const error = reply.payload as WireError
+  if (handshake.reply.kind === 'err') {
+    const error = handshake.reply.payload as WireError
     throw new ShelloutRpcError(error.code, error.message)
   }
-  const hello = reply.payload as HelloResponse
+  const hello = handshake.reply.payload as HelloResponse
   if (hello.protocol !== PROTOCOL_VERSION) {
     throw new ShelloutRpcError('version', `runner speaks protocol ${String(hello.protocol)}, this host speaks ${PROTOCOL_VERSION}`)
   }
-  return hello
+  return { hello, trailing: handshake.trailing }
 }
 
 /**
