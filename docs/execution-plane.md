@@ -93,7 +93,7 @@ Both modes resolve paths through the same resolver. Flags override environment:
 | `--listen` | `DSH_SHELLOUT_LISTEN` | `127.0.0.1:3001` (hub HTTP only) |
 
 Absent `DSH_HOME`, use `$HOME/.dsh`. The executor has no HTTP listener;
-`--dashboard` is removed. Start the hub with `--mode hub --listen <address>`.
+`--dashboard` and `DSH_SHELLOUT_DASHBOARD` are rejected. Start the hub with `--mode hub --listen <address>`.
 Shim inputs are only `--mode shim --state <directory> --id <executionId>`;
 the executor writes private metadata before admission and spawn.
 

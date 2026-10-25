@@ -27,6 +27,12 @@ fn arg_value(name: &str) -> Option<String> {
     None
 }
 
+fn arg_present(name: &str) -> bool {
+    std::env::args()
+        .skip(1)
+        .any(|arg| arg == name || arg.starts_with(&format!("{name}=")))
+}
+
 fn arg_number(name: &str, default: u64) -> u64 {
     arg_value(name)
         .and_then(|value| value.parse().ok())
@@ -76,6 +82,13 @@ impl Paths {
 }
 
 fn main() -> std::io::Result<()> {
+    // The executor serves no HTTP face; a deployment still asking for one must
+    // not start without a dashboard.
+    if arg_present("--dashboard") || std::env::var_os("DSH_SHELLOUT_DASHBOARD").is_some() {
+        return Err(std::io::Error::other(
+            "--dashboard is removed: the executor has no HTTP listener; start the hub with --mode hub --listen <address>",
+        ));
+    }
     let paths = Paths::resolve();
     let mode = arg_value("--mode").unwrap_or_else(|| "executor".into());
     if mode == "shim" {
