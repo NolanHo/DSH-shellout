@@ -105,16 +105,22 @@ async fn handle_connection(
                     events = Some(registry.subscribe());
                 }
                 let reply_value = dispatch(envelope, &registry, &config, &mut boot_id, &mut observer, &mut max_frame_bytes).await;
+                let mut replay = Vec::new();
                 if hello {
                     match (&reply_value["kind"], boot_id.as_deref()) {
                         // A settlement decided before this handshake reached no
                         // subscriber; the reply carries its facts, and the
-                        // recent ones are announced again.
-                        (Value::String(kind), Some(boot)) if kind == "res" => registry.replay(boot),
+                        // recent ones are announced on this connection only.
+                        (Value::String(kind), Some(boot)) if kind == "res" => {
+                            replay = registry.replay(boot);
+                        }
                         _ => events = None,
                     }
                 }
                 write_frame(&mut writer, &reply_value, max_frame_bytes).await?;
+                for frame in replay {
+                    write_frame(&mut writer, &frame, max_frame_bytes).await?;
+                }
             }
             event_value = async {
                 match events.as_mut() {
@@ -123,10 +129,16 @@ async fn handle_connection(
                 }
             } => {
                 // Only a connection that completed a handshake is a host.
-                if let Ok(value) = event_value {
-                    if boot_id.is_some() {
-                        write_frame(&mut writer, &value, max_frame_bytes).await?;
+                match event_value {
+                    Ok(value) => {
+                        if boot_id.is_some() {
+                            write_frame(&mut writer, &value, max_frame_bytes).await?;
+                        }
                     }
+                    // The connection fell behind the settlement stream. Dropping
+                    // it makes the host re-handshake, which reports the facts it
+                    // missed; silently skipping events would lose settlements.
+                    Err(_) => break,
                 }
             }
         }
@@ -471,6 +483,42 @@ mod tests {
         let reply = replies.next(8192).await.unwrap().unwrap();
         assert_eq!(reply.id, 2);
         assert_eq!(reply.method, "error");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_lagged_connection_is_dropped_so_the_host_rehandshakes() {
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        let registry = Registry::new(8, std::time::Duration::from_secs(10));
+        let task = tokio::spawn(handle_connection(server, Arc::clone(&registry), config()));
+        let (mut reader, mut writer) = client.split();
+        let mut replies = Frames::new(&mut reader);
+        write_frame(
+            &mut writer,
+            &json!({"id": 1, "kind": "req", "method": "hello",
+                "payload": {"protocol": "2.0", "clientBuild": "test", "bootId": "test"}}),
+            8192,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replies.next(8192).await.unwrap().unwrap().id, 1);
+        // Overflow the connection's settlement channel before it can consume any
+        // of it: the receiver gives up on order, so the stream is no longer a
+        // faithful settlement channel.
+        for index in 0..64 {
+            registry.publish(crate::protocol::event(
+                "settled",
+                json!({"executionId": format!("e{index}")}),
+            ));
+        }
+        let next = tokio::time::timeout(std::time::Duration::from_secs(2), replies.next(8192))
+            .await
+            .expect("the connection settles")
+            .unwrap();
+        assert!(
+            next.is_none(),
+            "a lagged connection must be closed so the host re-handshakes, not silently skipped: {next:?}"
+        );
         task.abort();
     }
 

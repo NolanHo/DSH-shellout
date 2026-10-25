@@ -260,15 +260,19 @@ impl Registry {
             .collect()
     }
 
-    /// Re-announce the settlements of one boot whose files are still retained.
+    /// The settlements of one boot whose files are still retained, for the
+    /// connection that just re-handshaked for it.
     ///
     /// A settlement emitted while no connection was subscribed would otherwise
-    /// be lost: the execution is announced once and never again. Only the
-    /// settlements a reconnecting host can still read are repeated, so the
-    /// replay stays proportional to recent work rather than to all history.
-    pub fn replay(&self, boot: &str) {
-        let settled: Vec<Value> = self
-            .executions
+    /// be lost: the execution is announced once and never again. The caller
+    /// writes these frames to its own connection only, so a replay stays
+    /// proportional to the reconnecting host's recent work and never reaches
+    /// another host's stream.
+    ///
+    /// @param boot - the boot that reconnected.
+    /// @returns the settlement event frames to replay on that connection.
+    pub fn replay(&self, boot: &str) -> Vec<Value> {
+        self.executions
             .lock()
             .expect("executions poisoned")
             .values()
@@ -278,10 +282,7 @@ impl Registry {
                     && execution.retained()
             })
             .map(|execution| settled_event(execution))
-            .collect();
-        for event in settled {
-            let _ = self.events.send(event);
-        }
+            .collect()
     }
 
     pub fn ping(&self, boot: &str) -> Result<(), Failure> {
@@ -791,10 +792,9 @@ mod tests {
         assert_eq!(rows[0]["exitCode"], 5);
         assert_eq!(rows[0]["executionId"], "settled-early");
 
-        // And a connecting host is told again through the event channel.
-        let mut events = registry.subscribe();
-        registry.replay("boot");
-        let event = events.try_recv().expect("replayed settlement");
+        // And the reconnecting connection receives the settlement frame itself.
+        let events = registry.replay("boot");
+        let event = events.first().expect("replayed settlement");
         assert_eq!(event["kind"], "evt");
         assert_eq!(event["method"], "settled");
         assert_eq!(event["payload"]["executionId"], "settled-early");
