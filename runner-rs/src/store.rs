@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
 const MAX_RECENT_ROWS: usize = 50;
@@ -18,6 +18,15 @@ pub struct Facts {
     pub exit_code: Option<i64>,
     pub signal: Option<i64>,
     pub finished_at: Option<i64>,
+}
+
+/// What one history write did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Save {
+    /// The row was inserted or advanced out of `running`.
+    Applied,
+    /// The row is already terminal and was left untouched.
+    AlreadyTerminal,
 }
 
 /// One persisted execution.
@@ -128,10 +137,10 @@ impl Store {
     /// The state machine is one-way: a row is born `running` and only the
     /// transition out of `running` is ever written. A terminal row is final, so
     /// a late or repeated save can never regress it.
-    pub fn save(&self, record: &Record) -> Result<(), String> {
+    pub fn save(&self, record: &Record) -> Result<Save, String> {
         let result = (|| {
             let connection = self.connection.lock().map_err(|error| error.to_string())?;
-            connection.execute(
+            let changed = connection.execute(
                 "INSERT INTO executions
                  (id, argv, cwd, started_at, finished_at, state, exit_code, signal,
                   stdout, stderr, lossy, stdout_lossy, stderr_lossy, stdout_truncated, stderr_truncated)
@@ -151,7 +160,31 @@ impl Store {
                     record.stderr_lossy, record.stdout_truncated, record.stderr_truncated,
                 ],
             ).map_err(|error| error.to_string())?;
-            Ok(())
+            if changed > 0 {
+                return Ok(Save::Applied);
+            }
+            // The conflict target exists and is terminal. Admission records are
+            // always `running`, so a zero-row write there would hide a refused
+            // id behind a silently unchanged row.
+            let existing: Option<String> = connection
+                .query_row(
+                    "SELECT state FROM executions WHERE id = ?1",
+                    params![record.id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            match existing {
+                Some(state) if record.state == "running" => Err(format!(
+                    "execution {} is already recorded as {state}; refusing to reuse the id",
+                    record.id
+                )),
+                Some(_) => Ok(Save::AlreadyTerminal),
+                None => Err(format!(
+                    "execution {} vanished during its history write",
+                    record.id
+                )),
+            }
         })();
         let mut health = self
             .write_health
@@ -520,6 +553,27 @@ mod tests {
         assert!(summaries.iter().all(|row| row["error"].is_string()));
         assert!(summaries.iter().all(|row| row.get("stdout").is_none()));
         assert_eq!(store.count().unwrap(), 56);
+    }
+
+    #[test]
+    fn a_terminal_row_cannot_be_reused_by_a_new_admission() {
+        let path = DatabasePath::new();
+        let store = Store::open(&path.0).unwrap();
+        store.save(&record("reused")).unwrap();
+        let mut running = record("reused");
+        running.state = "running".to_string();
+        running.finished_at = None;
+        running.exit_code = None;
+        let error = store
+            .save(&running)
+            .expect_err("a terminal row must refuse a new admission");
+        assert!(error.contains("already recorded"), "{error}");
+        assert_eq!(store.detail("reused").unwrap().unwrap()["state"], "exited");
+        // Re-saving the same terminal facts stays a no-op, not an error.
+        assert_eq!(
+            store.save(&record("reused")).unwrap(),
+            Save::AlreadyTerminal
+        );
     }
 
     #[test]
