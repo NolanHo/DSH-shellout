@@ -43,7 +43,19 @@ pub struct Store {
 }
 
 impl Store {
-    /// Open (or create) the database at `path`.
+    /// Open the database read-only. The service face must never write: only
+    /// the execution plane owns the rows, and a reader that reconciles them
+    /// would mark live executions lost the moment it starts.
+    pub fn open_read_only(path: &Path) -> rusqlite::Result<Self> {
+        let connection = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        Ok(Store { connection: Mutex::new(connection) })
+    }
+
+    /// Open (or create) the database at `path`, reconciling rows a previous
+    /// process left marked running.
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);

@@ -164,7 +164,7 @@ fn detail(hub: &Hub, live: Option<&Value>, id: &str) -> Option<Value> {
 
 /// Open the history database the execution plane writes.
 pub fn open_store(path: &Path) -> Option<Arc<Store>> {
-    match Store::open(path) {
+    match Store::open_read_only(path) {
         Ok(store) => Some(Arc::new(store)),
         Err(error) => {
             eprintln!("hub: cannot open {}: {error}", path.display());
