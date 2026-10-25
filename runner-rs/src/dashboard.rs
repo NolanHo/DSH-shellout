@@ -85,10 +85,9 @@ fn percent_decode(value: &str) -> String {
 
 /// The single-page dashboard.
 ///
-/// Layout is a master–detail split: the execution list scrolls in its own pane
-/// and the detail sits beside it, so selecting a row never moves the page and a
-/// long list costs nothing to browse. Narrow viewports stack the two panes with
-/// the detail opened as a sheet.
+/// Selecting a row expands its detail directly underneath that row: the row is
+/// already on screen, so nothing navigates and nothing scrolls to reveal it.
+/// Only one row is open at a time.
 fn page() -> &'static str {
     r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>dsh shellout runner</title>
@@ -104,8 +103,6 @@ header{flex:none;display:flex;flex-wrap:wrap;gap:14px;align-items:center;padding
 .pills{display:flex;gap:8px;margin-left:auto;flex-wrap:wrap}
 .pill{background:#171a21;border:1px solid #242833;border-radius:8px;padding:3px 10px;font-size:11px;color:var(--dim)}
 .pill b{color:var(--ink);font-size:12px;margin-left:5px}
-main{flex:1;min-height:0;display:grid;grid-template-columns:minmax(340px,46%) 1fr}
-#listPane{min-height:0;display:flex;flex-direction:column;border-right:1px solid var(--line)}
 .tools{flex:none;display:flex;gap:8px;align-items:center;padding:8px 12px;border-bottom:1px solid var(--line)}
 .tools input{flex:1;background:#0b0d11;border:1px solid #242833;border-radius:8px;color:var(--ink);padding:5px 9px;font:12px/1.4 ui-monospace,Menlo,monospace}
 .tools input:focus{outline:none;border-color:var(--accent)}
@@ -113,17 +110,17 @@ main{flex:1;min-height:0;display:grid;grid-template-columns:minmax(340px,46%) 1f
 .toggle.on{border-color:var(--accent);color:#cfe0ff}
 #listScroll{flex:1;min-height:0;overflow:auto}
 table{width:100%;border-collapse:collapse;font-size:12px}
-th,td{text-align:left;padding:6px 10px;border-bottom:1px solid #191d25}
-th{position:sticky;top:0;background:var(--panel);color:var(--dim);font-weight:500;z-index:1}
-tbody tr{cursor:pointer}
-tbody tr:hover{background:#171a21}
-tbody tr.sel{background:#1a2130;box-shadow:inset 3px 0 0 var(--accent)}
+th,td{text-align:left;padding:6px 12px;border-bottom:1px solid #191d25}
+th{position:sticky;top:0;background:var(--panel);color:var(--dim);font-weight:500;z-index:2}
+tr.row{cursor:pointer}
+tr.row:hover{background:#171a21}
+tr.row.sel{background:#1a2130;box-shadow:inset 3px 0 0 var(--accent)}
 td.cmd{color:#c9d4e6;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:1px;font-family:ui-monospace,Menlo,monospace;font-size:11.5px}
-#detailPane{min-height:0;overflow:auto;padding:16px 18px}
-.empty{color:#6d7078;padding:18px}
-.dhead{display:flex;flex-wrap:wrap;gap:10px;align-items:baseline;margin-bottom:10px}
-.did{font-size:12px;color:var(--dim);font-family:ui-monospace,Menlo,monospace}
-pre{margin:0 0 14px;padding:11px 13px;background:#0b0d11;border:1px solid #22262f;border-radius:8px;white-space:pre-wrap;word-break:break-word;font:12px/1.55 ui-monospace,Menlo,monospace;color:var(--code)}
+tr.detail>td{background:#0c0f14;padding:0;border-bottom:1px solid #22262f}
+.dwrap{padding:14px 16px 16px}
+.dhead{display:flex;flex-wrap:wrap;gap:10px;align-items:baseline;margin-bottom:10px;color:var(--dim);font-size:12px}
+.dhead b{color:var(--ink);font-weight:600}
+pre{margin:0 0 12px;padding:11px 13px;background:#0b0d11;border:1px solid #22262f;border-radius:8px;white-space:pre-wrap;word-break:break-word;font:12px/1.55 ui-monospace,Menlo,monospace;color:var(--code);max-height:46vh;overflow:auto}
 .tabs{display:flex;gap:8px;margin:0 0 8px}
 .tab{background:#171a21;border:1px solid #242833;color:#b8b8c0;border-radius:8px;padding:3px 12px;font-size:11px;cursor:pointer}
 .tab.on{border-color:var(--accent);color:#cfe0ff}
@@ -131,39 +128,22 @@ pre{margin:0 0 14px;padding:11px 13px;background:#0b0d11;border:1px solid #22262
 .badge.running{color:#7fd8a4;border-color:#2f6b4c}
 .badge.exited{color:#9ecbff;border-color:#2f4d7a}
 .badge.killed{color:#e5a15a;border-color:#6b4f2f}
-.flag{color:#e5a15a;font-size:11px}
-#back{display:none}
-@media (max-width:820px){
-  main{grid-template-columns:1fr}
-  #detailPane{display:none;position:fixed;inset:0;background:var(--bg);padding:14px}
-  body.detailOpen #detailPane{display:block}
-  body.detailOpen #listPane{display:none}
-  #back{display:inline-block;margin-bottom:10px}
-}
+.empty{color:#6d7078;padding:18px}
+.flag{color:#e5a15a}
 </style></head><body>
 <header>
   <span class="title">dsh shellout runner</span>
   <span class="meta" id="sub">connecting…</span>
   <div class="pills" id="pills"></div>
 </header>
-<main>
-  <section id="listPane">
-    <div class="tools">
-      <input id="filter" placeholder="filter by command…" autocomplete="off">
-      <button class="toggle on" id="follow" title="keep the newest executions at the top">follow</button>
-    </div>
-    <div id="listScroll">
-      <table><thead><tr><th>exec</th><th>command</th><th>state</th><th>exit</th><th>time</th></tr></thead>
-      <tbody id="rows"><tr><td colspan="5" class="empty">no executions yet</td></tr></tbody></table>
-    </div>
-  </section>
-  <section id="detailPane">
-    <button class="toggle" id="back">\u2190 executions</button>
-    <div id="detail">
-      <div class="empty">Select an execution to inspect its command and output.</div>
-    </div>
-  </section>
-</main>
+<div class="tools">
+  <input id="filter" placeholder="filter by command…" autocomplete="off">
+  <button class="toggle on" id="follow" title="pause the two-second refresh">follow</button>
+</div>
+<div id="listScroll">
+  <table><thead><tr><th>exec</th><th>command</th><th>state</th><th>exit</th><th>time</th></tr></thead>
+  <tbody id="rows"><tr><td colspan="5" class="empty">no executions yet</td></tr></tbody></table>
+</div>
 <script>
 const fmt = (ms) => ms == null ? '\u2014' : ms < 1000 ? ms + ' ms' : (ms / 1000).toFixed(1) + ' s'
 const esc = (text) => String(text).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]))
@@ -172,13 +152,12 @@ let tab = 'stdout'
 let filter = ''
 let follow = true
 let rowsCache = []
+let detailCache = null
 
 const commandLine = (execution) => {
   const argv = execution.argv || []
   const raw = (argv.length > 2 ? argv.slice(2).join(' ') : argv.join(' ')) || execution.command || ''
   const text = raw.replace(/\s+/g, ' ').trim()
-  // Every agent command starts by moving into its workspace; that prefix is
-  // identical across rows, so the list shows what comes after it instead.
   const stripped = text.replace(/^cd\s+[^&|;]+?(?:&&|;)\s*/, '')
   return stripped.length > 0 ? stripped : text
 }
@@ -193,104 +172,142 @@ async function loadStats() {
     .map(([k, v]) => `<span class="pill">${k}<b>${v}</b></span>`).join('')
 }
 
-async function loadList() {
-  const { executions } = await (await fetch('/api/executions', { cache: 'no-store' })).json()
-  rowsCache = executions
+function detailMarkup(d) {
+  if (!d) return '<div class="empty">This execution is no longer retained.</div>'
+  const text = tab === 'stdout' ? d.stdout : d.stderr
+  return `
+    <div class="dwrap">
+      <div class="dhead">
+        <span class="badge ${d.state}">${d.state}</span>
+        <span>exit <b>${d.exitCode == null ? '\u2014' : d.exitCode}</b></span>
+        ${d.signal == null ? '' : `<span>signal <b>${d.signal}</b></span>`}
+        <span>${fmt(d.durationMs != null ? d.durationMs : d.ageMs)}</span>
+        <span>CWD ${esc(d.cwd)}</span>
+        ${d.lossy ? '<span class="flag">output truncated (tail kept)</span>' : ''}
+        <span>${esc(d.id)}</span>
+      </div>
+      <pre>$ ${esc((d.argv || []).join(' '))}</pre>
+      <div class="tabs">
+        <button class="tab ${tab === 'stdout' ? 'on' : ''}" data-tab="stdout">stdout</button>
+        <button class="tab ${tab === 'stderr' ? 'on' : ''}" data-tab="stderr">stderr</button>
+      </div>
+      <pre data-output>${text && text.length > 0 ? esc(text) : '\u2014'}</pre>
+    </div>`
+}
+
+function render() {
   const needle = filter.trim().toLowerCase()
-  const visible = needle === '' ? executions : executions.filter(e => commandLine(e).toLowerCase().includes(needle))
+  const visible = needle === '' ? rowsCache : rowsCache.filter(e => commandLine(e).toLowerCase().includes(needle))
   const scroll = document.getElementById('listScroll')
   const keepTop = scroll.scrollTop
   const rows = document.getElementById('rows')
   if (visible.length === 0) {
-    rows.innerHTML = `<tr><td colspan="5" class="empty">${executions.length === 0 ? 'no executions yet' : 'nothing matches the filter'}</td></tr>`
+    rows.innerHTML = `<tr><td colspan="5" class="empty">${rowsCache.length === 0 ? 'no executions yet' : 'nothing matches the filter'}</td></tr>`
     return
   }
-  rows.innerHTML = visible.map((e) => `
-    <tr data-id="${esc(e.id)}" class="${e.id === selected ? 'sel' : ''}">
+  let html = ''
+  for (const e of visible) {
+    html += `<tr class="row ${e.id === selected ? 'sel' : ''}" data-id="${esc(e.id)}">
       <td><code>${esc(e.id.slice(0, 8))}</code></td>
       <td class="cmd" title="${esc(commandLine(e))}">${esc(commandLine(e))}</td>
       <td><span class="badge ${e.state}">${e.state}</span></td>
       <td>${e.exitCode == null ? '\u2014' : e.exitCode}</td>
       <td>${fmt(e.durationMs != null ? e.durationMs : e.ageMs)}</td>
-    </tr>`).join('')
-  for (const row of rows.querySelectorAll('tr[data-id]')) {
-    row.addEventListener('click', () => select(row.dataset.id))
+    </tr>`
+    if (e.id === selected) {
+      html += `<tr class="detail" data-detail><td colspan="5">${detailMarkup(detailCache)}</td></tr>`
+    }
+  }
+  rows.innerHTML = html
+  for (const row of rows.querySelectorAll('tr.row')) {
+    row.addEventListener('click', () => toggle(row.dataset.id))
+  }
+  for (const button of rows.querySelectorAll('.tab')) {
+    button.addEventListener('click', (event) => {
+      event.stopPropagation()
+      tab = button.dataset.tab
+      render()
+    })
   }
   scroll.scrollTop = keepTop
-  if (selected === null && visible[0]) select(visible[0].id)
+}
+
+async function loadList() {
+  const { executions } = await (await fetch('/api/executions', { cache: 'no-store' })).json()
+  rowsCache = executions
+  if (selected === null && executions[0]) {
+    selected = executions[0].id
+    await loadDetail()
+  } else if (selected !== null && !executions.some(e => e.id === selected)) {
+    detailCache = null
+  }
+  render()
 }
 
 async function loadDetail() {
-  const pane = document.getElementById('detail')
-  const paneScroll = document.getElementById('detailPane').scrollTop
+  if (selected === null) { detailCache = null; return }
   const response = await fetch('/api/execution?id=' + encodeURIComponent(selected), { cache: 'no-store' })
-  if (!response.ok) {
-    pane.innerHTML = '<div class="empty">This execution is no longer retained.</div>'
-    return
-  }
-  const d = await response.json()
-  const text = tab === 'stdout' ? d.stdout : d.stderr
-  const flag = d.lossy ? '<span class="flag">\u00b7 output truncated (tail kept)</span>' : ''
-  pane.innerHTML = `
-    <div class="dhead">
-      <span class="badge ${d.state}">${d.state}</span>
-      <span>exit ${d.exitCode == null ? '\u2014' : d.exitCode}${d.signal == null ? '' : ' \u00b7 signal ' + d.signal}</span>
-      <span>${fmt(d.durationMs != null ? d.durationMs : d.ageMs)}</span>
-      <span>CWD ${esc(d.cwd)}</span>
-      ${flag}
-      <span class="did">${esc(d.id)}</span>
-    </div>
-    <pre>$ ${esc((d.argv || []).join(' '))}</pre>
-    <div class="tabs">
-      <button class="tab ${tab === 'stdout' ? 'on' : ''}" data-tab="stdout">stdout</button>
-      <button class="tab ${tab === 'stderr' ? 'on' : ''}" data-tab="stderr">stderr</button>
-    </div>
-    <pre>${text && text.length > 0 ? esc(text) : '\u2014'}</pre>`
-  document.getElementById('detailPane').scrollTop = paneScroll
-  for (const button of pane.querySelectorAll('.tab')) {
-    button.addEventListener('click', () => { tab = button.dataset.tab; loadDetail() })
-  }
+  detailCache = response.ok ? await response.json() : null
 }
 
-function select(id) {
+function toggle(id) {
+  if (selected === id) { selected = null; detailCache = null; render(); return }
   selected = id
-  document.body.classList.add('detailOpen')
-  for (const row of document.querySelectorAll('#rows tr[data-id]')) {
-    row.classList.toggle('sel', row.dataset.id === id)
-  }
-  loadDetail()
+  detailCache = null
+  render()
+  loadDetail().then(() => {
+    // Replace only the open row's content so the list does not flicker.
+    const cell = document.querySelector('tr.detail td')
+    if (cell && selected === id) {
+      cell.innerHTML = detailMarkup(detailCache)
+      for (const button of cell.querySelectorAll('.tab')) {
+        button.addEventListener('click', (event) => { event.stopPropagation(); tab = button.dataset.tab; render() })
+      }
+    }
+  })
 }
 
-document.getElementById('back').addEventListener('click', () => document.body.classList.remove('detailOpen'))
 document.getElementById('follow').addEventListener('click', (event) => {
   follow = !follow
   event.target.classList.toggle('on', follow)
 })
 document.getElementById('filter').addEventListener('input', (event) => {
   filter = event.target.value
-  loadList()
+  render()
 })
 document.addEventListener('keydown', (event) => {
   if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return
-  const rows = [...document.querySelectorAll('#rows tr[data-id]')]
+  const rows = [...document.querySelectorAll('tr.row')]
   if (rows.length === 0) return
   const index = rows.findIndex(row => row.dataset.id === selected)
   const next = event.key === 'ArrowDown' ? Math.min(rows.length - 1, index + 1) : Math.max(0, index - 1)
   const target = rows[index === -1 ? 0 : next]
   if (!target) return
   event.preventDefault()
-  select(target.dataset.id)
+  toggle(target.dataset.id)
   target.scrollIntoView({ block: 'nearest' })
 })
 
 async function tick() {
   try {
     await loadStats()
-    if (follow || rowsCache.length === 0) await loadList()
-    // A live execution keeps producing output; keep its pane current without
-    // moving the reader's position.
-    if (follow && selected !== null && rowsCache.some(e => e.id === selected && e.state === 'running')) {
+    if (!follow && rowsCache.length > 0) return
+    const selectedRow = rowsCache.find(e => e.id === selected)
+    await loadList()
+    // A live execution keeps producing output; refresh just its pane.
+    if (selected !== null && (selectedRow === undefined || selectedRow.state === 'running')) {
       await loadDetail()
+      const cell = document.querySelector('tr.detail td')
+      if (cell && detailCache !== null) {
+        const output = cell.querySelector('[data-output]')
+        const keep = output ? output.scrollTop : 0
+        cell.innerHTML = detailMarkup(detailCache)
+        for (const button of cell.querySelectorAll('.tab')) {
+          button.addEventListener('click', (event) => { event.stopPropagation(); tab = button.dataset.tab; render() })
+        }
+        const next = cell.querySelector('[data-output]')
+        if (next) next.scrollTop = keep
+      }
     }
   } catch (error) {
     document.getElementById('sub').textContent = 'runner unreachable: ' + error
