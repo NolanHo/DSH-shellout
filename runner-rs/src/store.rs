@@ -59,6 +59,10 @@ pub struct Store {
     connection: Mutex<Connection>,
     write_health: Mutex<WriteHealth>,
     per_stream_flags: bool,
+    /// Whether this database carries the counter row `counts` reads. A history
+    /// written before the row existed, opened read-only, has none and falls
+    /// back to counting its rows.
+    counters: bool,
 }
 
 /// Execution counts by outcome, so a dashboard agrees with history across
@@ -83,6 +87,7 @@ impl Store {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
         )?;
         let per_stream_flags = stream_columns(&connection)?.len() == 4;
+        let counters = has_counters(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
             write_health: Mutex::new(WriteHealth {
@@ -90,6 +95,7 @@ impl Store {
                 error: None,
             }),
             per_stream_flags,
+            counters,
         })
     }
 
@@ -135,6 +141,29 @@ impl Store {
                 ))?;
             }
         }
+        // Counts are a maintained projection, not a query over the table: the
+        // dashboard polls them on every observation and history is never pruned,
+        // so counting rows would grow with every command ever run. The row is
+        // initialized once from the rows already stored and advanced by every
+        // write in the same transaction, which keeps it exactly as fresh as the
+        // history it summarizes.
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS counters (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                rows INTEGER NOT NULL,
+                exited INTEGER NOT NULL,
+                killed INTEGER NOT NULL,
+                failed INTEGER NOT NULL
+             );",
+        )?;
+        let tracked: Option<i64> = transaction
+            .query_row("SELECT rows FROM counters WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        if tracked.is_none() {
+            transaction.execute(COUNTS_FROM_HISTORY, [])?;
+        }
         transaction.commit()?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -143,6 +172,7 @@ impl Store {
                 error: None,
             }),
             per_stream_flags: true,
+            counters: true,
         })
     }
 
@@ -154,7 +184,20 @@ impl Store {
     pub fn save(&self, record: &Record) -> Result<Save, String> {
         let result = (|| {
             let connection = self.connection.lock().map_err(|error| error.to_string())?;
-            let changed = connection.execute(
+            let transaction = connection
+                .unchecked_transaction()
+                .map_err(|error| error.to_string())?;
+            // The state the counter row was told about: a new row is a new row,
+            // an update can only leave `running`, and a terminal row is final.
+            let prior: Option<String> = transaction
+                .query_row(
+                    "SELECT state FROM executions WHERE id = ?1",
+                    params![record.id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let changed = transaction.execute(
                 "INSERT INTO executions
                  (id, argv, cwd, started_at, finished_at, state, exit_code, signal,
                   stdout, stderr, lossy, stdout_lossy, stderr_lossy, stdout_truncated, stderr_truncated)
@@ -174,31 +217,38 @@ impl Store {
                     record.stderr_lossy, record.stdout_truncated, record.stderr_truncated,
                 ],
             ).map_err(|error| error.to_string())?;
-            if changed > 0 {
-                return Ok(Save::Applied);
+            if changed == 0 {
+                // The conflict target exists and is terminal. Admission records
+                // are always `running`, so a zero-row write there would hide a
+                // refused id behind a silently unchanged row.
+                return match prior {
+                    Some(state) if record.state == "running" => Err(format!(
+                        "execution {} is already recorded as {state}; refusing to reuse the id",
+                        record.id
+                    )),
+                    Some(_) => Ok(Save::AlreadyTerminal),
+                    None => Err(format!(
+                        "execution {} vanished during its history write",
+                        record.id
+                    )),
+                };
             }
-            // The conflict target exists and is terminal. Admission records are
-            // always `running`, so a zero-row write there would hide a refused
-            // id behind a silently unchanged row.
-            let existing: Option<String> = connection
-                .query_row(
-                    "SELECT state FROM executions WHERE id = ?1",
-                    params![record.id],
-                    |row| row.get(0),
+            // The counters advance with the row they count, in one transaction:
+            // an observation never reads a tally that history has moved past.
+            let (exited, killed, failed) = outcome_delta(&record.state);
+            let tracked = transaction
+                .execute(
+                    "UPDATE counters SET rows = rows + ?1, exited = exited + ?2,
+                       killed = killed + ?3, failed = failed + ?4
+                     WHERE id = 1",
+                    params![i64::from(prior.is_none()), exited, killed, failed],
                 )
-                .optional()
                 .map_err(|error| error.to_string())?;
-            match existing {
-                Some(state) if record.state == "running" => Err(format!(
-                    "execution {} is already recorded as {state}; refusing to reuse the id",
-                    record.id
-                )),
-                Some(_) => Ok(Save::AlreadyTerminal),
-                None => Err(format!(
-                    "execution {} vanished during its history write",
-                    record.id
-                )),
+            if tracked == 0 {
+                return Err("history counter row is missing".to_string());
             }
+            transaction.commit().map_err(|error| error.to_string())?;
+            Ok(Save::Applied)
         })();
         let mut health = self
             .write_health
@@ -248,14 +298,25 @@ impl Store {
     /// Advance a `running` row to `lost`. A terminal row is never touched.
     pub fn mark_lost(&self, id: &str, at_ms: u64) -> Result<(), String> {
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
-        connection
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        let changed = transaction
             .execute(
                 "UPDATE executions SET state = 'lost', finished_at = ?2
                  WHERE id = ?1 AND state = 'running'",
                 params![id, at_ms as i64],
             )
             .map_err(|error| error.to_string())?;
-        Ok(())
+        if changed > 0 {
+            let tracked = transaction
+                .execute("UPDATE counters SET failed = failed + 1 WHERE id = 1", [])
+                .map_err(|error| error.to_string())?;
+            if tracked == 0 {
+                return Err("history counter row is missing".to_string());
+            }
+        }
+        transaction.commit().map_err(|error| error.to_string())
     }
 
     /// Writer availability and the last write failure (cleared by a successful save).
@@ -271,26 +332,33 @@ impl Store {
     }
 
     /// Counts by outcome, derived from history rather than memory.
+    ///
+    /// The answer is the counter row every write maintains, so its cost does not
+    /// depend on how much history has accumulated. A history that predates the
+    /// row and is opened read-only answers by counting its rows.
     pub fn counts(&self) -> Result<Counts, String> {
         let connection = self.connection.lock().map_err(|error| error.to_string())?;
-        connection
-            .query_row(
-                "SELECT COUNT(*),
-                    COALESCE(SUM(state = 'exited'), 0),
-                    COALESCE(SUM(state = 'killed'), 0),
-                    COALESCE(SUM(state IN ('failed', 'lost')), 0)
-                 FROM executions",
-                [],
-                |row| {
-                    Ok(Counts {
-                        rows: row.get::<_, i64>(0)? as u64,
-                        exited: row.get::<_, i64>(1)? as u64,
-                        killed: row.get::<_, i64>(2)? as u64,
-                        failed: row.get::<_, i64>(3)? as u64,
-                    })
-                },
-            )
-            .map_err(|error| error.to_string())
+        if self.counters {
+            let tracked: Option<Counts> = connection
+                .query_row(
+                    "SELECT rows, exited, killed, failed FROM counters WHERE id = 1",
+                    [],
+                    |row| {
+                        Ok(Counts {
+                            rows: row.get::<_, i64>(0)? as u64,
+                            exited: row.get::<_, i64>(1)? as u64,
+                            killed: row.get::<_, i64>(2)? as u64,
+                            failed: row.get::<_, i64>(3)? as u64,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            if let Some(counts) = tracked {
+                return Ok(counts);
+            }
+        }
+        count_rows(&connection)
     }
 
     pub fn count(&self) -> Result<i64, String> {
@@ -410,6 +478,54 @@ impl Store {
     }
 }
 
+/// The one-row tally the counter row is initialized from.
+const COUNTS_FROM_HISTORY: &str = "INSERT INTO counters (id, rows, exited, killed, failed)
+    SELECT 1, COUNT(*),
+        COALESCE(SUM(state = 'exited'), 0),
+        COALESCE(SUM(state = 'killed'), 0),
+        COALESCE(SUM(state IN ('failed', 'lost')), 0)
+    FROM executions";
+
+/// What one terminal state adds to the counter row.
+fn outcome_delta(state: &str) -> (i64, i64, i64) {
+    match state {
+        "exited" => (1, 0, 0),
+        "killed" => (0, 1, 0),
+        "failed" | "lost" => (0, 0, 1),
+        _ => (0, 0, 0),
+    }
+}
+
+/// Count the rows themselves; the answer for a history without a counter row.
+fn count_rows(connection: &Connection) -> Result<Counts, String> {
+    connection
+        .query_row(
+            "SELECT COUNT(*),
+                COALESCE(SUM(state = 'exited'), 0),
+                COALESCE(SUM(state = 'killed'), 0),
+                COALESCE(SUM(state IN ('failed', 'lost')), 0)
+             FROM executions",
+            [],
+            |row| {
+                Ok(Counts {
+                    rows: row.get::<_, i64>(0)? as u64,
+                    exited: row.get::<_, i64>(1)? as u64,
+                    killed: row.get::<_, i64>(2)? as u64,
+                    failed: row.get::<_, i64>(3)? as u64,
+                })
+            },
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn has_counters(connection: &Connection) -> rusqlite::Result<bool> {
+    let mut statement = connection
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'counters'")?;
+    let mut rows = statement.query([])?;
+    let present = rows.next()?.is_some();
+    Ok(present)
+}
+
 fn stream_columns(connection: &Connection) -> rusqlite::Result<Vec<String>> {
     let mut statement = connection.prepare("PRAGMA table_info(executions)")?;
     let names = statement.query_map([], |row| row.get::<_, String>(1))?;
@@ -507,6 +623,112 @@ mod tests {
             stdout_truncated: false,
             stderr_truncated: false,
         }
+    }
+
+    fn counts(rows: u64, exited: u64, killed: u64, failed: u64) -> Counts {
+        Counts {
+            rows,
+            exited,
+            killed,
+            failed,
+        }
+    }
+
+    fn running(id: &str) -> Record {
+        let mut record = record(id);
+        record.state = "running".to_string();
+        record.finished_at = None;
+        record.exit_code = None;
+        record
+    }
+
+    #[test]
+    fn counts_advance_with_every_write() {
+        let path = DatabasePath::new();
+        let store = Store::open(&path.0).unwrap();
+        assert_eq!(store.counts().unwrap(), counts(0, 0, 0, 0));
+
+        store.save(&running("live")).unwrap();
+        assert_eq!(
+            store.counts().unwrap(),
+            counts(1, 0, 0, 0),
+            "a live execution counts as a row"
+        );
+        store.save(&record("live")).unwrap();
+        assert_eq!(
+            store.counts().unwrap(),
+            counts(1, 1, 0, 0),
+            "leaving running advances the outcome, not the row count"
+        );
+
+        // A row born terminal (a spawn failure recorded before any pid) counts
+        // on insert; a killed row lands in its own bucket.
+        store.save(&record("born-terminal")).unwrap();
+        let mut killed = record("stopped");
+        killed.state = "killed".to_string();
+        killed.signal = Some(9);
+        killed.exit_code = None;
+        store.save(&killed).unwrap();
+        assert_eq!(store.counts().unwrap(), counts(3, 2, 1, 0));
+
+        store.save(&running("lost-later")).unwrap();
+        store.mark_lost("lost-later", 2_000).unwrap();
+        assert_eq!(
+            store.counts().unwrap(),
+            counts(4, 2, 1, 1),
+            "a lost execution counts as failed"
+        );
+
+        // A repeated terminal write and a refused reuse change nothing.
+        assert_eq!(store.save(&record("live")).unwrap(), Save::AlreadyTerminal);
+        assert!(store.save(&running("live")).is_err());
+        assert!(store.mark_lost("live", 3_000).is_ok());
+        assert_eq!(store.counts().unwrap(), counts(4, 2, 1, 1));
+    }
+
+    #[test]
+    fn counters_are_rebuilt_when_a_history_has_none() {
+        let path = DatabasePath::new();
+        let store = Store::open(&path.0).unwrap();
+        store.save(&record("older")).unwrap();
+        store.save(&running("older-live")).unwrap();
+        drop(store);
+        // What an executor without counter maintenance left behind.
+        let connection = Connection::open(&path.0).unwrap();
+        connection.execute_batch("DROP TABLE counters").unwrap();
+        drop(connection);
+
+        let store = Store::open(&path.0).unwrap();
+        assert_eq!(
+            store.counts().unwrap(),
+            counts(2, 1, 0, 0),
+            "the counter row is derived from the rows already stored"
+        );
+        store.save(&record("newer")).unwrap();
+        assert_eq!(store.counts().unwrap(), counts(3, 2, 0, 0));
+    }
+
+    #[test]
+    fn a_read_only_history_without_counters_counts_its_rows() {
+        let path = DatabasePath::new();
+        let legacy = Connection::open(&path.0).unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE executions (
+                    id TEXT PRIMARY KEY, argv TEXT NOT NULL, cwd TEXT NOT NULL,
+                    started_at INTEGER NOT NULL, finished_at INTEGER, state TEXT NOT NULL,
+                    exit_code INTEGER, signal INTEGER, stdout TEXT NOT NULL,
+                    stderr TEXT NOT NULL, lossy INTEGER NOT NULL
+                 );
+                 INSERT INTO executions VALUES
+                    ('one', '[\"echo\"]', '/', 1, 2, 'exited', 0, NULL, '', '', 0),
+                    ('two', '[\"echo\"]', '/', 3, NULL, 'running', NULL, NULL, '', '', 0),
+                    ('three', '[\"echo\"]', '/', 4, 5, 'lost', NULL, NULL, '', '', 0);",
+            )
+            .unwrap();
+        drop(legacy);
+        let store = Store::open_read_only(&path.0).unwrap();
+        assert_eq!(store.counts().unwrap(), counts(3, 1, 0, 1));
     }
 
     #[test]

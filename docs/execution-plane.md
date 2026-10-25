@@ -146,7 +146,9 @@ host re-handshakes and recovers the facts; events are never silently skipped.
 * `/` and `/health` never call the executor; `/api/*` degrade to history-only
   and report `executor: "unreachable"` instead of inventing zeroes.
 * Dashboard counters are derived from history, so an executor restart cannot
-  reset them and a refused spawn is counted like any other failure.
+  reset them and a refused spawn is counted like any other failure. The history
+  keeps them as one maintained row, advanced in the same transaction as the row
+  it counts, so an observation costs the same on a long history as on a new one.
 
 ## Deployment prerequisites
 
