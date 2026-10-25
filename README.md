@@ -42,6 +42,11 @@ The runner is the preferred execution path, not a hard dependency of the agent's
   `killed` with a `shellout: runner lost` note, and the next commands run in this process until a
   reconnect succeeds.
 
+## Rust runner
+
+The execution plane also ships as a standalone Rust binary that speaks the same protocol: see
+[docs/rust-runner.md](docs/rust-runner.md). Linux only — Windows keeps the Node runner.
+
 ## Status
 
 Implementation complete for the shell path; the contract lives in [docs/spec.md](docs/spec.md).
