@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
 use crate::exec::{spawn_execution, Counters, Execution};
+use crate::store::Store;
 use crate::protocol::ExecRequest;
 
 /// Admission or lookup failure carrying a wire error code.
@@ -34,11 +35,21 @@ pub struct Registry {
     lease_ttl: Duration,
     counters: Arc<Counters>,
     started: Instant,
+    store: Option<Arc<Store>>,
 }
 
 impl Registry {
     /// Create a registry; the returned receiver observes settlement events.
     pub fn new(max_concurrent: usize, lease_ttl: Duration) -> (Arc<Registry>, broadcast::Receiver<Value>) {
+        Self::with_store(max_concurrent, lease_ttl, None)
+    }
+
+    /// Create a registry that persists every execution to `store`.
+    pub fn with_store(
+        max_concurrent: usize,
+        lease_ttl: Duration,
+        store: Option<Arc<Store>>,
+    ) -> (Arc<Registry>, broadcast::Receiver<Value>) {
         let (events, receiver) = broadcast::channel(1024);
         let registry = Arc::new(Registry {
             executions: Mutex::new(HashMap::new()),
@@ -49,6 +60,7 @@ impl Registry {
             lease_ttl,
             counters: Arc::new(Counters::default()),
             started: Instant::now(),
+            store,
         });
         (registry, receiver)
     }
@@ -97,19 +109,40 @@ impl Registry {
             .lock()
             .map(|guard| guard.values().map(|execution| execution.detail()).collect())
             .unwrap_or_default();
-        // Smallest age first: the newest execution tops the list.
-        rows.sort_by_key(|row| row["ageMs"].as_u64().unwrap_or(u64::MAX));
+        // Fold in persisted history so a restart does not empty the list.
+        if let Some(store) = self.store.as_ref() {
+            let live: std::collections::HashSet<String> =
+                rows.iter().map(|row| row["id"].as_str().unwrap_or_default().to_string()).collect();
+            for (id, _, document) in store.recent(limit) {
+                if live.contains(&id) {
+                    continue;
+                }
+                if let Ok(value) = serde_json::from_str::<Value>(&document) {
+                    rows.push(value);
+                }
+            }
+        }
+        rows.sort_by_key(|row| std::cmp::Reverse(row["startedAtMs"].as_u64().unwrap_or(0)));
         rows.truncate(limit);
         rows
     }
 
     /// One execution with its captured output.
     pub fn detail(&self, execution_id: &str) -> Option<Value> {
-        self.executions
+        if let Some(detail) = self
+            .executions
             .lock()
-            .ok()?
-            .get(execution_id)
-            .map(|execution| execution.detail())
+            .ok()
+            .and_then(|guard| guard.get(execution_id).map(|execution| execution.detail()))
+        {
+            return Some(detail);
+        }
+        let store = self.store.as_ref()?;
+        store
+            .recent(500)
+            .into_iter()
+            .find(|(id, _, _)| id == execution_id)
+            .and_then(|(_, _, document)| serde_json::from_str(&document).ok())
     }
 
     /// Subscribe to settlement events.
@@ -176,6 +209,7 @@ impl Registry {
             boot_id.to_string(),
             self.events.clone(),
             Arc::clone(&self.counters),
+            self.store.clone(),
         )
         .map_err(|error| Failure::new("rejected", format!("spawn failed: {error}")))?;
         if let Ok(mut executions) = self.executions.lock() {

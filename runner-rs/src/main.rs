@@ -10,6 +10,7 @@ mod legacy;
 mod protocol;
 mod registry;
 mod server;
+mod store;
 
 use std::time::Duration;
 
@@ -63,9 +64,24 @@ async fn main() -> std::io::Result<()> {
 
     eprintln!("dsh-shellout-runner {} listening on {}", env!("CARGO_PKG_VERSION"), socket_path);
 
-    let (registry, _events) = registry::Registry::new(
+    let history_path = arg_value("--history").map(std::path::PathBuf::from).unwrap_or_else(|| {
+        let home = std::env::var("DSH_HOME").unwrap_or_else(|_| "/root/.dsh".to_string());
+        std::path::PathBuf::from(home).join("shellout").join("history.sqlite")
+    });
+    let store = match store::Store::open(&history_path) {
+        Ok(store) => {
+            eprintln!("history: {}", history_path.display());
+            Some(std::sync::Arc::new(store))
+        }
+        Err(error) => {
+            eprintln!("history: cannot open {}: {error}", history_path.display());
+            None
+        }
+    };
+    let (registry, _events) = registry::Registry::with_store(
         config.max_concurrent,
         Duration::from_millis(config.lease_ttl_ms),
+        store,
     );
     if !dashboard_address.is_empty() {
         let registry = std::sync::Arc::clone(&registry);

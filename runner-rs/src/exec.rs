@@ -13,6 +13,7 @@ use serde_json::json;
 use tokio::sync::broadcast;
 
 use crate::capture::CaptureState;
+use crate::store::{Record, Store};
 use crate::protocol::SpawnSpec;
 
 /// Terminal facts of one execution.
@@ -178,6 +179,7 @@ pub fn spawn_execution(
     boot_id: String,
     events: broadcast::Sender<serde_json::Value>,
     counters: Arc<Counters>,
+    store: Option<Arc<Store>>,
 ) -> std::io::Result<Arc<Execution>> {
     let mut command = Command::new(&spec.argv[0]);
     command
@@ -230,6 +232,26 @@ pub fn spawn_execution(
     let stderr_reader = pump(child.stderr.take(), Arc::clone(&stderr));
 
     counters.spawned.fetch_add(1, Ordering::Relaxed);
+    let save = move |execution: &Execution, state: &str| {
+        let Some(store) = store.as_ref() else { return };
+        let state_facts = execution.state();
+        let read = |capture: &Arc<Mutex<CaptureState>>| {
+            capture.lock().map(|guard| guard.read_from(0, usize::MAX)).map(|read| read.text).unwrap_or_default()
+        };
+        store.save(&Record {
+            id: execution.id.clone(),
+            argv: serde_json::to_string(&execution.argv).unwrap_or_else(|_| "[]".to_string()),
+            cwd: execution.cwd.clone(),
+            started_at: epoch_millis(execution.started_wall),
+            finished_at: execution.settled_wall.lock().ok().and_then(|guard| *guard).map(epoch_millis),
+            state: state.to_string(),
+            exit_code: state_facts.exit_code.map(i64::from),
+            signal: state_facts.signal.map(i64::from),
+            stdout: read(&execution.stdout),
+            stderr: read(&execution.stderr),
+            lossy: false,
+        });
+    };
     let execution = Arc::new(Execution {
         id: execution_id.clone(),
         program: spec.argv.first().cloned().unwrap_or_default(),
@@ -250,6 +272,7 @@ pub fn spawn_execution(
         grace_ms: spec.grace_ms,
     });
 
+    save(&execution, "running");
     if spec.on_expiry == "kill" {
         let watchdog = Arc::clone(&execution);
         let timeout_ms = spec.timeout_ms;
@@ -260,6 +283,7 @@ pub fn spawn_execution(
     }
 
     let supervisor = Arc::clone(&execution);
+    let save_handle = save;
     thread::spawn(move || {
         let outcome = wait_child(child);
         let _ = stdout_reader.join();
@@ -299,6 +323,7 @@ pub fn spawn_execution(
         } else {
             counters.failed.fetch_add(1, Ordering::Relaxed);
         }
+        save_handle(&supervisor, status);
         let _ = events.send(crate::protocol::event(
             "settled",
             json!({

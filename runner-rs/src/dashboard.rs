@@ -118,6 +118,7 @@ th{position:sticky;top:0;background:var(--panel);color:var(--dim);font-weight:50
 tr.row{cursor:pointer}
 tr.row:hover{background:#171a21}
 tr.row.sel{background:#1a2130;box-shadow:inset 3px 0 0 var(--accent)}
+td.when{color:var(--dim);white-space:nowrap;font-family:ui-monospace,Menlo,monospace;font-size:11.5px}
 td.cmd{color:#c9d4e6;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:1px;font-family:ui-monospace,Menlo,monospace;font-size:11.5px}
 tr.detail>td{background:#0c0f14;padding:0;border-bottom:1px solid #22262f}
 .dwrap{padding:14px 16px 16px}
@@ -149,8 +150,8 @@ pre{margin:0 0 12px;padding:11px 13px;background:#0b0d11;border:1px solid #22262
   <button class="toggle on" id="follow" title="pause the two-second refresh">follow</button>
 </div>
 <div id="listScroll">
-  <table><thead><tr><th>exec</th><th>command</th><th>state</th><th>exit</th><th>started</th><th>duration</th></tr></thead>
-  <tbody id="rows"><tr><td colspan="6" class="empty">no executions yet</td></tr></tbody></table>
+  <table><thead><tr><th>started (UTC+8)</th><th>command</th><th>state</th><th>exit</th><th>duration</th></tr></thead>
+  <tbody id="rows"><tr><td colspan="5" class="empty">no executions yet</td></tr></tbody></table>
 </div>
 <script>
 const fmt = (ms) => ms == null ? '\u2014' : ms < 1000 ? ms + ' ms' : (ms / 1000).toFixed(1) + ' s'
@@ -163,10 +164,11 @@ let follow = true
 let rowsCache = []
 let detailCache = null
 
+// Fixed UTC+8, independent of the viewer's timezone.
 const clock = (ms) => {
   if (ms == null) return '\u2014'
-  const d = new Date(ms)
-  return d.toLocaleTimeString([], { hour12: false })
+  const shifted = new Date(ms + 8 * 3600 * 1000)
+  return shifted.toISOString().slice(0, 19).replace('T', ' ')
 }
 
 const commandLine = (execution) => {
@@ -229,21 +231,20 @@ function render() {
   const keepTop = scroll.scrollTop
   const rows = document.getElementById('rows')
   if (visible.length === 0) {
-    rows.innerHTML = `<tr><td colspan="6" class="empty">${rowsCache.length === 0 ? 'no executions yet' : 'nothing matches the filter'}</td></tr>`
+    rows.innerHTML = `<tr><td colspan="5" class="empty">${rowsCache.length === 0 ? 'no executions yet' : 'nothing matches the filter'}</td></tr>`
     return
   }
   let html = ''
   for (const e of visible) {
     html += `<tr class="row ${e.id === selected ? 'sel' : ''}" data-id="${esc(e.id)}">
-      <td><code>${esc(e.id.slice(0, 8))}</code></td>
+      <td class="when">${clock(e.startedAtMs)}</td>
       <td class="cmd" title="${esc(commandLine(e))}">${esc(commandLine(e))}</td>
       <td><span class="badge ${e.state}">${e.state}</span></td>
       <td>${e.exitCode == null ? '\u2014' : e.exitCode}</td>
-      <td>${clock(e.startedAtMs)}</td>
       <td>${fmt(e.durationMs != null ? e.durationMs : e.ageMs)}</td>
     </tr>`
     if (e.id === selected) {
-      html += `<tr class="detail" data-detail><td colspan="6">${detailMarkup(detailCache)}</td></tr>`
+      html += `<tr class="detail" data-detail><td colspan="5">${detailMarkup(detailCache)}</td></tr>`
     }
   }
   rows.innerHTML = html
