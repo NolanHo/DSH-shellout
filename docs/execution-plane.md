@@ -121,6 +121,10 @@ rename — so the published path never names a partially copied stream. The host
 * Admission does not block the runtime: the executor waits for the shim's
   first report on a blocking thread and holds no admission lock while it
   waits, so an unrelated request is answered while a spawn is in flight.
+* An admission still in flight counts against `--max-concurrent`, and a
+  duplicate in-flight `operationId` is refused across connections: a burst of
+  requests cannot overshoot the limit, or start one operation twice, before any
+  shim has reported a pid.
 * SIGTERM: the executor stops serving and exits without signalling shims or commands.
   On adoption, a host boot receives a fresh lease window to reconnect; deadlines
   remain owned by the shim while the executor is absent.

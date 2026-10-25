@@ -201,8 +201,9 @@ Ordering: the runner sends `settled` **after** the final output bytes are readab
   otherwise they settle as `killed` with the provider note and later commands run in-process until
   reconnected. The window must exceed the worst-case executor restart, or a merely slow restart is
   reported as a lost runner.
-- **Concurrency limit** → the runner admits at most `maxConcurrent` executions (default 64) and
-  answers `busy` beyond that; the host surfaces it as a preparation failure.
+- **Concurrency limit** → the runner admits at most `maxConcurrent` executions (default 64),
+  counting spawns still in admission, and refuses beyond that; the host surfaces the refusal as a
+  preparation failure. A duplicate in-flight `operationId` is refused the same way.
 
 ### 5.6 Security
 
@@ -246,7 +247,7 @@ Runner plugin config: `socketPath`, `leaseTtlMs`, `maxConcurrent`, `settleRetent
 | Executor is replaced and no longer holds the execution | `done` resolves, `status: 'killed'`, stderr carries `shellout: runner lost` |
 | Host dies mid-execution | Runner terminates the group at lease expiry; history records `killed` with `termination: "lease"` |
 | Socket reconnect inside lease | Executions continue; host reconciles via `state` and resumes mirroring |
-| Duplicate `exec` (same operation) | One process; same `executionId` returned |
+| Duplicate `exec` (same operation) | One process; same `executionId` returned (a duplicate while the first is still being admitted is refused) |
 | `kill` after settlement | Returns `{ requested: false }` |
 
 ## 7. Acceptance criteria

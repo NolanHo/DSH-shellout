@@ -30,8 +30,9 @@ pub struct Registry {
     executions: Mutex<HashMap<String, Arc<Execution>>>,
     /// Serializes admission decisions without holding a lock across the spawn.
     admission: Mutex<()>,
-    /// Execution ids currently being admitted; they are not in `executions` yet.
-    reservations: Mutex<std::collections::HashSet<String>>,
+    /// Executions currently being admitted, by id to operation id. They are
+    /// not in `executions` yet, but they already hold a concurrency slot.
+    reservations: Mutex<std::collections::HashMap<String, String>>,
     boots: Mutex<HashMap<String, Instant>>,
     events: broadcast::Sender<Value>,
     max_concurrent: usize,
@@ -66,7 +67,7 @@ impl Registry {
         Arc::new(Self {
             executions: Mutex::new(HashMap::new()),
             admission: Mutex::new(()),
-            reservations: Mutex::new(std::collections::HashSet::new()),
+            reservations: Mutex::new(std::collections::HashMap::new()),
             boots: Mutex::new(HashMap::new()),
             events,
             max_concurrent,
@@ -129,7 +130,7 @@ impl Registry {
         let registry = Arc::new(Self {
             executions: Mutex::new(HashMap::new()),
             admission: Mutex::new(()),
-            reservations: Mutex::new(std::collections::HashSet::new()),
+            reservations: Mutex::new(std::collections::HashMap::new()),
             boots: Mutex::new(HashMap::new()),
             events,
             max_concurrent,
@@ -377,17 +378,6 @@ impl Registry {
             if executions.contains_key(&request.execution_id) {
                 return Err(Failure::new("rejected", "execution id already exists"));
             }
-            if executions
-                .values()
-                .filter(|execution| execution.running())
-                .count()
-                >= self.max_concurrent
-            {
-                return Err(Failure::new(
-                    "rejected",
-                    "executor concurrent execution limit reached",
-                ));
-            }
             if !valid_id(&request.execution_id)
                 || request.spec.argv.is_empty()
                 || request.spec.argv[0].is_empty()
@@ -397,17 +387,41 @@ impl Registry {
                     "invalid execution id or empty argv",
                 ));
             }
-            if !self
+            let mut reservations = self
                 .reservations
                 .lock()
-                .map_err(|_| Failure::new("internal", "reservations poisoned"))?
-                .insert(id.clone())
+                .map_err(|_| Failure::new("internal", "reservations poisoned"))?;
+            // Admission in flight is a live execution for the limit: six
+            // simultaneous requests must not all pass a limit of two before
+            // any of them reaches `executions`.
+            if executions
+                .values()
+                .filter(|execution| execution.running())
+                .count()
+                .saturating_add(reservations.len())
+                >= self.max_concurrent
             {
+                return Err(Failure::new(
+                    "rejected",
+                    "executor concurrent execution limit reached",
+                ));
+            }
+            if reservations
+                .values()
+                .any(|operation| *operation == request.operation_id)
+            {
+                return Err(Failure::new(
+                    "rejected",
+                    "operation id is already being admitted",
+                ));
+            }
+            if reservations.contains_key(&id) {
                 return Err(Failure::new(
                     "rejected",
                     "execution id is already being admitted",
                 ));
             }
+            reservations.insert(id.clone(), request.operation_id.clone());
         }
         let outcome = self.admit(request, boot);
         match self.reservations.lock() {

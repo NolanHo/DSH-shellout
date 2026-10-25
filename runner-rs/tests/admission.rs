@@ -239,3 +239,134 @@ fn a_spawn_timeout_refuses_the_command_and_leaves_no_ghost() {
         "the rejected command ran after the exec reply said it did not"
     );
 }
+
+/// In-flight admissions are live executions for the limit: a burst must not
+/// overshoot `--max-concurrent` before any shim has reported a pid.
+#[test]
+fn in_flight_admissions_count_against_the_concurrent_limit() {
+    let scratch = Scratch::new("limit");
+    let executor = Executor::start_full(
+        &scratch,
+        "executor",
+        std::path::Path::new(support::BINARY),
+        &["--max-concurrent", "2"],
+        &[
+            ("DSH_SHELLOUT_SPAWN_GRACE_MS", "3000"),
+            ("DSH_SHELLOUT_SHIM_START_DELAY_MS", "800"),
+        ],
+    );
+    executor.ready();
+
+    let socket = scratch.socket();
+    let mut handles = Vec::new();
+    for index in 0..6 {
+        let socket = socket.clone();
+        handles.push(std::thread::spawn(move || {
+            let mut client = support::Client::connect(&socket).expect("connection");
+            client.hello(&format!("boot-limit-{index}"));
+            client
+                .call(
+                    "exec",
+                    json!({
+                        "executionId": format!("limit-{index}"),
+                        "operationId": format!("op-limit-{index}"),
+                        "specDigest": "limit",
+                        "spec": {
+                            "argv": ["/bin/sh", "-c", "exit 0"],
+                            "cwd": "/tmp",
+                            "env": {"PATH": "/usr/bin:/bin"},
+                            "timeoutMs": 10_000,
+                            "onExpiry": "kill",
+                            "graceMs": 100,
+                            "capture": {"stdoutMaxBytes": 64_000, "stderrMaxBytes": 64_000,
+                                "spillMaxBytes": 1_048_576, "spillDir": "/tmp"},
+                        },
+                    }),
+                )
+                .expect("the executor answered")
+        }));
+    }
+    let replies: Vec<serde_json::Value> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("admission thread"))
+        .collect();
+    let accepted = replies
+        .iter()
+        .filter(|reply| reply["kind"] == "res")
+        .count();
+    assert_eq!(
+        accepted, 2,
+        "accepted {accepted} of 6 with --max-concurrent 2: {replies:?}"
+    );
+    for reply in &replies {
+        if reply["kind"] == "err" {
+            assert!(
+                reply["payload"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("concurrent execution limit"),
+                "the refusal names the limit: {reply}"
+            );
+        }
+    }
+}
+
+/// A duplicate in-flight `operationId` is refused across connections, so one
+/// retried operation cannot start two commands before either is registered.
+#[test]
+fn a_duplicate_in_flight_operation_id_is_rejected_across_connections() {
+    let scratch = Scratch::new("dup-op");
+    let executor = Executor::start_full(
+        &scratch,
+        "executor",
+        std::path::Path::new(support::BINARY),
+        &[],
+        &[
+            ("DSH_SHELLOUT_SPAWN_GRACE_MS", "3000"),
+            ("DSH_SHELLOUT_SHIM_START_DELAY_MS", "800"),
+        ],
+    );
+    executor.ready();
+
+    fn spec(id: &str) -> serde_json::Value {
+        json!({
+            "executionId": id,
+            "operationId": "shared-operation",
+            "specDigest": "shared",
+            "spec": {
+                "argv": ["/bin/sh", "-c", "exit 0"],
+                "cwd": "/tmp",
+                "env": {"PATH": "/usr/bin:/bin"},
+                "timeoutMs": 10_000,
+                "onExpiry": "kill",
+                "graceMs": 100,
+                "capture": {"stdoutMaxBytes": 64_000, "stderrMaxBytes": 64_000,
+                    "spillMaxBytes": 1_048_576, "spillDir": "/tmp"},
+            },
+        })
+    }
+    let socket = scratch.socket();
+    let first = std::thread::spawn(move || {
+        let mut client = support::Client::connect(&socket).expect("connection");
+        client.hello("boot-dup-1");
+        client.call("exec", spec("first")).expect("first answered")
+    });
+    std::thread::sleep(Duration::from_millis(150));
+
+    let mut second = support::Client::connect(&scratch.socket()).expect("second connection");
+    second.hello("boot-dup-2");
+    let reply = second
+        .call("exec", spec("second"))
+        .expect("second answered");
+    assert_eq!(reply["kind"], "err", "{reply}");
+    assert!(
+        reply["payload"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("operation id is already being admitted"),
+        "the refusal names the in-flight operation: {reply}"
+    );
+
+    let first_reply = first.join().expect("first thread");
+    assert_eq!(first_reply["kind"], "res", "{first_reply}");
+}
