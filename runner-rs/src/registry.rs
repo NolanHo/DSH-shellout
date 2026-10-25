@@ -97,7 +97,8 @@ impl Registry {
             .lock()
             .map(|guard| guard.values().map(|execution| execution.detail()).collect())
             .unwrap_or_default();
-        rows.sort_by_key(|row| std::cmp::Reverse(row["ageMs"].as_u64().unwrap_or(0)));
+        // Smallest age first: the newest execution tops the list.
+        rows.sort_by_key(|row| row["ageMs"].as_u64().unwrap_or(u64::MAX));
         rows.truncate(limit);
         rows
     }

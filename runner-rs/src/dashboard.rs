@@ -222,6 +222,7 @@ async function loadList() {
 
 async function loadDetail() {
   const pane = document.getElementById('detail')
+  const paneScroll = document.getElementById('detailPane').scrollTop
   const response = await fetch('/api/execution?id=' + encodeURIComponent(selected), { cache: 'no-store' })
   if (!response.ok) {
     pane.innerHTML = '<div class="empty">This execution is no longer retained.</div>'
@@ -245,6 +246,7 @@ async function loadDetail() {
       <button class="tab ${tab === 'stderr' ? 'on' : ''}" data-tab="stderr">stderr</button>
     </div>
     <pre>${text && text.length > 0 ? esc(text) : '\u2014'}</pre>`
+  document.getElementById('detailPane').scrollTop = paneScroll
   for (const button of pane.querySelectorAll('.tab')) {
     button.addEventListener('click', () => { tab = button.dataset.tab; loadDetail() })
   }
@@ -285,6 +287,11 @@ async function tick() {
   try {
     await loadStats()
     if (follow || rowsCache.length === 0) await loadList()
+    // A live execution keeps producing output; keep its pane current without
+    // moving the reader's position.
+    if (follow && selected !== null && rowsCache.some(e => e.id === selected && e.state === 'running')) {
+      await loadDetail()
+    }
   } catch (error) {
     document.getElementById('sub').textContent = 'runner unreachable: ' + error
   }
