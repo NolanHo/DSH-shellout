@@ -90,6 +90,27 @@ impl Registry {
         })
     }
 
+    /// Recent executions, newest first, for the dashboard list.
+    pub fn recent(&self, limit: usize) -> Vec<Value> {
+        let mut rows: Vec<Value> = self
+            .executions
+            .lock()
+            .map(|guard| guard.values().map(|execution| execution.detail()).collect())
+            .unwrap_or_default();
+        rows.sort_by_key(|row| std::cmp::Reverse(row["ageMs"].as_u64().unwrap_or(0)));
+        rows.truncate(limit);
+        rows
+    }
+
+    /// One execution with its captured output.
+    pub fn detail(&self, execution_id: &str) -> Option<Value> {
+        self.executions
+            .lock()
+            .ok()?
+            .get(execution_id)
+            .map(|execution| execution.detail())
+    }
+
     /// Subscribe to settlement events.
     pub fn subscribe(&self) -> broadcast::Receiver<Value> {
         self.events.subscribe()
@@ -233,6 +254,31 @@ impl Registry {
 
     /// Terminate executions whose boot lease expired.
     pub fn sweep(&self) {
+        self.retain_recent();
+        self.sweep_leases();
+    }
+
+    /// Keep the newest finished executions' captures so the dashboard can show
+    /// them; drop the oldest beyond the retention window.
+    fn retain_recent(&self) {
+        const RETAINED: usize = 200;
+        let Ok(mut executions) = self.executions.lock() else { return };
+        let mut finished: Vec<(String, std::time::Instant)> = executions
+            .values()
+            .filter(|execution| !execution.state().running)
+            .map(|execution| (execution.id.clone(), execution.started))
+            .collect();
+        if finished.len() <= RETAINED {
+            return;
+        }
+        finished.sort_by_key(|(_, started)| *started);
+        for (id, _) in finished.into_iter().take(executions.len().saturating_sub(RETAINED)) {
+            executions.remove(&id);
+        }
+    }
+
+    /// Terminate executions whose boot lease expired (internal).
+    fn sweep_leases(&self) {
         let now = Instant::now();
         let expired: Vec<String> = self
             .boots

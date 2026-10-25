@@ -46,8 +46,14 @@ pub struct Execution {
     pub boot_id: String,
     /// `argv[0]` for the dashboard.
     pub program: String,
+    /// Full argv, for the dashboard detail view.
+    pub argv: Vec<String>,
+    /// Working directory the command ran in.
+    pub cwd: String,
     /// When the process was created.
     pub started: Instant,
+    /// When it settled.
+    pub settled_at: Mutex<Option<Instant>>,
     /// Captured stdout.
     pub stdout: Arc<Mutex<CaptureState>>,
     /// Captured stderr.
@@ -103,6 +109,37 @@ impl Execution {
             }
         });
         true
+    }
+
+    /// One execution as the dashboard shows it, including captured output.
+    pub fn detail(&self) -> serde_json::Value {
+        let state = self.state();
+        let read = |capture: &Arc<Mutex<CaptureState>>| {
+            capture
+                .lock()
+                .map(|guard| guard.read_from(0, usize::MAX))
+                .map(|read| (read.text, read.lossy, read.spill_path))
+                .unwrap_or_default()
+        };
+        let (stdout, stdout_lossy, stdout_spill) = read(&self.stdout);
+        let (stderr, stderr_lossy, stderr_spill) = read(&self.stderr);
+        let finished = self.settled_at.lock().ok().and_then(|guard| *guard);
+        json!({
+            "id": self.id,
+            "argv": self.argv,
+            "command": self.program,
+            "cwd": self.cwd,
+            "state": if state.running { "running" } else if state.killed { "killed" } else { "exited" },
+            "exitCode": state.exit_code,
+            "signal": state.signal,
+            "ageMs": self.started.elapsed().as_millis() as u64,
+            "durationMs": finished.map(|at| at.saturating_duration_since(self.started).as_millis() as u64),
+            "stdout": stdout,
+            "stderr": stderr,
+            "lossy": stdout_lossy || stderr_lossy,
+            "stdoutSpillPath": stdout_spill,
+            "stderrSpillPath": stderr_spill,
+        })
     }
 
     fn signal_group(&self, signal: i32) {
@@ -190,7 +227,10 @@ pub fn spawn_execution(
     let execution = Arc::new(Execution {
         id: execution_id.clone(),
         program: spec.argv.first().cloned().unwrap_or_default(),
+        argv: spec.argv.clone(),
+        cwd: spec.cwd.clone(),
         started: Instant::now(),
+        settled_at: Mutex::new(None),
         operation_id,
         digest,
         boot_id: boot_id.clone(),
@@ -236,6 +276,9 @@ pub fn spawn_execution(
         }
         if let Ok(mut guard) = supervisor.pid.lock() {
             *guard = None;
+        }
+        if let Ok(mut guard) = supervisor.settled_at.lock() {
+            *guard = Some(Instant::now());
         }
         let status = if killed { "killed" } else { "exited" };
         if killed {
