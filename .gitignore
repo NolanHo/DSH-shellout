@@ -6,3 +6,5 @@ coverage/
 .DS_Store
 .vitest/
 target/
+# Scratch sockets and fixtures for the Rust runner tests and scripts/e2e-rust.mjs.
+.task-tmp/
