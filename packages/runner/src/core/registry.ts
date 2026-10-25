@@ -71,6 +71,7 @@ export class ExecutionRegistry {
   private readonly byOperation = new Map<string, string>()
   private readonly boots = new Map<string, Boot>()
   private readonly listeners = new Set<(event: SettledEvent) => void>()
+  private readonly closedListeners = new Set<() => void>()
   private readonly leaseTtlMs: number
   private readonly maxConcurrent: number
   private readonly settleRetentionMs: number
@@ -95,6 +96,20 @@ export class ExecutionRegistry {
   onSettled(listener: (event: SettledEvent) => void): () => void {
     this.listeners.add(listener)
     return () => { this.listeners.delete(listener) }
+  }
+
+  /**
+   * Subscribe to the settlement stream closing.
+   *
+   * A connection that can no longer be told about a settlement has to let its
+   * host re-handshake rather than leave it waiting for an event that will never
+   * come. The server drops its host connections on this signal.
+   * @param listener - called once, when this registry disposes.
+   * @returns a disposer removing the listener.
+   */
+  onClosed(listener: () => void): () => void {
+    this.closedListeners.add(listener)
+    return () => { this.closedListeners.delete(listener) }
   }
 
   /**
@@ -127,6 +142,27 @@ export class ExecutionRegistry {
       })
     }
     return held
+  }
+
+  /**
+   * The settlements of one boot that are still retained, for the connection
+   * that just handshaked for it.
+   *
+   * A settlement is announced once; one announced while no connection was
+   * subscribed would otherwise leave the execution `running` on its host. The
+   * caller writes these on that connection only, so an unrelated boot's stream
+   * stays its own, and the `hello` reply's terminal facts stay the authority for
+   * a host that does not follow events.
+   * @param bootId - the boot that reconnected.
+   * @returns every retained settlement this boot owns.
+   */
+  replay(bootId: string): SettledEvent[] {
+    const events: SettledEvent[] = []
+    for (const record of this.records.values()) {
+      if (record.bootId !== bootId || record.terminal === undefined) continue
+      events.push(record.terminal)
+    }
+    return events
   }
 
   /**
@@ -246,7 +282,7 @@ export class ExecutionRegistry {
     return { live: live().length }
   }
 
-  /** Terminate every execution and stop the sweep timer. */
+  /** Terminate every execution and stop the settlement stream. */
   dispose(): void {
     if (this.disposed) return
     this.disposed = true
@@ -255,6 +291,8 @@ export class ExecutionRegistry {
       if (!record.settled) record.execution.kill()
     }
     this.listeners.clear()
+    for (const listener of this.closedListeners) listener()
+    this.closedListeners.clear()
   }
 
   private draining = false

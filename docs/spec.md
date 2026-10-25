@@ -149,13 +149,17 @@ Methods (all host → runner unless marked event):
 | `ping` | `{ bootId }` | `{ ok: true }` | Refreshes the boot lease. |
 | `drain` | `{ timeoutMs }` | `{ live: number }` | Stops accepting `exec`; terminates or waits for live executions. |
 | `shutdown` | `{}` | `{}` | Clean stop after drain. |
-| `settled` (event) | `{ executionId, status, exitCode, signal, termination?, sandbox?, detail? }` | — | Sent once per execution, after its final output is readable. A settlement nobody was subscribed for is recovered from the `hello` reply. |
+| `settled` (event) | `{ executionId, status, exitCode, signal, termination?, sandbox?, detail? }` | — | Sent once per execution, after its final output is readable. A settlement nobody was subscribed for is recovered from the `hello` reply, which also replays the retained settlements of that boot on the connection that just handshaked for it. |
 
 Error codes: `protocol`, `version`, `unknown-execution`, `busy`, `rejected` (admission refused),
 `internal`. An `err` frame for a request the host no longer tracks is logged and ignored.
 
 Ordering: the runner sends `settled` **after** the final output bytes are readable through
 `readOutput`/`readStream`, so a host that reads until `settled` never misses a tail.
+
+A connection that falls behind its settlement stream — its socket stops accepting announcements —
+is dropped rather than skipping events, so its host re-handshakes and takes the facts it missed
+from the `hello` reply. A replay never reaches another boot's connection.
 
 ### 5.4 Local mirror (host)
 

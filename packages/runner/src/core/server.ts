@@ -48,12 +48,30 @@ export interface RunnerServerOptions {
   readonly leaseTtlMs?: number
   /** Called after a `shutdown` request has been answered. */
   readonly onShutdown?: () => void
+  /**
+   * Settlement bytes one connection may fall behind before it is dropped so its
+   * host re-handshakes and recovers the facts it missed.
+   */
+  readonly settlementBacklogBytes?: number
 }
+
+/**
+ * Default settlement backlog a connection may accumulate. A settlement event is
+ * a few hundred bytes, so this is thousands of them: a host that cannot consume
+ * that much is no longer following its stream.
+ */
+const DEFAULT_SETTLEMENT_BACKLOG_BYTES = 1_048_576
 
 interface Connection {
   readonly socket: Socket
   readonly decoder: FrameDecoder
   bootId?: string
+  /** Settlement frames the socket has not accepted yet, oldest first. */
+  backlog: Buffer[]
+  /** Bytes in `backlog`. */
+  backlogBytes: number
+  /** Set while the socket is full; the `drain` event resumes delivery. */
+  drainWait: boolean
 }
 
 /** The runner's socket endpoint. */
@@ -61,11 +79,15 @@ export class RunnerServer {
   private readonly connections = new Set<Connection>()
   private readonly server: Server
   private readonly detach: () => void
+  private readonly detachClosed: () => void
+  private readonly settlementBacklogBytes: number
   private closing = false
 
   private constructor(private readonly options: RunnerServerOptions, server: Server) {
     this.server = server
+    this.settlementBacklogBytes = options.settlementBacklogBytes ?? DEFAULT_SETTLEMENT_BACKLOG_BYTES
     this.detach = options.registry.onSettled(event => { this.broadcast(event) })
+    this.detachClosed = options.registry.onClosed(() => { this.dropHosts() })
   }
 
   /** Socket path this server bound. */
@@ -107,6 +129,7 @@ export class RunnerServer {
     if (this.closing) return
     this.closing = true
     this.detach()
+    this.detachClosed()
     for (const connection of this.connections) connection.socket.destroy()
     this.connections.clear()
     await new Promise<void>((resolve) => { this.server.close(() => { resolve() }) })
@@ -114,15 +137,27 @@ export class RunnerServer {
   }
 
   private accept(socket: Socket, maxFrameBytes: number): void {
-    const connection: Connection = { socket, decoder: new FrameDecoder(maxFrameBytes) }
+    const connection: Connection = {
+      socket,
+      decoder: new FrameDecoder(maxFrameBytes),
+      backlog: [],
+      backlogBytes: 0,
+      drainWait: false,
+    }
     this.connections.add(connection)
     socket.on('data', (chunk: Buffer) => { void this.onData(connection, chunk) })
+    socket.on('drain', () => {
+      connection.drainWait = false
+      this.flush(connection)
+    })
     socket.on('error', () => { this.drop(connection) })
     socket.on('close', () => { this.drop(connection) })
   }
 
   private drop(connection: Connection): void {
     this.connections.delete(connection)
+    connection.backlog = []
+    connection.backlogBytes = 0
   }
 
   private async onData(connection: Connection, chunk: Buffer): Promise<void> {
@@ -164,6 +199,14 @@ export class RunnerServer {
             leaseTtlMs: this.options.leaseTtlMs ?? 60_000,
             executions,
           })
+          // A settlement announced while nobody was subscribed is replayed on
+          // the connection that just handshaked for it — never by broadcast, so
+          // another boot's stream stays its own. A replay is this connection's
+          // own history, not a sign that it stopped consuming its live stream,
+          // so it is written like any other reply.
+          for (const event of this.options.registry.replay(request.bootId)) {
+            this.write(connection, { id: 0, kind: 'evt', method: 'settled', payload: event })
+          }
           return
         }
         case 'exec': {
@@ -255,7 +298,68 @@ export class RunnerServer {
   private broadcast(event: SettledEvent): void {
     for (const connection of this.connections) {
       if (connection.bootId === undefined) continue
-      this.write(connection, { id: 0, kind: 'evt', method: 'settled', payload: event })
+      this.settle(connection, event)
+    }
+  }
+
+  /**
+   * Deliver one settlement event to one host connection.
+   *
+   * The connection owns a bounded queue of settlements the socket has not
+   * accepted yet. A connection that falls behind it is dropped rather than
+   * silently skipping events: its host re-handshakes and takes the facts it
+   * missed from the `hello` reply. The bound is what makes the drop a fact
+   * about the host, not about this process's memory.
+   * @param connection - the host connection.
+   * @param event - the settlement to announce.
+   */
+  private settle(connection: Connection, event: SettledEvent): void {
+    let frame: Buffer
+    try {
+      frame = encodeFrame(
+        { id: 0, kind: 'evt', method: 'settled', payload: event },
+        this.options.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES,
+      )
+    } catch {
+      // A settlement this connection cannot even frame is a broken connection.
+      this.drop(connection)
+      connection.socket.destroy()
+      return
+    }
+    connection.backlog.push(frame)
+    connection.backlogBytes += frame.byteLength
+    if (connection.backlogBytes > this.settlementBacklogBytes) {
+      this.drop(connection)
+      connection.socket.destroy()
+      return
+    }
+    this.flush(connection)
+  }
+
+  /**
+   * Hand queued settlements to the socket until it reports backpressure.
+   * @param connection - the host connection to drain.
+   */
+  private flush(connection: Connection): void {
+    if (connection.drainWait || connection.socket.destroyed) return
+    while (connection.backlog.length > 0) {
+      const frame = connection.backlog.shift() as Buffer
+      connection.backlogBytes -= frame.byteLength
+      if (!connection.socket.write(frame)) {
+        // The socket accepted these bytes and will report `drain` when it can
+        // take more; until then a growing backlog means the host stopped reading.
+        connection.drainWait = true
+        return
+      }
+    }
+  }
+
+  /** Drop every host connection once the settlement stream is gone. */
+  private dropHosts(): void {
+    for (const connection of [...this.connections]) {
+      if (connection.bootId === undefined) continue
+      this.connections.delete(connection)
+      connection.socket.destroy()
     }
   }
 }

@@ -74,12 +74,22 @@ class TestClient {
     this.socket.write(bytes)
   }
 
+  /** Stop reading, as a host busy with its own work would. */
+  pause(): void {
+    this.socket.pause()
+  }
+
+  /** Read again, as that host does once it is free. */
+  resume(): void {
+    this.socket.resume()
+  }
+
   close(): void {
     this.socket.destroy()
   }
 }
 
-async function startServer(options: { heartbeatMs?: number } = {}): Promise<{
+async function startServer(options: { heartbeatMs?: number; settlementBacklogBytes?: number } = {}): Promise<{
   server: RunnerServer
   registry: ExecutionRegistry
   backend: FakeBackend
@@ -108,6 +118,15 @@ const hello = (bootId = 'boot-a'): { protocol: string; clientBuild: string; boot
   bootId,
   maxFrameBytes: 8 * 1024 * 1024,
 })
+
+/** Wait until the channel collected `count` events, or the deadline passes. */
+async function events(channel: TestClient, count: number, timeoutMs = 2_000): Promise<Envelope[]> {
+  const deadline = Date.now() + timeoutMs
+  while (channel.events.length < count && Date.now() < deadline) {
+    await new Promise(resolve => { setTimeout(resolve, 5) })
+  }
+  return channel.events
+}
 
 describe('RunnerServer', () => {
   it('answers hello with the descriptor and held executions', async () => {
@@ -184,6 +203,90 @@ describe('RunnerServer', () => {
     const reply = await channel.request('state', { executionId: 'ghost' })
     expect(reply.kind).toBe('err')
     expect((reply.payload as { code: string }).code).toBe('unknown-execution')
+  })
+
+  it('replays a missed settlement on the connection that handshaked for it', async () => {
+    const { client, backend } = await startServer()
+    const owner = await client()
+    await owner.request('hello', hello('boot-owner'))
+    await owner.request('exec', {
+      operationId: 'op1', executionId: 'e1', spec: SPEC, specDigest: specDigest(SPEC),
+    })
+    // The host goes away before its execution settles, so the announcement
+    // reaches no connection.
+    owner.close()
+    await owner.closed
+    backend.executions[0]?.complete(5)
+    await new Promise(resolve => { setTimeout(resolve, 30) })
+
+    // A host of another boot is connected for the whole story; the owner's
+    // replay must never appear on its stream.
+    const unrelated = await client()
+    cleanups.push(() => { unrelated.close() })
+    await unrelated.request('hello', hello('boot-unrelated'))
+
+    const reconnected = await client()
+    cleanups.push(() => { reconnected.close() })
+    const reply = await reconnected.request('hello', hello('boot-owner'))
+    expect(reply.kind).toBe('res')
+    expect((reply.payload as { executions: unknown[] }).executions).toEqual([
+      { executionId: 'e1', state: 'exited', exitCode: 5, signal: null },
+    ])
+    const replayed = await events(reconnected, 1)
+    expect(replayed[0]?.method).toBe('settled')
+    expect(replayed[0]?.payload).toMatchObject({ executionId: 'e1', status: 'exited', exitCode: 5 })
+    await new Promise(resolve => { setTimeout(resolve, 50) })
+    expect(unrelated.events).toHaveLength(0)
+  })
+
+  it('drops a connection that falls behind its settlement stream', async () => {
+    const { client, registry, backend } = await startServer({ settlementBacklogBytes: 4_096 })
+    const channel = await client()
+    cleanups.push(() => { channel.close() })
+    await channel.request('hello', hello())
+    // A host that stops reading cannot be told about settlements any more. The
+    // volume is far past any socket buffer, so the backlog bound trips on every
+    // platform this runs on.
+    channel.pause()
+    const total = 20_000
+    for (let index = 0; index < total; index += 1) {
+      await registry.exec({
+        operationId: `op-${String(index)}`,
+        executionId: `e${String(index)}`,
+        spec: SPEC,
+        specDigest: specDigest(SPEC),
+      }, 'boot-a')
+      backend.executions[index]?.complete(0)
+    }
+    // The dropped connection ends instead of skipping settlements silently: the
+    // host reads what reached it and then reconnects.
+    channel.resume()
+    await channel.closed
+    expect(channel.events.length).toBeLessThan(total)
+    const reconnected = await client()
+    cleanups.push(() => { reconnected.close() })
+    const reply = await reconnected.request('hello', hello())
+    // Every settlement the dropped connection missed is in the handshake facts.
+    expect((reply.payload as { executions: unknown[] }).executions).toHaveLength(total)
+  })
+
+  it('drops host connections when the settlement stream closes', async () => {
+    const { client, registry } = await startServer()
+    const host = await client()
+    cleanups.push(() => { host.close() })
+    await host.request('hello', hello())
+    const observer = await client()
+    cleanups.push(() => { observer.close() })
+    await observer.request('state', { executionId: 'ghost' })
+    registry.dispose()
+    // The host can no longer be told about settlements, so it re-handshakes.
+    await host.closed
+    // An observer never subscribed to the stream and keeps its connection.
+    const observerClosed = await Promise.race([
+      observer.closed.then(() => true),
+      new Promise<boolean>(resolve => { setTimeout(() => { resolve(false) }, 100) }),
+    ])
+    expect(observerClosed).toBe(false)
   })
 
   it('closes the connection on an oversized frame', async () => {
