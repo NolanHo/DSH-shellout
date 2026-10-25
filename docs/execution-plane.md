@@ -32,6 +32,7 @@ matters about the execution in files:
 `$DSH_SHELLOUT_STATE` (default `<DSH_HOME>/shellout/state`), one directory per execution:
 
 ```
+<state>/.lock      exclusive claim held by the one executor that owns this directory
 <state>/<executionId>/
   meta.json     argv, cwd, complete env, stdin, deadline and capture policy, boot/operation identity
   status.json   command pid/pgid/start time, shim identity, timestamps, terminal and stream facts
@@ -41,24 +42,64 @@ matters about the execution in files:
 ```
 
 `status.json` is replaced with `write`+`rename`, so a reader never sees a torn
-document. The shim writes `state: running` before `exec` and the terminal facts
-after the child is reaped; the executor writes the same record to history.
+document. The shim publishes its own identity (pid and start time) as its first
+act, then the command's pid/pgid once spawned, and the terminal facts after the
+child exits; the executor writes the same record to history. It never rewrites
+an unchanged record, and it clears `meta.json`'s environment once the execution
+is terminal.
+
+Terminal facts other than the exit status:
+
+| Field | Meaning |
+|---|---|
+| `termination` | `deadline`, `request`, `lease` or `drain` — who ended the execution |
+| `spawnError` | why the command could not be started; its presence fails `exec` synchronously |
+
+An execution whose stream a detached descendant keeps open is published as
+`lossy` rather than blocking: the shim bounds the join, records the loss, and
+publishes terminal facts regardless.
+
+A settled execution's directory is deleted once its history row is durable and
+a retention window (`--state-retention-ms`, default 15 s) has passed, so
+readers that follow the settlement event can still fetch the tail. Keep that
+window longer than the host's `disconnectGraceMs`: a host that reconnects
+inside its grace still has to read the execution it missed.
 
 ## Executor lifetime
 
-* On start, the executor scans the state directory. For each shim whose
-  `status.json` says running, it checks the recorded pid's start time (pid +
-  `/proc/<pid>/stat` field 22) and, when it matches, **adopts** the execution:
-  it re-registers it, serves its output from the files, and settles it from
-  `status.json` when the shim finishes.
-* When the pid is gone or the start time differs (pid reuse), the execution is
-  marked `lost` — a fact, not a guess.
+* **One executor per state directory.** It takes `flock(LOCK_EX|LOCK_NB)` on
+  `<state>/.lock` before it unlinks or binds the socket, and exits with an
+  error naming the lock when another executor holds it. Two executors would
+  each adopt the other's shims, and the older lease would terminate the newer
+  one's commands.
+* On start, the executor scans the state directory and **adopts** every shim
+  that is still alive: it checks the recorded supervisor start time (pid +
+  `/proc/<pid>/stat` field 22) and re-registers the execution, serving its
+  output from the files.
+* Liveness is a property of the **shim**, not of the command: a shim that has
+  already reaped its direct child is still terminating the group and draining
+  the pipes, and the execution stays `running` until the shim publishes its
+  terminal facts. Loading and polling use the same predicate, so a restart
+  can never disagree with a running executor about the same file.
+* When the supervisor is gone, or its start time differs (pid reuse), the
+  execution is marked `lost` — a fact, not a guess.
 * A directory whose shim has not published `status.json` yet is adopted as
   `running`, because the shim writes its identity as its first act. If nothing
   is published within the startup grace, the execution is marked `lost`.
+* History is a projection of the state directory. A `running` row with no
+  directory behind it becomes `lost` at startup, and a row only ever moves
+  from `running` to a terminal state: a terminal row is never rewritten or
+  regressed.
 * SIGTERM: the executor stops serving and exits without signalling shims or commands.
   On adoption, a host boot receives a fresh lease window to reconnect; deadlines
   remain owned by the shim while the executor is absent.
+
+Settlement is replayable. A `settled` event is sent once; if it is emitted while
+no connection is subscribed, the execution would stay `running` on every host
+that missed it. The `hello` reply therefore carries each held execution's
+terminal facts (`state`, `exitCode`, `signal`, `termination`, `detail`), and a
+host settles from those facts on reconnect; the connection also re-announces
+the settlement through the event channel once it is subscribed.
 
 ## Hub lifetime
 
@@ -67,6 +108,22 @@ after the child is reaped; the executor writes the same record to history.
   subscription, a total deadline, and a cap on concurrent calls.
 * `/` and `/health` never call the executor; `/api/*` degrade to history-only
   and report `executor: "unreachable"` instead of inventing zeroes.
+
+## Deployment prerequisites
+
+The shim is the command's parent, so anything that signals a process **group**
+terminates supervised commands with it:
+
+* The service manager must signal the executor process only: `KillMode=process`
+  under systemd, `killasgroup=false`/`stopasgroup=false` under supervisor, or
+  shims placed in their own scope. A control-group kill reaches every shim the
+  executor started.
+* The executor must not be PID 1 in a container. PID 1 inherits orphaned
+  children, so a signalled init takes the shims — and their commands — with it.
+* `disconnectGraceMs` on the host must exceed the worst-case executor restart,
+  including process start, the state-directory scan and the handshake. A
+  restart that is merely slower than the window is indistinguishable from a
+  lost runner, and its executions settle as `killed`.
 
 ## Wire budget
 

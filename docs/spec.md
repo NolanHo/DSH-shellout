@@ -45,8 +45,11 @@ in place; the structural problem is that execution and UI share a fate.
 - **Non-shell process sources.** MCP servers, language servers, ACP/Codex/Claude subagent CLIs,
   the PTC runtime, and package-manager runs stay where they are. They do not perform process-table
   liveness polling; moving them is a separate decision.
-- **Cross-restart durability.** Executions do not survive a host restart. A runner restart is a
-  failure; executions are reported as lost, never silently adopted.
+- **Cross-host-restart durability.** An execution survives a restart of the process that
+  supervises it: the shim owns the command, and a restarted supervisor re-adopts a live shim from
+  the state directory (see [execution-plane.md](execution-plane.md)). It does not survive a restart
+  of the harness host: a new boot cannot address the previous boot's executions, which are
+  terminated at lease expiry.
 - **Scheduling, containers, remote hosts.** One runner serves one host on one machine.
 - **Windows.** First release targets Linux/macOS POSIX semantics. Windows support is a follow-up.
 
@@ -136,7 +139,7 @@ Methods (all host → runner unless marked event):
 
 | Method | Payload | Reply | Notes |
 |---|---|---|---|
-| `hello` | `{ protocol, clientBuild, bootId, capabilities }` | `{ protocol, runnerBuild, runnerBootId, descriptor, maxFrameBytes, heartbeatMs, leaseTtlMs }` | First frame on every connection. Version mismatch is fatal. |
+| `hello` | `{ protocol, clientBuild, bootId, capabilities }` | `{ protocol, runnerBuild, runnerBootId, descriptor, maxFrameBytes, heartbeatMs, leaseTtlMs, executions }` | First frame on every connection. Version mismatch is fatal. `executions` lists what this boot still owns, with each execution's terminal facts. |
 | `resolve` | `{ request }` | `{ spec }` | Optional: used by diagnostics and tests; the host normally resolves locally. |
 | `exec` | `{ operationId, executionId, spec }` | `{ executionId }` | Idempotent per `operationId`: a repeated `exec` with the same `(operationId, specDigest)` returns the same execution; a different digest is rejected. |
 | `readOutput` | `{ executionId }` | `ShellProcessRead` | Consuming; the runner advances its cursor. |
@@ -146,7 +149,7 @@ Methods (all host → runner unless marked event):
 | `ping` | `{ bootId }` | `{ ok: true }` | Refreshes the boot lease. |
 | `drain` | `{ timeoutMs }` | `{ live: number }` | Stops accepting `exec`; terminates or waits for live executions. |
 | `shutdown` | `{}` | `{}` | Clean stop after drain. |
-| `settled` (event) | `{ executionId, status, exitCode, signal, sandbox?, detail? }` | — | Sent once per execution, after its final output is readable. |
+| `settled` (event) | `{ executionId, status, exitCode, signal, termination?, sandbox?, detail? }` | — | Sent once per execution, after its final output is readable. A settlement nobody was subscribed for is recovered from the `hello` reply. |
 
 Error codes: `protocol`, `version`, `unknown-execution`, `busy`, `rejected` (admission refused),
 `internal`. An `err` frame for a request the host no longer tracks is logged and ignored.
@@ -177,17 +180,23 @@ Ordering: the runner sends `settled` **after** the final output bytes are readab
   boot, verifies each process group is empty, and records the outcome as
   `lost: host boot expired`. A reconnect within the lease resumes the same boot; a reconnect after
   expiry starts a new lease and cannot address the old executions.
-- **Runner crash** → the host settles every live execution as `killed` with a stderr note
-  (`shellout: runner lost`), matching the seam's provider-failure shape. No adoption is attempted:
-  a process-group id you did not spawn is not proof of ownership.
+- **Executor restart** → supervised commands keep running. A replacement executor re-adopts every
+  shim whose recorded start time still matches, and the host reconciles from the handshake: an
+  execution the executor still holds is kept (settling with the real exit code when it ends), and
+  one it no longer holds settles as `killed` with the stderr note `shellout: runner lost`. A
+  process-group id alone is never treated as proof of ownership — only the recorded supervisor
+  identity is.
 - **Protocol/version mismatch** → the host refuses to start and reports an actionable message.
 - **Runner unavailable at startup** → after `connectRetryMs` (default 10 s) the plugin logs one
   warning naming the socket and mounts the stock in-process executor, so the agent keeps a working
   shell. `fallback: 'none'` restores fail-loud behaviour. The fallback is a startup decision and
   is never silent.
 - **Connection lost at runtime** → `disconnectGraceMs` (default 10 s) to recover. A reconnect keeps
-  the executions the runner still holds (reconciled against its handshake list); otherwise they
-  settle as `killed` with the provider note and later commands run in-process until reconnected.
+  the executions the runner still holds (reconciled against its handshake list, which carries each
+  execution's terminal facts so a settlement announced while the host was away is not lost);
+  otherwise they settle as `killed` with the provider note and later commands run in-process until
+  reconnected. The window must exceed the worst-case executor restart, or a merely slow restart is
+  reported as a lost runner.
 - **Concurrency limit** → the runner admits at most `maxConcurrent` executions (default 64) and
   answers `busy` beyond that; the host surfaces it as a preparation failure.
 
@@ -228,7 +237,8 @@ Runner plugin config: `socketPath`, `leaseTtlMs`, `maxConcurrent`, `settleRetent
 | `signal` aborted after publication | The runner kills the group; `result().aborted === true` |
 | Spawn failure (bad cwd, missing exe) | `execute` throws the preparation error |
 | Output exceeds the cap | Non-lossy reads up to the cap; beyond it `lossy: true` plus `spillPath` |
-| Runner dies mid-execution | `done` resolves, `status: 'killed'`, stderr carries `shellout: runner lost` |
+| Executor restarts mid-execution | The command keeps running; the host settles it with its real exit code |
+| Executor is replaced and no longer holds the execution | `done` resolves, `status: 'killed'`, stderr carries `shellout: runner lost` |
 | Host dies mid-execution | Runner terminates the group at lease expiry and records `lost: host boot expired` |
 | Socket reconnect inside lease | Executions continue; host reconciles via `state` and resumes mirroring |
 | Duplicate `exec` (same operation) | One process; same `executionId` returned |

@@ -19,7 +19,10 @@ operating-system work:
 | Deadline | shim enforces `timeoutMs` independently of the executor |
 | Termination | shim sends `SIGTERM` to the group, then `SIGKILL` after `graceMs` |
 | Settlement | atomic `status.json`, retried history write, and one `settled` event |
+| Adoption | a restarted executor re-adopts a live shim and settles it from `status.json` |
 | Leases | a host boot's executions are terminated when its lease expires |
+| Ownership | one executor per state directory, claimed with `flock` on `<state>/.lock` |
+| Retention | a settled execution's directory is deleted once its history row is durable (`--state-retention-ms`, default 15 s) |
 
 The executor holds no sessions, model connection, HTTP surface or harness dependency.
 The separate `--mode hub` owns the dashboard and opens history read-only.
@@ -43,9 +46,14 @@ command=/opt/dsh-shellout/dsh-shellout-runner --socket /srv/dsh/shellout/control
 autostart=true
 autorestart=true
 startsecs=1
-stopasgroup=true
-killasgroup=true
+; The supervisor signals the executor process only. Supervised commands live
+; in shims the executor started; a group signal would kill them with it.
+stopasgroup=false
+killasgroup=false
 ```
+
+[execution-plane.md](execution-plane.md#deployment-prerequisites) owns why the
+group must be left alone and what else the deployment has to guarantee.
 
 ## Parity with the Node runner
 
@@ -58,7 +66,12 @@ isolated wire-level suite without a harness checkout or a running service:
 - executor SIGKILL while a command writes one marker per second; continued
   capture, adoption by the replacement executor, and the real terminal exit code
 - executor SIGTERM leaves the command running
-- mismatched process start times become `lost`
+- a settlement emitted while no host was connected is replayed on reconnect
+- a second executor on the same state directory refuses to start
+- a detached descendant holding a pipe cannot stall settlement
+- a reaped child with a live shim survives an executor restart
+- a spawn failure is answered by the `exec` reply itself
+- mismatched supervisor start times become `lost`
 - read-only hub observation, summary/detail split, percent-decoded IDs, and
   history-only/missing-history degradation
 
