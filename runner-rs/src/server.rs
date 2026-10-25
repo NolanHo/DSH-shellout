@@ -104,7 +104,7 @@ async fn handle_connection(
                 if hello {
                     events = Some(registry.subscribe());
                 }
-                let reply_value = dispatch(envelope, &registry, &config, &mut boot_id, &mut observer, &mut max_frame_bytes);
+                let reply_value = dispatch(envelope, &registry, &config, &mut boot_id, &mut observer, &mut max_frame_bytes).await;
                 if hello {
                     match (&reply_value["kind"], boot_id.as_deref()) {
                         // A settlement decided before this handshake reached no
@@ -134,7 +134,7 @@ async fn handle_connection(
     Ok(())
 }
 
-fn dispatch(
+async fn dispatch(
     envelope: Envelope,
     registry: &Arc<Registry>,
     config: &Config,
@@ -254,9 +254,16 @@ fn dispatch(
                 Ok(request) => request,
                 Err(message) => return error_reply(id, "protocol", &message),
             };
-            match registry.exec(request, &boot) {
-                Ok(value) => reply(id, "exec", value),
-                Err(failure) => error_reply(id, failure.code, &failure.message),
+            // Admission waits for the shim's first report. That wait is file and
+            // process I/O, so it runs on a blocking thread: the runtime keeps
+            // serving other connections while a command starts.
+            let registry = Arc::clone(registry);
+            match tokio::task::spawn_blocking(move || registry.exec(request, &boot)).await {
+                Ok(Ok(value)) => reply(id, "exec", value),
+                Ok(Err(failure)) => error_reply(id, failure.code, &failure.message),
+                Err(error) => {
+                    error_reply(id, "internal", &format!("admission task failed: {error}"))
+                }
             }
         }
         "readStream" => {
@@ -370,8 +377,8 @@ mod tests {
             .unwrap()
     }
 
-    #[test]
-    fn observer_has_no_lease_and_cannot_become_host() {
+    #[tokio::test]
+    async fn observer_has_no_lease_and_cannot_become_host() {
         let registry = Registry::new(8, std::time::Duration::from_secs(10));
         let mut boot = None;
         let mut observer = false;
@@ -384,7 +391,8 @@ mod tests {
             &mut boot,
             &mut observer,
             &mut cap,
-        );
+        )
+        .await;
         assert_eq!(response["kind"], "res");
         assert_eq!(response["method"], "observe");
         assert!(observer);
@@ -401,14 +409,15 @@ mod tests {
             &mut boot,
             &mut observer,
             &mut cap,
-        );
+        )
+        .await;
         assert_eq!(response["kind"], "err");
         assert_eq!(response["method"], "error");
         assert!(boot.is_none());
     }
 
-    #[test]
-    fn host_cannot_observe_and_nonrequests_cannot_dispatch() {
+    #[tokio::test]
+    async fn host_cannot_observe_and_nonrequests_cannot_dispatch() {
         let registry = Registry::new(8, std::time::Duration::from_secs(10));
         let mut boot = Some("host".to_string());
         let mut observer = false;
@@ -421,7 +430,8 @@ mod tests {
                 &mut boot,
                 &mut observer,
                 &mut cap,
-            );
+            )
+            .await;
             assert_eq!(response["kind"], "err");
             assert!(!observer);
         }

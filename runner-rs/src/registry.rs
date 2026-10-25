@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
-use crate::exec::{self, Counters, Execution};
+use crate::exec::{self, Counters, Execution, SpawnOutcome};
 use crate::protocol::ExecRequest;
 use crate::shim::{self, Meta};
 use crate::store::Store;
@@ -28,7 +28,10 @@ impl Failure {
 
 pub struct Registry {
     executions: Mutex<HashMap<String, Arc<Execution>>>,
+    /// Serializes admission decisions without holding a lock across the spawn.
     admission: Mutex<()>,
+    /// Execution ids currently being admitted; they are not in `executions` yet.
+    reservations: Mutex<std::collections::HashSet<String>>,
     boots: Mutex<HashMap<String, Instant>>,
     events: broadcast::Sender<Value>,
     max_concurrent: usize,
@@ -54,6 +57,7 @@ impl Registry {
         Arc::new(Self {
             executions: Mutex::new(HashMap::new()),
             admission: Mutex::new(()),
+            reservations: Mutex::new(std::collections::HashSet::new()),
             boots: Mutex::new(HashMap::new()),
             events,
             max_concurrent,
@@ -93,6 +97,7 @@ impl Registry {
         let registry = Arc::new(Self {
             executions: Mutex::new(HashMap::new()),
             admission: Mutex::new(()),
+            reservations: Mutex::new(std::collections::HashSet::new()),
             boots: Mutex::new(HashMap::new()),
             events,
             max_concurrent,
@@ -291,51 +296,78 @@ impl Registry {
         Ok(())
     }
 
+    /// Admit one execution. The decision is serialized, but the spawn wait is
+    /// not: it holds no lock, so other requests keep flowing while a shim starts.
     pub fn exec(&self, request: ExecRequest, boot: &str) -> Result<Value, Failure> {
-        let _admission = self
-            .admission
-            .lock()
-            .map_err(|_| Failure::new("internal", "admission poisoned"))?;
-        let executions = self
-            .executions
-            .lock()
-            .map_err(|_| Failure::new("internal", "executions poisoned"))?;
-        if let Some(existing) = executions
-            .values()
-            .find(|execution| execution.meta.operation_id == request.operation_id)
+        let id = request.execution_id.clone();
         {
-            if existing.meta.digest != request.spec_digest {
+            let _admission = self
+                .admission
+                .lock()
+                .map_err(|_| Failure::new("internal", "admission poisoned"))?;
+            let executions = self
+                .executions
+                .lock()
+                .map_err(|_| Failure::new("internal", "executions poisoned"))?;
+            if let Some(existing) = executions
+                .values()
+                .find(|execution| execution.meta.operation_id == request.operation_id)
+            {
+                if existing.meta.digest != request.spec_digest {
+                    return Err(Failure::new(
+                        "rejected",
+                        "operation id reused with a different spec",
+                    ));
+                }
+                return Ok(json!({"executionId":existing.meta.id}));
+            }
+            if executions.contains_key(&request.execution_id) {
+                return Err(Failure::new("rejected", "execution id already exists"));
+            }
+            if executions
+                .values()
+                .filter(|execution| execution.running())
+                .count()
+                >= self.max_concurrent
+            {
                 return Err(Failure::new(
                     "rejected",
-                    "operation id reused with a different spec",
+                    "executor concurrent execution limit reached",
                 ));
             }
-            return Ok(json!({"executionId":existing.meta.id}));
+            if !valid_id(&request.execution_id)
+                || request.spec.argv.is_empty()
+                || request.spec.argv[0].is_empty()
+            {
+                return Err(Failure::new(
+                    "rejected",
+                    "invalid execution id or empty argv",
+                ));
+            }
+            if !self
+                .reservations
+                .lock()
+                .map_err(|_| Failure::new("internal", "reservations poisoned"))?
+                .insert(id.clone())
+            {
+                return Err(Failure::new(
+                    "rejected",
+                    "execution id is already being admitted",
+                ));
+            }
         }
-        if executions.contains_key(&request.execution_id) {
-            return Err(Failure::new("rejected", "execution id already exists"));
+        let outcome = self.admit(request, boot);
+        match self.reservations.lock() {
+            Ok(mut reservations) => {
+                reservations.remove(&id);
+            }
+            Err(_) => eprintln!("execution {id}: admission reservation release failed"),
         }
-        if executions
-            .values()
-            .filter(|execution| execution.running())
-            .count()
-            >= self.max_concurrent
-        {
-            return Err(Failure::new(
-                "rejected",
-                "executor concurrent execution limit reached",
-            ));
-        }
-        drop(executions);
-        if !valid_id(&request.execution_id)
-            || request.spec.argv.is_empty()
-            || request.spec.argv[0].is_empty()
-        {
-            return Err(Failure::new(
-                "rejected",
-                "invalid execution id or empty argv",
-            ));
-        }
+        outcome
+    }
+
+    /// The part of admission that owns no lock: spawn, wait, and register.
+    fn admit(&self, request: ExecRequest, boot: &str) -> Result<Value, Failure> {
         let store = self.store.as_ref().ok_or_else(|| {
             Failure::new("history", "history database unavailable; admission refused")
         })?;
@@ -348,14 +380,28 @@ impl Registry {
         };
         // A command that could not be started is a preparation failure, so the
         // reply is an error rather than a handle that fails later.
-        let execution = exec::admit(meta, &self.state_dir, store)
+        let admission = exec::admit(meta, &self.state_dir, store)
             .map_err(|error| Failure::new("rejected", error.to_string()))?;
-        self.counters.spawned.fetch_add(1, Ordering::Relaxed);
-        self.executions
-            .lock()
-            .expect("executions poisoned")
-            .insert(request.execution_id.clone(), execution);
-        Ok(json!({"executionId":request.execution_id}))
+        match admission.outcome {
+            SpawnOutcome::Admitted => {
+                self.counters.spawned.fetch_add(1, Ordering::Relaxed);
+                self.executions
+                    .lock()
+                    .expect("executions poisoned")
+                    .insert(request.execution_id.clone(), admission.execution);
+                Ok(json!({"executionId":request.execution_id}))
+            }
+            SpawnOutcome::Refused(message) => Err(Failure::new("rejected", message)),
+            SpawnOutcome::Undecided(message) => {
+                // The caller was told the spawn failed. The execution is still
+                // tracked so its failure is addressable and settles on its own.
+                self.executions
+                    .lock()
+                    .expect("executions poisoned")
+                    .insert(request.execution_id.clone(), admission.execution);
+                Err(Failure::new("rejected", message))
+            }
+        }
     }
 
     pub fn read_stream(

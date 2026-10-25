@@ -18,6 +18,45 @@ use crate::store::{Record, Store};
 /// A spawn failure is a preparation failure, so it belongs in the exec reply.
 const SPAWN_GRACE: Duration = Duration::from_secs(5);
 
+/// The admission wait, shortened by a test seam so the timeout path is testable
+/// without delaying `execve` for the production five seconds.
+fn spawn_grace() -> Duration {
+    std::env::var("DSH_SHELLOUT_SPAWN_GRACE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map_or(SPAWN_GRACE, Duration::from_millis)
+}
+
+/// What admission decided about one execution.
+pub struct Admission {
+    pub execution: Arc<Execution>,
+    pub outcome: SpawnOutcome,
+}
+
+/// The spawn outcome the `exec` reply and history must agree about.
+pub enum SpawnOutcome {
+    /// The shim reported the command's pid; the execution is live.
+    Admitted,
+    /// The command never started and the execution's files are already gone.
+    Refused(String),
+    /// No spawn outcome arrived in time. The execution is tracked and settles
+    /// asynchronously, and its failure row is already durable.
+    Undecided(String),
+}
+
+/// The binary to run as a shim: the running image, never the path it was
+/// started from. Deployment replaces the file in place, which unlinks the old
+/// inode; `/proc/self/exe` addresses the image this process is already running.
+fn shim_program() -> io::Result<PathBuf> {
+    let proc_self = PathBuf::from("/proc/self/exe");
+    if proc_self.exists() {
+        Ok(proc_self)
+    } else {
+        std::env::current_exe()
+    }
+}
+
 pub struct Execution {
     pub meta: Meta,
     pub dir: PathBuf,
@@ -234,7 +273,7 @@ impl Execution {
     }
 }
 
-pub fn admit(meta: Meta, state: &Path, store: &Store) -> io::Result<Arc<Execution>> {
+pub fn admit(meta: Meta, state: &Path, store: &Store) -> io::Result<Admission> {
     let dir = state.join(&meta.id);
     fs::create_dir(&dir)?;
     shim::atomic_json(&dir.join("meta.json"), &meta)?;
@@ -256,7 +295,11 @@ pub fn admit(meta: Meta, state: &Path, store: &Store) -> io::Result<Arc<Executio
             "history admission write failed: {error}"
         )));
     }
-    let mut command = Command::new(std::env::current_exe()?);
+    // The executor owns the spawn outcome unless a shim claimed it first. The
+    // claim must exist before the shim starts, so a shim that runs late cannot
+    // race the decision the caller was already given.
+    let arbitration = shim::claim_spawn(&execution.dir, "executor")?;
+    let mut command = Command::new(shim_program()?);
     command
         .arg("--mode")
         .arg("shim")
@@ -277,20 +320,23 @@ pub fn admit(meta: Meta, state: &Path, store: &Store) -> io::Result<Arc<Executio
             }
         });
     }
-    match command.spawn() {
-        Ok(mut child) => {
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-        }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
         Err(error) => {
             let message = persist_failure(&execution, store, &error.to_string());
             let _ = fs::remove_dir_all(&execution.dir);
-            return Err(io::Error::other(message));
+            return Ok(Admission {
+                execution,
+                outcome: SpawnOutcome::Refused(message),
+            });
         }
-    }
-    execution.await_spawn(store)?;
-    Ok(execution)
+    };
+    let outcome = execution.await_spawn(store, arbitration)?;
+    // The shim outlives admission: reap it without holding the caller.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(Admission { execution, outcome })
 }
 
 /// Record a shim that never started as a settled failure, then report it.
@@ -312,9 +358,15 @@ fn persist_failure(execution: &Execution, store: &Store, error: &str) -> String 
 impl Execution {
     /// The command is spawned by the shim, so the admission result is the
     /// shim's report: a recorded pid, or why it could not start one.
-    fn await_spawn(&self, store: &Store) -> io::Result<()> {
+    ///
+    /// When the shim reports its identity the executor releases the spawn with
+    /// the one decision it owns; when no outcome arrives in time, the command is
+    /// refused or stopped and the execution keeps a terminal history row.
+    fn await_spawn(&self, store: &Store, arbitration: bool) -> io::Result<SpawnOutcome> {
         let path = self.dir.join("status.json");
-        let deadline = Instant::now() + SPAWN_GRACE;
+        let grace = spawn_grace();
+        let mut deadline = Instant::now() + grace;
+        let mut authorized = false;
         loop {
             match shim::read_json::<Status>(&path) {
                 Ok(status) => {
@@ -325,20 +377,37 @@ impl Execution {
                             status.spawn_error.as_deref().unwrap_or("spawn failed"),
                         );
                         let _ = fs::remove_dir_all(&self.dir);
-                        return Err(io::Error::other(message));
+                        return Ok(SpawnOutcome::Refused(message));
                     }
                     if status.pid.is_some() {
-                        return Ok(());
+                        return Ok(SpawnOutcome::Admitted);
+                    }
+                    if arbitration && status.shim_pid != 0 && !authorized {
+                        // The shim is alive and waiting for the one decision we
+                        // own; the command may start. It gets its own window to
+                        // report a pid or a spawn failure.
+                        shim::decide_spawn(&self.dir, shim::VERDICT_GO)?;
+                        authorized = true;
+                        deadline = Instant::now() + grace;
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => eprintln!("execution {}: status read failed: {error}", self.meta.id),
             }
             if Instant::now() >= deadline {
-                // Nothing is known about the command; make sure it cannot keep
-                // running unattended while the caller is told admission failed.
-                let _ = fs::write(self.dir.join("kill.request"), shim::TERMINATION_REQUEST);
-                return Err(io::Error::other("the shim did not report a spawn outcome"));
+                let message = "the shim did not report a spawn outcome";
+                if arbitration && !authorized {
+                    // Nothing was authorized, so no command can start. The
+                    // durable refusal also stops a shim that starts even later.
+                    shim::decide_spawn(&self.dir, shim::VERDICT_FAIL)?;
+                } else {
+                    // A live shim may have started the command; ask it to stop.
+                    let _ = fs::write(self.dir.join("kill.request"), shim::TERMINATION_REQUEST);
+                }
+                persist_failure(self, store, message);
+                // Keep the execution: the caller was told the spawn failed, and
+                // the failure must stay addressable and settle on its own.
+                return Ok(SpawnOutcome::Undecided(message.into()));
             }
             std::thread::sleep(Duration::from_millis(5));
         }

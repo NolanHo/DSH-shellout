@@ -172,6 +172,52 @@ fn environment_values_are_cleared_once_the_execution_settled() {
     assert_eq!(meta["cwd"], json!(scratch.root));
 }
 
+/// The executor creates the spawn claim before it starts the shim and decides
+/// the outcome; a shim that starts late must honour that decision instead of
+/// running a command the caller was told was rejected.
+#[test]
+fn a_shim_does_not_run_a_command_the_executor_rejected() {
+    let scratch = Scratch::new("rejected-spawn");
+    let state = scratch.state();
+    write_meta(
+        &state,
+        "rejected",
+        json!({
+            "argv": ["/bin/sh", "-c", "echo ran > ran.marker"],
+            "cwd": scratch.root,
+            "env": {"PATH": "/usr/bin:/bin"},
+            "timeoutMs": 10_000,
+            "onExpiry": "kill",
+            "graceMs": 100,
+            "capture": {"stdoutMaxBytes": 64_000, "stderrMaxBytes": 64_000,
+                "spillMaxBytes": 1_048_576, "spillDir": "/tmp"},
+        }),
+    );
+    let dir = state.join("rejected");
+    std::fs::create_dir_all(&dir).expect("execution directory");
+    // What the executor leaves behind when its admission wait expires.
+    std::fs::write(dir.join("spawn.claim"), b"executor").expect("claim");
+    std::fs::write(dir.join("spawn.verdict"), b"fail").expect("verdict");
+
+    let mut shim = spawn_shim(&state, "rejected");
+    assert!(
+        !shim.wait().expect("shim exits").success(),
+        "a refused spawn exits non-zero"
+    );
+    assert!(
+        !scratch.root.join("ran.marker").exists(),
+        "a rejected spawn must never run its command"
+    );
+    let status = read_json(&dir.join("status.json"));
+    assert_eq!(status["state"], "failed");
+    assert!(
+        status["spawnError"]
+            .as_str()
+            .is_some_and(|error| error.contains("refused")),
+        "the shim records why the command never started: {status}"
+    );
+}
+
 #[test]
 fn a_termination_request_records_the_party_that_asked() {
     let scratch = Scratch::new("term");

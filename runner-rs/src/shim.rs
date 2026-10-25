@@ -132,6 +132,89 @@ pub fn matches_process(pid: i32, start: u64) -> bool {
 /// has no recorded supervisor to verify, so it is neither live nor lost.
 pub const STARTUP_GRACE_MS: u64 = 10_000;
 
+/// Exactly one party arbitrates a spawn outcome. This file records which one:
+/// the executor creates it before it starts the shim; a shim that starts without
+/// it found the executor gone and arbitrates itself.
+pub const SPAWN_CLAIM: &str = "spawn.claim";
+/// The arbiter's one decision: may the command start, or may it not?
+pub const SPAWN_VERDICT: &str = "spawn.verdict";
+/// The command may start.
+pub const VERDICT_GO: &str = "go";
+/// The command must never start.
+pub const VERDICT_FAIL: &str = "fail";
+/// How long a claimed shim waits for the executor's decision before refusing.
+const VERDICT_GRACE: Duration = Duration::from_secs(60);
+
+/// Take the spawn claim. `true` when this caller created it, `false` when some
+/// other party got there first and therefore owns the decision.
+pub fn claim_spawn(dir: &Path, owner: &str) -> io::Result<bool> {
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dir.join(SPAWN_CLAIM))
+    {
+        Ok(mut file) => {
+            file.write_all(owner.as_bytes())?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Publish the arbiter's decision, atomically so a reader never sees a torn one.
+pub fn decide_spawn(dir: &Path, verdict: &str) -> io::Result<()> {
+    let path = dir.join(SPAWN_VERDICT);
+    let temp = path.with_extension("tmp");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temp)?;
+    file.write_all(verdict.as_bytes())?;
+    file.sync_all()?;
+    fs::rename(temp, path)
+}
+
+/// The published decision, once the arbiter wrote one.
+pub fn spawn_verdict(dir: &Path) -> Option<String> {
+    let text = fs::read_to_string(dir.join(SPAWN_VERDICT)).ok()?;
+    Some(text.trim().to_string())
+}
+
+/// Wait for the executor that claimed this spawn to decide.
+///
+/// @param dir - execution directory holding the claim.
+/// @param timeout - bound on waiting, so a dead arbiter cannot wedge the shim.
+/// @returns `Ok(())` when the command may start, `Err(reason)` when it may not.
+fn await_decision(dir: &Path, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match spawn_verdict(dir).as_deref() {
+            Some(VERDICT_GO) => return Ok(()),
+            Some(VERDICT_FAIL) => return Err("the executor refused this spawn".into()),
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            return Err("the executor never decided this spawn".into());
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Test seam: hold the shim before its first act so an admission timeout can be
+/// exercised without instrumenting `execve`.
+fn start_delay() {
+    if let Some(millis) = std::env::var("DSH_SHELLOUT_SHIM_START_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        thread::sleep(Duration::from_millis(millis));
+    }
+}
+
 /// The supervisor owns the command's lifetime, so an execution is live exactly
 /// while its shim is: the shim may already have reaped the direct child and
 /// still be terminating the group and draining the capture pipes.
@@ -296,10 +379,27 @@ pub fn run(state: &Path, id: &str) -> io::Result<()> {
         termination: None,
         spawn_error: None,
     };
+    // Test seam: a late start exercises the executor's admission timeout.
+    start_delay();
+    // Exactly one arbiter decides whether this command may start. A claim that
+    // already exists belongs to the executor that spawned this shim.
+    let claimed = claim_spawn(&dir, "shim")?;
     // First act, before any child exists: the executor can tell a starting
-    // shim from a dead one by this record alone.
+    // shim from a dead one by this record alone and answers it with the decision.
     atomic_json(&dir.join("status.json"), &status)?;
-    let result = supervise(&dir, &meta.spec, &mut status);
+    let decision = if claimed {
+        Ok(())
+    } else {
+        await_decision(&dir, VERDICT_GRACE)
+    };
+    if let Err(refusal) = &decision {
+        // The command was never started, so its absence is a spawn failure.
+        status.spawn_error = Some(refusal.clone());
+    }
+    let result = match decision {
+        Ok(()) => supervise(&dir, &meta.spec, &mut status),
+        Err(refusal) => Err(io::Error::other(refusal)),
+    };
     if let Err(error) = &result {
         status.state = "failed".into();
         status.error = Some(error.to_string());

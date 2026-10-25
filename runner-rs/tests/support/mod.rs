@@ -62,9 +62,20 @@ impl Executor {
     }
 
     pub fn start_named(scratch: &Scratch, name: &str, extra: &[&str]) -> Self {
+        Self::start_full(scratch, name, Path::new(BINARY), extra, &[])
+    }
+
+    /// Start from a specific binary image and with extra environment entries.
+    pub fn start_full(
+        scratch: &Scratch,
+        name: &str,
+        binary: &Path,
+        extra: &[&str],
+        envs: &[(&str, &str)],
+    ) -> Self {
         let stderr = scratch.root.join(format!("{name}.stderr"));
         let file = std::fs::File::create(&stderr).expect("stderr file");
-        let mut command = Command::new(BINARY);
+        let mut command = Command::new(binary);
         command
             .arg("--state")
             .arg(scratch.state())
@@ -75,6 +86,7 @@ impl Executor {
             .arg("--lease-ttl-ms")
             .arg("60000")
             .args(extra)
+            .envs(envs.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(file));
