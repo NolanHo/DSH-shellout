@@ -482,6 +482,30 @@ impl Execution {
     }
 }
 
+#[cfg(test)]
+mod private_file_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    /// The spill file is narrowed; the directory the caller named is not.
+    #[test]
+    fn narrowing_a_spill_leaves_its_directory_alone() {
+        let root = std::env::temp_dir().join(format!("dsh-spill-mode-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&root);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let file = root.join("probe.log");
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        super::private_file(&file);
+
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&file), 0o600, "the capture is owner-only");
+        assert_eq!(mode(&root), 0o755, "the caller's directory is untouched");
+        let _ = std::fs::remove_file(&file);
+    }
+}
+
 /// Copy a capture into the spill directory atomically.
 ///
 /// The destination is written beside the target under a temporary name and

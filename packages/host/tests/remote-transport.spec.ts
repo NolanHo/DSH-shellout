@@ -36,7 +36,7 @@ describe('remote transport selection', () => {
       kind: 'command',
       argv: [
         'dsh-shellout-runner', '--mode', 'attach', '--host', 'worker-1',
-        '--ssh', 'ssh -J jump',
+        '--ssh', 'ssh', '--ssh', '-J', '--ssh', 'jump',
         '--remote-root', '/tmp/state',
       ],
     })

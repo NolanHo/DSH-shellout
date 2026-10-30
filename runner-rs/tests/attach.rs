@@ -22,7 +22,16 @@ use support::Scratch;
 fn controller() -> Option<PathBuf> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("target/x86_64-unknown-linux-musl/release/dsh-shellout-runner");
-    path.exists().then_some(path)
+    if path.exists() {
+        return Some(path);
+    }
+    // A silently skipped remote test looks exactly like a passing one, so the
+    // gate sets this to refuse that trade instead of accepting it.
+    assert!(
+        std::env::var_os("DSH_REQUIRE_STATIC").is_none(),
+        "the static controller is missing: run scripts/build-static.sh"
+    );
+    None
 }
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -142,7 +142,7 @@ function transportFor(config: ShelloutConfig, socketPath: string): TransportOpti
   const remote = config.remote
   if (remote === undefined) return { kind: 'socket', path: socketPath }
   const argv = [remote.runner ?? 'dsh-shellout-runner', '--mode', 'attach', '--host', remote.host]
-  if (remote.ssh !== undefined) argv.push('--ssh', remote.ssh.join(' '))
+  for (const word of remote.ssh ?? []) argv.push('--ssh', word)
   if (remote.remoteRoot !== undefined) argv.push('--remote-root', remote.remoteRoot)
   return { kind: 'command', argv }
 }

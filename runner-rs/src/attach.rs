@@ -103,7 +103,19 @@ fn probe_script(version: &str, arch: &str) -> String {
          printf 'system %s\\n' \"$(uname -s)\"\n\
          printf 'machine %s\\n' \"$(uname -m)\"\n\
          printf 'home %s\\n' \"$HOME\"\n\
-         test -w \"$HOME\" || root=\"/tmp/dsh-shellout-$(id -u)\"\n\
+         if ! test -w \"$HOME\"; then\n\
+           root=\"/tmp/dsh-shellout-$(id -u)\"\n\
+           if [ -e \"$root\" ] && {{ [ ! -O \"$root\" ] || [ -L \"$root\" ]; }}; then\n\
+             printf 'root unsafe\\n'\n\
+             printf 'root %s\\n' \"$root\"\n\
+             printf 'system %s\\n' \"$(uname -s)\"\n\
+             printf 'machine %s\\n' \"$(uname -m)\"\n\
+             printf 'home %s\\n' \"$HOME\"\n\
+             printf 'binary missing\\n'\n\
+             printf 'digest missing\\n'\n\
+             exit 0\n\
+           fi\n\
+         fi\n\
          printf 'root %s\\n' \"$root\"\n\
          binary=\"$root/bin/{version}-{arch}/runner\"\n\
          if [ -x \"$binary\" ]; then printf 'binary %s\\n' \"$binary\"; else printf 'binary missing\\n'; fi\n\
@@ -313,6 +325,13 @@ pub async fn attach(target: Target, version: &str) -> io::Result<()> {
         return Err(io::Error::other(format!(
             "cannot probe {}: exit {}: {}{}",
             target.host, probe.code, probe.stdout, probe.stderr
+        )));
+    }
+    if probe.stdout.lines().any(|line| line == "root unsafe") {
+        return Err(io::Error::other(format!(
+            "{}: the fallback state root under /tmp is not owned by the ssh account, so a pushed \
+             binary there would not be private",
+            target.host
         )));
     }
     let remote = parse_probe(&probe.stdout)?;
