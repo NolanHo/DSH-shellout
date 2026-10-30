@@ -414,3 +414,60 @@ fn a_late_attach_can_read_the_hosts_history() {
     assert_eq!(row["state"], "exited", "{row}");
     assert_eq!(row["exitCode"], 0, "{row}");
 }
+
+/// `--remote-root` must be the root the probe looks in, or the cache never hits
+/// and every attach re-pushes three megabytes.
+#[test]
+fn a_named_root_is_the_one_the_cache_uses() {
+    let Some(_controller) = controller() else {
+        eprintln!("skipped: run scripts/build-static.sh to provide the static controller");
+        return;
+    };
+    let scratch = Scratch::new("attach-root-cache");
+    let root = remote_root(&scratch);
+    let binary = root
+        .join("bin")
+        .join(format!("{VERSION}-x86_64"))
+        .join("runner");
+
+    {
+        let mut first = Attached::start(&scratch, &root);
+        let hello = first.request(
+            "hello",
+            json!({ "protocol": "2.0", "clientBuild": "test", "bootId": "boot-root-1" }),
+        );
+        assert_eq!(hello["kind"], "res", "{hello}");
+        first.request(
+            "exec",
+            json!({ "operationId": "op-root-1", "executionId": "root-1", "specDigest": "d", "spec": spec("true") }),
+        );
+        let _ = first.settled("root-1");
+    }
+    let first_write = std::fs::metadata(&binary)
+        .expect("pushed once")
+        .modified()
+        .expect("mtime");
+    std::thread::sleep(Duration::from_millis(1100));
+
+    let mut second = Attached::start(&scratch, &root);
+    let hello = second.request(
+        "hello",
+        json!({ "protocol": "2.0", "clientBuild": "test", "bootId": "boot-root-2" }),
+    );
+    assert_eq!(hello["kind"], "res", "{hello}");
+    second.request(
+        "exec",
+        json!({ "operationId": "op-root-2", "executionId": "root-2", "specDigest": "d", "spec": spec("printf 'again\\n'") }),
+    );
+    let settled = second.settled("root-2");
+    assert_eq!(settled["exitCode"], 0, "{settled}");
+
+    let second_write = std::fs::metadata(&binary)
+        .expect("still there")
+        .modified()
+        .expect("mtime");
+    assert_eq!(
+        first_write, second_write,
+        "the cache is keyed by the named root"
+    );
+}

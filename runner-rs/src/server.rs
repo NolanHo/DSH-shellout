@@ -358,7 +358,9 @@ async fn dispatch(
                 .get("limit")
                 .and_then(Value::as_u64)
                 .unwrap_or(50) as usize;
-            let limit = limit.clamp(1, 500);
+            // One cap, in the store: asking for more than it keeps would look
+            // like a short answer rather than a bounded one.
+            let limit = limit.clamp(1, 50);
             match registry.history(limit) {
                 Ok(value) => reply(id, "history", value),
                 Err(failure) => error_reply(id, failure.code, &failure.message),
