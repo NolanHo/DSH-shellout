@@ -515,6 +515,21 @@ impl Registry {
         )
     }
 
+    /// Recent settlements, newest first.
+    ///
+    /// A controller attaching to a remote host needs its history, not just the
+    /// settlements that happened while it was listening.
+    pub fn history(&self, limit: usize) -> Result<Value, Failure> {
+        let store = self
+            .store
+            .clone()
+            .ok_or_else(|| Failure::new("history", "no history store"))?;
+        let rows = store
+            .recent(limit)
+            .map_err(|error| Failure::new("history", error))?;
+        Ok(json!({ "rows": rows }))
+    }
+
     pub fn state(&self, id: &str) -> Result<Value, Failure> {
         // Reflect a settlement the poller has not reached yet.
         self.poll();

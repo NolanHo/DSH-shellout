@@ -352,6 +352,18 @@ async fn dispatch(
             }
         }
         "snapshot" => bounded_snapshot(id, "snapshot", registry.snapshot(), *max_frame_bytes),
+        "history" => {
+            let limit = envelope
+                .payload
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(50) as usize;
+            let limit = limit.clamp(1, 500);
+            match registry.history(limit) {
+                Ok(value) => reply(id, "history", value),
+                Err(failure) => error_reply(id, failure.code, &failure.message),
+            }
+        }
         "state" => {
             let request: ExecutionRef = match serde_json::from_value(envelope.payload) {
                 Ok(request) => request,

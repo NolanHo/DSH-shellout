@@ -110,6 +110,11 @@ makes the whole sequence testable without an sshd: `scripts/fake-remote.sh`
 executes the remote command locally, and `tests/attach.rs` drives the real
 binary through it.
 
+The protocol answers `history { limit }` with the host's recent settlements, so
+a controller that attaches after the fact still sees what ran there. The rows
+live with the host — that is where the state directory and the shim facts are —
+and a dashboard merges them by asking each attached host.
+
 ## Bootstrap protocol
 
 Attach performs, in order, each step separately diagnosable:

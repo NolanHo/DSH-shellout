@@ -338,3 +338,40 @@ fn a_killed_remote_executor_is_adopted_and_still_reports_the_real_exit_code() {
     );
     assert_eq!(row.1, Some(7), "{row:?}");
 }
+
+/// A controller that attaches later still gets the host's settlements: the
+/// history lives with the host, so the protocol has to return it.
+#[test]
+fn a_late_attach_can_read_the_hosts_history() {
+    let scratch = Scratch::new("attach-history");
+    let remote_root = remote_root(&scratch);
+
+    let mut first = Attached::start(&scratch, &remote_root);
+    let hello = first.request(
+        "hello",
+        json!({ "protocol": "2.0", "clientBuild": "test", "bootId": "boot-history-1" }),
+    );
+    assert_eq!(hello["kind"], "res", "{hello}");
+    first.request(
+        "exec",
+        json!({ "operationId": "op-history", "executionId": "history-1", "specDigest": "d", "spec": spec("printf 'kept\\n'") }),
+    );
+    let _ = first.settled("history-1");
+    drop(first);
+
+    let mut second = Attached::start(&scratch, &remote_root);
+    let hello = second.request(
+        "hello",
+        json!({ "protocol": "2.0", "clientBuild": "test", "bootId": "boot-history-2" }),
+    );
+    assert_eq!(hello["kind"], "res", "{hello}");
+    let history = second.request("history", json!({ "limit": 10 }));
+    assert_eq!(history["kind"], "res", "{history}");
+    let rows = history["payload"]["rows"].as_array().expect("rows");
+    let row = rows
+        .iter()
+        .find(|row| row["id"] == "history-1")
+        .unwrap_or_else(|| panic!("history-1 in {history}"));
+    assert_eq!(row["state"], "exited", "{row}");
+    assert_eq!(row["exitCode"], 0, "{row}");
+}
