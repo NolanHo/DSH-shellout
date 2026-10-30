@@ -47,7 +47,9 @@ Only (1) and (2) are defects in the sense of "works here, not there"; (3) and
 - **One artifact for every host.** `scripts/build-static.sh` produces a
   `static-pie` musl binary (~3 MB) with `zig` as the C toolchain for vendored
   SQLite, so no system package is needed to build it and no libc is needed to
-  run it. The same file serves the local plane and every remote host.
+  run it. The same file serves the local plane and every remote host, and attach
+  refuses to push a controller that carries a `PT_INTERP` segment: a glibc build
+  would reproduce exactly the failure this plane exists to avoid.
 - **The binary travels over the channel it will use.** The first attach pushes
   the bytes through the same ssh connection (`cat > …`), verifies `sha256`, and
   renames into place. No release host, no egress requirement, no version skew
@@ -121,8 +123,8 @@ Attach performs, in order, each step separately diagnosable:
 
 1. `uname -sm` → `linux-x86_64` / `linux-aarch64`; anything else is a clear
    refusal, never a silent fallback.
-2. Probe the state root: `$DSH_SHELLOUT_HOME`, else `~/.dsh-shellout`, else
-   `/tmp/dsh-shellout-<uid>` when the home is read-only.
+2. Probe the state root: `$DSH_SHELLOUT_HOME` on the host, else
+   `~/.dsh-shellout`, else `/tmp/dsh-shellout-<uid>` when the home is read-only.
 3. Probe executability: run the cached binary with `--mode status`; a `noexec`
    mount or a wrong arch shows up here rather than at the first real command.
 4. If the cached version does not answer, push the local static binary, verify
@@ -137,8 +139,8 @@ failed instead of "worker died".
 | Condition | Behaviour |
 |---|---|
 | No `/proc` (unusual containers) | adoption cannot verify identity; executions settle from `status.json` but are never adopted — reported as `lost` on attach |
-| Read-only home | state root moves to `/tmp/dsh-shellout-<uid>` (0700, sticky parent); history warns it is not durable across reboot |
-| `noexec` home | detected at the probe; state root falls back to `/tmp` with the same warning |
+| Read-only home | state root moves to `/tmp/dsh-shellout-<uid>` (0700; the parent is sticky), and history there is not durable across a reboot |
+| `noexec` home | the push lands and `--mode status` fails to execute, which is reported with the host's own error; there is no silent fallback to `/tmp` |
 | No `sha256sum`/`shasum` | attach refuses: an unverified binary is not executed |
 | Non-Linux remote | refused with the detected platform, by design |
 

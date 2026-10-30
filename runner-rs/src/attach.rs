@@ -85,13 +85,17 @@ async fn run(
 }
 
 /// Probe the remote host: platform, home, and whether our binary is there.
-fn probe_script(version: &str, arch: &str) -> String {
+fn probe_script(version: &str, arch: &str, requested_root: Option<&str>) -> String {
+    let root_line = requested_root
+        .map(|root| format!("root={root}\n"))
+        .unwrap_or_default();
     format!(
         "set -eu\n\
+         {root_line}\
          printf 'system %s\\n' \"$(uname -s)\"\n\
          printf 'machine %s\\n' \"$(uname -m)\"\n\
          printf 'home %s\\n' \"$HOME\"\n\
-         root=\"$HOME/.dsh-shellout\"\n\
+         root=\"${{DSH_SHELLOUT_HOME:-$HOME/.dsh-shellout}}\"\n\
          test -w \"$HOME\" || root=\"/tmp/dsh-shellout-$(id -u)\"\n\
          printf 'root %s\\n' \"$root\"\n\
          binary=\"$root/bin/{version}-{arch}/runner\"\n\
@@ -140,6 +144,41 @@ fn parse_probe(stdout: &str) -> io::Result<Remote> {
     })
 }
 
+/// Whether the bytes are a statically linked executable.
+///
+/// A glibc build reproduces exactly the failure this plane exists to avoid: the
+/// host reports a loader error instead of running. Look for a `PT_INTERP`
+/// segment, which only a dynamically linked executable carries.
+fn is_static_executable(bytes: &[u8]) -> bool {
+    if bytes.len() < 64 || &bytes[..4] != b"\x7fELF" || bytes[4] != 2 {
+        return false;
+    }
+    let read_u64 = |offset: usize| -> Option<u64> {
+        let slice = bytes.get(offset..offset + 8)?;
+        Some(u64::from_le_bytes(slice.try_into().ok()?))
+    };
+    let read_u16 = |offset: usize| -> Option<u16> {
+        let slice = bytes.get(offset..offset + 2)?;
+        Some(u16::from_le_bytes(slice.try_into().ok()?))
+    };
+    let (Some(phoff), Some(phentsize), Some(phnum)) = (read_u64(32), read_u16(54), read_u16(56))
+    else {
+        return false;
+    };
+    for index in 0..u64::from(phnum) {
+        let start = match usize::try_from(phoff + index * u64::from(phentsize)) {
+            Ok(start) => start,
+            Err(_) => return false,
+        };
+        match read_u64(start) {
+            Some(3) => return false,
+            Some(_) => {}
+            None => return false,
+        }
+    }
+    true
+}
+
 /// Whether the host needs this build pushed at all.
 fn needs_push(remote: &Remote) -> bool {
     remote.binary.is_none()
@@ -148,6 +187,12 @@ fn needs_push(remote: &Remote) -> bool {
 /// Push this build's binary to the remote path.
 async fn push(target: &Target, remote: &Remote, destination: &str) -> io::Result<()> {
     let bytes = std::fs::read(std::env::current_exe()?)?;
+    if !is_static_executable(&bytes) {
+        return Err(io::Error::other(
+            "the controller binary is not statically linked: build it with scripts/build-static.sh so \
+             the host does not need a matching libc",
+        ));
+    }
     let digest = sha256_hex(&bytes);
     let directory = PathBuf::from(destination)
         .parent()
@@ -159,19 +204,34 @@ async fn push(target: &Target, remote: &Remote, destination: &str) -> io::Result
     } else {
         "sha256sum -c - >/dev/null"
     };
+    // Values travel as arguments, never interpolated into the script: the path
+    // comes from the host's own `$HOME` and a single quote in it would otherwise
+    // end the quoting and run whatever follows.
     let script = format!(
         "set -eu\n\
-         mkdir -p '{directory}'\n\
          umask 077\n\
-         cat > '{destination}.incoming'\n\
-         chmod 700 '{destination}.incoming'\n\
-         printf '%s  %s\\n' '{digest}' '{destination}.incoming' | {verify}\n\
-         mv '{destination}.incoming' '{destination}'\n\
-         printf 'pushed %s\\n' '{destination}'\n"
+         mkdir -p \"$1\"\n\
+         chmod 700 \"$1\"\n\
+         cat > \"$2\"\n\
+         chmod 700 \"$2\"\n\
+         printf '%s  %s\\n' \"$3\" \"$2\" | {verify}\n\
+         chmod 700 \"$1/$(basename \"$2\")\" 2>/dev/null || true\n\
+         mv \"$2\" \"$4\"\n\
+         printf 'pushed %s\\n' \"$4\"\n"
     );
+    let incoming = format!("{destination}.incoming.{}", std::process::id());
     let result = run(
         target,
-        &["sh".to_string(), "-c".to_string(), script],
+        &[
+            "sh".to_string(),
+            "-c".to_string(),
+            script,
+            "sh".to_string(),
+            directory,
+            incoming,
+            digest,
+            destination.to_string(),
+        ],
         Some(bytes),
     )
     .await?;
@@ -225,7 +285,7 @@ pub async fn attach(target: Target, version: &str) -> io::Result<()> {
         &[
             "sh".to_string(),
             "-c".to_string(),
-            probe_script(version, arch),
+            probe_script(version, arch, target.root.as_deref()),
         ],
         None,
     )
@@ -322,7 +382,14 @@ async fn bridge(child: &mut Child) -> io::Result<()> {
         Ok::<(), io::Error>(())
     };
     let _ = tokio::try_join!(upstream, downstream);
-    let _ = child.wait().await;
+    let status = child.wait().await?;
+    // A remote executor that refuses to start (bad socket path, refused lock,
+    // loader error) must not look like a clean end of session.
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "the remote executor exited with {status}"
+        )));
+    }
     Ok(())
 }
 

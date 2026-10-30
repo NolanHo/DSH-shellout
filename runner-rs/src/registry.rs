@@ -26,6 +26,12 @@ impl Failure {
     }
 }
 
+/// Make a directory readable only by its owner.
+fn private(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+}
+
 pub struct Registry {
     executions: Mutex<HashMap<String, Arc<Execution>>>,
     /// Serializes admission decisions without holding a lock across the spawn.
@@ -126,6 +132,7 @@ impl Registry {
         spill_budget: u64,
     ) -> std::io::Result<Arc<Self>> {
         std::fs::create_dir_all(&state_dir)?;
+        private(&state_dir);
         let (events, _) = broadcast::channel(1024);
         let registry = Arc::new(Self {
             executions: Mutex::new(HashMap::new()),

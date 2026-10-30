@@ -25,6 +25,10 @@ impl StateLock {
     /// @throws when another live process holds the claim.
     pub fn acquire(state: &Path) -> io::Result<Self> {
         std::fs::create_dir_all(state)?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(state, std::fs::Permissions::from_mode(0o700));
+        }
         let path = state.join(".lock");
         let file = OpenOptions::new()
             .read(true)

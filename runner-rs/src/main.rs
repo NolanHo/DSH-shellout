@@ -161,7 +161,20 @@ fn main() -> std::io::Result<()> {
             }
             // One executor owns a state directory. Take the claim before the
             // socket is unlinked, so a refused start leaves the live one intact.
-            let _claim = lock::StateLock::acquire(&paths.state)?;
+            // A second session may start while the first is still building its
+            // registry and has not bound the socket yet; retry the bridge before
+            // declaring the state root owned.
+            let mut claim = lock::StateLock::acquire(&paths.state);
+            if claim.is_err() && stdio_mode {
+                for _ in 0..40 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    if stdio::bridge(std::path::Path::new(&paths.socket)).await? {
+                        return Ok(());
+                    }
+                }
+                claim = lock::StateLock::acquire(&paths.state);
+            }
+            let _claim = claim?;
             let cwd = arg_value("--cwd").unwrap_or(std::env::current_dir()?.display().to_string());
             let config = server::Config {
                 socket_path: paths.socket.clone(),

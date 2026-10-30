@@ -305,7 +305,7 @@ impl Execution {
                 }
             }
             if let Some(parent) = target.parent() {
-                if let Err(error) = fs::create_dir_all(parent) {
+                if let Err(error) = private_dir(parent) {
                     eprintln!(
                         "execution {}: cannot create the spill directory: {error}",
                         self.meta.id
@@ -699,6 +699,13 @@ fn needs_persist(store: Option<&Store>, id: &str, status: &Status) -> bool {
             true
         }
     }
+}
+
+/// Create a directory readable only by its owner.
+fn private_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
 }
 
 pub fn load(dir: PathBuf, store: Option<&Store>) -> io::Result<Arc<Execution>> {
