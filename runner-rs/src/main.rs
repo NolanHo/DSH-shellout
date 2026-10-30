@@ -3,6 +3,7 @@ mod capture;
 mod dashboard;
 mod exec;
 mod hub;
+mod inspect;
 mod legacy;
 mod lock;
 mod protocol;
@@ -95,6 +96,11 @@ fn main() -> std::io::Result<()> {
     }
     let paths = Paths::resolve();
     let mode = arg_value("--mode").unwrap_or_else(|| "executor".into());
+    if mode == "status" {
+        // Operator view: which executor owns this state directory and what it
+        // is running, read from files rather than from process scanning.
+        std::process::exit(inspect::status(&paths.state, arg_present("--json")));
+    }
     if mode == "shim" {
         let id = arg_value("--id").ok_or_else(|| std::io::Error::other("shim requires --id"))?;
         return shim::run(&paths.state, &id);
@@ -143,7 +149,7 @@ fn main() -> std::io::Result<()> {
                 config.max_concurrent,
                 Duration::from_millis(config.lease_ttl_ms),
                 store,
-                paths.state,
+                paths.state.clone(),
                 Duration::from_millis(arg_number(
                     "--state-retention-ms",
                     registry::DEFAULT_STATE_RETENTION.as_millis() as u64,
@@ -159,11 +165,17 @@ fn main() -> std::io::Result<()> {
                 env!("CARGO_PKG_VERSION"),
                 paths.socket
             );
-            tokio::select! {
-                result = server::serve(config,registry) => result,
+            // Publish identity so operators and scripts can find this process
+            // by what it wrote rather than by a pgrep pattern that also matches
+            // the shell running the query.
+            inspect::publish(&paths.state, &paths.socket)?;
+            let outcome = tokio::select! {
+                result = server::serve(config, registry) => result,
                 // Dropping the listener/runtime leaves detached shims and commands untouched.
                 _ = shutdown_signal() => Ok(()),
-            }
+            };
+            inspect::withdraw(&paths.state);
+            outcome
         })
 }
 

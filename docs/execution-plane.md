@@ -237,3 +237,31 @@ and hub statistics expose `historyWritable` and `historyError`. When the executo
 is unavailable, counters are absent rather than zero and `executor` is
 `unreachable`; missing/unreadable history yields `history: unavailable` and a
 minimal page instead of a hub panic. The hub never reconciles or writes rows.
+
+## Operating the plane
+
+Ask the plane, not the process table:
+
+```sh
+dsh-shellout-runner --mode status --state /root/.dsh-runner/shellout/state
+dsh-shellout-runner --mode status --state … --json
+```
+
+It prints the executor it found (pid, version, socket, whether that pid is
+still the same process) and every execution the state directory holds with its
+command, state, command pid and shim pid. The exit code is `0` when an executor
+answers and `1` when none does, so it also serves as a health check.
+
+The executor publishes `<state>/executor.json` at startup and withdraws it on a
+clean stop; a killed executor leaves the file behind and the view reports it as
+`alive=no` by comparing the pid's start time with the recorded one.
+
+**Never identify this process with `pgrep -f`.** Any pattern specific enough to
+match the executor also appears in the command line of the shell running the
+query, so `pgrep -f 'dsh-shellout-runner --socket' | head -1` silently returns
+that shell. Use `supervisorctl status <program>`, the status mode above, or a
+filter on the exact executable path.
+
+The state directory path must stay below ~104 bytes: a unix socket path cannot
+exceed `SUN_LEN`, and the executor now refuses an over-long path with an error
+that names both the length and the limit.

@@ -55,6 +55,19 @@ pub async fn serve(config: Config, registry: Arc<Registry>) -> std::io::Result<(
         std::fs::create_dir_all(parent)?;
     }
     let _ = std::fs::remove_file(path);
+    // AF_UNIX caps a socket path at ~107 bytes; the kernel's own message names
+    // neither the limit nor the path, so say both before binding.
+    if path.as_os_str().len() >= 104 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "socket path is {} bytes, which exceeds the {} byte limit of a unix socket: {}",
+                path.as_os_str().len(),
+                107,
+                path.display()
+            ),
+        ));
+    }
     let listener = UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
 

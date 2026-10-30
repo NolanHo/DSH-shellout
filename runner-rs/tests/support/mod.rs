@@ -21,10 +21,18 @@ pub struct Scratch {
 impl Scratch {
     pub fn new(name: &str) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
+        // Keep the directory name short: the unix socket lives inside it, and a
+        // long path fails with "path must be shorter than SUN_LEN" instead of
+        // anything that points at the test.
+        let slug: String = name
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .take(6)
+            .collect();
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(".task-tmp")
             .join(format!(
-                "{name}-{}-{}",
+                "{slug}-{}-{}",
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
@@ -107,7 +115,11 @@ impl Executor {
                 let _ = client.request("state", json!({"executionId": "probe"}));
                 return client;
             }
-            assert!(Instant::now() < deadline, "executor did not become ready");
+            assert!(
+                Instant::now() < deadline,
+                "executor did not become ready:\n{}",
+                self.diagnose()
+            );
             std::thread::sleep(Duration::from_millis(25));
         }
     }
