@@ -1,4 +1,5 @@
 //! DSH execution plane: hub, executor and one detached shim per execution.
+mod attach;
 mod capture;
 mod dashboard;
 mod exec;
@@ -101,6 +102,33 @@ fn main() -> std::io::Result<()> {
         // Operator view: which executor owns this state directory and what it
         // is running, read from files rather than from process scanning.
         std::process::exit(inspect::status(&paths.state, arg_present("--json")));
+    }
+    if mode == "attach" {
+        let host =
+            arg_value("--host").ok_or_else(|| std::io::Error::other("attach requires --host"))?;
+        let ssh = arg_value("--ssh")
+            .map(|words| {
+                words
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| {
+                vec![
+                    "ssh".to_string(),
+                    "-o".to_string(),
+                    "BatchMode=yes".to_string(),
+                ]
+            });
+        let target = attach::Target {
+            ssh,
+            host,
+            root: arg_value("--remote-root"),
+        };
+        return tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(attach::attach(target, env!("CARGO_PKG_VERSION")));
     }
     if mode == "shim" {
         let id = arg_value("--id").ok_or_else(|| std::io::Error::other("shim requires --id"))?;

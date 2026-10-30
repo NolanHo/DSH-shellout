@@ -96,6 +96,20 @@ the local plane hold unchanged:
 The reconnect path is the existing settlement replay plus the handshake's
 terminal facts — no new state machine.
 
+## Attaching from a controller
+
+```sh
+dsh-shellout-runner --mode attach --host <alias> [--ssh "ssh -J jump"] [--remote-root <path>]
+```
+
+`--mode attach` performs the bootstrap below and then bridges its own stdin and
+stdout to the remote executor, so any client that could speak to a local socket
+can speak to a remote host by spawning this command instead. The transport is a
+plain argv (`ssh` by default, `{host}` substituted where it appears), which also
+makes the whole sequence testable without an sshd: `scripts/fake-remote.sh`
+executes the remote command locally, and `tests/attach.rs` drives the real
+binary through it.
+
 ## Bootstrap protocol
 
 Attach performs, in order, each step separately diagnosable:
