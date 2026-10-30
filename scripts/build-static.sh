@@ -28,7 +28,10 @@ fi
 # uppercased. Mixing these up silently falls back to the host compiler.
 cc_var="CC_$(printf '%s' "$target" | tr '-' '_')"
 upper="$(printf '%s' "$target" | tr '[:lower:]-' '[:upper:]_')"
+# The zig wrappers are shared by every target, so the triple travels with the
+# environment rather than being baked into them.
 env \
+  ZIG_TARGET="$zig_triple" \
   "${cc_var}=$here/zig-musl-cc.sh" \
   "CARGO_TARGET_${upper}_LINKER=$here/zig-musl-ld.sh" \
   RUSTFLAGS="-C link-self-contained=no" \
