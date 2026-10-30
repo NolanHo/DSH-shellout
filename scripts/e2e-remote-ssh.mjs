@@ -129,5 +129,5 @@ try {
   console.log('PASS history answered from the host')
 } finally {
   child.kill('SIGTERM')
-  await once(child, 'exit').catch(() => {})
+  if (child.exitCode === null && child.signalCode === null) await once(child, 'exit').catch(() => {})
 }
