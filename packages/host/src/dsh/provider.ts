@@ -29,6 +29,7 @@ import { ENV_OVERRIDES } from '@deepseek-ai/dsh-bash-local'
 import { scrubbedParentEnv } from '@deepseek-ai/dsh-subprocess'
 import { specDigest, type SpawnSpec } from 'dsh-shellout-protocol'
 import { ShelloutClient } from '../core/client.js'
+import type { TransportOptions } from '../core/transport.js'
 import { RemoteExecution } from '../core/execution.js'
 
 /** Local executor settings used by the fallback path. */
@@ -47,10 +48,27 @@ export interface LocalExecutorConfig {
   graceMs?: number
 }
 
+/** A host reached over ssh instead of the local socket. */
+export interface RemoteTarget {
+  /** ssh host alias or `user@host`. */
+  readonly host: string
+  /** Runner binary used to attach; defaults to `dsh-shellout-runner` on `PATH`. */
+  readonly runner?: string
+  /** ssh argv, with `{host}` substituted where present; defaults to `ssh -o BatchMode=yes`. */
+  readonly ssh?: readonly string[]
+  /** Remote state root; defaults to `$HOME/.dsh-shellout` on the host. */
+  readonly remoteRoot?: string
+}
+
 /** Plugin configuration; every field is optional. */
 export interface ShelloutConfig {
   /** Runner socket path; defaults to `$DSH_HOME/shellout/control.sock`. */
   socketPath?: string
+  /**
+   * Attach to a remote host instead of the local socket. The runner bootstraps
+   * the host and speaks the same protocol over the ssh command's stdio.
+   */
+  remote?: RemoteTarget
   /** Bound on one startup handshake attempt. */
   connectTimeoutMs?: number
   /** How long to keep retrying the runner at startup before deciding. */
@@ -101,6 +119,8 @@ function signalName(value: string | number | null | undefined): NodeJS.Signals |
 
 export interface ResolvedShelloutConfig {
   readonly socketPath: string
+  /** How the client reaches the runner. */
+  readonly transport: TransportOptions
   readonly connectTimeoutMs: number
   readonly connectRetryMs: number
   readonly reconnectDelayMs: number
@@ -113,6 +133,21 @@ export interface ResolvedShelloutConfig {
 }
 
 /**
+ * Choose the transport a configuration asks for.
+ * @param config - caller configuration.
+ * @param socketPath - the local socket path to use when no remote is named.
+ * @returns the transport the client opens.
+ */
+function transportFor(config: ShelloutConfig, socketPath: string): TransportOptions {
+  const remote = config.remote
+  if (remote === undefined) return { kind: 'socket', path: socketPath }
+  const argv = [remote.runner ?? 'dsh-shellout-runner', '--mode', 'attach', '--host', remote.host]
+  if (remote.ssh !== undefined) argv.push('--ssh', remote.ssh.join(' '))
+  if (remote.remoteRoot !== undefined) argv.push('--remote-root', remote.remoteRoot)
+  return { kind: 'command', argv }
+}
+
+/**
  * Apply defaults to a plugin configuration.
  * @param config - caller configuration, possibly partial.
  * @param env - environment to read the harness home from.
@@ -120,8 +155,10 @@ export interface ResolvedShelloutConfig {
  */
 export function resolveConfig(config: ShelloutConfig = {}, env: NodeJS.ProcessEnv = process.env): ResolvedShelloutConfig {
   const home = env.DSH_HOME ?? join(env.HOME ?? '/root', '.dsh')
+  const socketPath = config.socketPath ?? join(home, 'shellout', 'control.sock')
   return {
-    socketPath: config.socketPath ?? join(home, 'shellout', 'control.sock'),
+    socketPath,
+    transport: transportFor(config, socketPath),
     connectTimeoutMs: config.connectTimeoutMs ?? 5_000,
     connectRetryMs: config.connectRetryMs ?? 10_000,
     reconnectDelayMs: config.reconnectDelayMs ?? 2_000,

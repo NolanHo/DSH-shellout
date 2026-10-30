@@ -45,9 +45,9 @@ export async function apply(ctx: Context, config: ShelloutConfig = {}): Promise<
     return
   }
   if (resolved.fallback === 'none') {
-    throw new Error(`shellout: runner socket ${resolved.socketPath} did not answer within ${String(resolved.connectRetryMs)} ms and fallback is disabled`)
+    throw new Error(`shellout: ${described(resolved)} did not answer within ${String(resolved.connectRetryMs)} ms and fallback is disabled`)
   }
-  ctx.logger?.warn?.(`shellout: runner socket ${resolved.socketPath} did not answer within ${String(resolved.connectRetryMs)} ms; falling back to in-process execution`)
+  ctx.logger?.warn?.(`shellout: ${described(resolved)} did not answer within ${String(resolved.connectRetryMs)} ms; falling back to in-process execution`)
   const { default: LocalBashExecutor } = await import('@deepseek-ai/dsh-bash-local')
   await ctx.plugin(LocalBashExecutor, {
     ...resolved.local.cwd === undefined ? {} : { cwd: resolved.local.cwd },
@@ -57,6 +57,12 @@ export async function apply(ctx: Context, config: ShelloutConfig = {}): Promise<
     maxSpillBytes: resolved.local.maxSpillBytes,
     graceMs: resolved.local.graceMs,
   })
+}
+
+/** Name the target a failure refers to. */
+function described(config: { transport: { kind: string; path?: string; argv?: readonly string[] } }): string {
+  if (config.transport.kind === 'socket') return `runner socket ${String(config.transport.path)}`
+  return `remote attach command ${(config.transport.argv ?? []).join(' ')}`
 }
 
 /**
@@ -69,6 +75,7 @@ async function connectWithRetry(config: ReturnType<typeof resolveConfig>): Promi
   for (;;) {
     try {
       return await ShelloutClient.connect({
+        transport: config.transport,
         socketPath: config.socketPath,
         bootId: randomUUID(),
         clientBuild: 'dsh-shellout',

@@ -10,7 +10,9 @@
  * @module dsh-shellout/core/client
  */
 
-import { connect, type Socket } from 'node:net'
+import { Duplex } from 'node:stream'
+
+import { openTransport, type TransportOptions } from './transport.js'
 import {
   DEFAULT_MAX_FRAME_BYTES,
   FrameDecoder,
@@ -36,8 +38,10 @@ export class ShelloutRpcError extends Error {
 
 /** Connection options. */
 export interface ClientOptions {
-  /** Runner socket path. */
-  readonly socketPath: string
+  /** How to reach the runner; `socketPath` is a shorthand for the socket form. */
+  readonly transport?: TransportOptions
+  /** Runner socket path; ignored when `transport` is given. */
+  readonly socketPath?: string
   /** Identity for this host boot; executions are owned by it. */
   readonly bootId: string
   /** Build label sent at handshake. */
@@ -48,6 +52,13 @@ export interface ClientOptions {
   readonly heartbeatMs?: number
   /** Retry delay after a dropped connection; `undefined` disables reconnect. */
   readonly reconnectDelayMs?: number
+}
+
+/** The transport a client uses, derived from its options. */
+function transportOf(options: ClientOptions): TransportOptions {
+  if (options.transport !== undefined) return options.transport
+  if (options.socketPath === undefined) throw new Error('shellout: client needs a transport or a socket path')
+  return { kind: 'socket', path: options.socketPath }
 }
 
 /** A connected runner client. */
@@ -61,10 +72,10 @@ export class ShelloutClient {
   private latest: HelloResponse
   private heartbeat: NodeJS.Timeout | undefined
   private closed = false
-  private current: Socket
+  private current: Duplex
 
   private constructor(
-    socket: Socket,
+    socket: Duplex,
     private readonly options: ClientOptions,
     /** Descriptor answered by the handshake. */
     readonly descriptor: RunnerDescriptor,
@@ -84,9 +95,9 @@ export class ShelloutClient {
    * @throws ShelloutRpcError when the socket is unreachable or the protocol mismatches.
    */
   static async connect(options: ClientOptions): Promise<ShelloutClient> {
-    const socket = await openSocket(options.socketPath, options.connectTimeoutMs ?? 5_000)
-    const probe = { id: 0 }
-    void probe
+    const socket = await openTransport(transportOf(options), options.connectTimeoutMs ?? 5_000).catch(
+      (error: Error) => { throw new ShelloutRpcError('protocol', error.message) },
+    )
     const { hello, trailing } = await handshakeOn(socket, options)
     const client = new ShelloutClient(socket, options, hello.descriptor, hello)
     for (const frame of trailing) client.dispatch(frame)
@@ -190,7 +201,7 @@ export class ShelloutClient {
     }
   }
 
-  private attach(socket: Socket): void {
+  private attach(socket: Duplex): void {
     const decoder = new FrameDecoder(this.handshake.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES)
     socket.on('data', (chunk: Buffer) => {
       let frames: Envelope[]
@@ -240,7 +251,9 @@ export class ShelloutClient {
   private async reconnect(): Promise<void> {
     if (this.closed) return
     try {
-      const socket = await openSocket(this.options.socketPath, this.options.connectTimeoutMs ?? 5_000)
+      const socket = await openTransport(transportOf(this.options), this.options.connectTimeoutMs ?? 5_000).catch(
+        (error: Error) => { throw new ShelloutRpcError('protocol', error.message) },
+      )
       const { hello, trailing } = await handshakeOn(socket, this.options)
       this.latest = hello
       this.current = socket
@@ -278,19 +291,6 @@ export class ShelloutClient {
  * @param timeoutMs - connection bound.
  * @returns the connected socket.
  */
-async function openSocket(path: string, timeoutMs: number): Promise<Socket> {
-  const socket = connect(path)
-  socket.setNoDelay(true)
-  await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      socket.destroy()
-      reject(new ShelloutRpcError('internal', `runner socket ${path} did not accept a connection within ${String(timeoutMs)} ms`))
-    }, timeoutMs)
-    socket.once('connect', () => { clearTimeout(timer); resolve() })
-    socket.once('error', (error: Error) => { clearTimeout(timer); reject(toRpcError(error)) })
-  })
-  return socket
-}
 
 /** A completed handshake: the reply, and whatever arrived behind it. */
 interface Handshake {
@@ -312,7 +312,7 @@ interface Handshake {
  * @returns the runner's hello reply and the frames behind it.
  * @throws ShelloutRpcError on a protocol mismatch or a malformed reply.
  */
-async function handshakeOn(socket: Socket, options: ClientOptions): Promise<Handshake> {
+async function handshakeOn(socket: Duplex, options: ClientOptions): Promise<Handshake> {
   const decoder = new FrameDecoder()
   const handshake = await new Promise<{ reply: Envelope; trailing: Envelope[] }>((resolve, reject) => {
     const onData = (chunk: Buffer): void => {

@@ -265,3 +265,21 @@ filter on the exact executable path.
 The state directory path must stay below ~104 bytes: a unix socket path cannot
 exceed `SUN_LEN`, and the executor now refuses an over-long path with an error
 that names both the length and the limit.
+
+## Remote hosts
+
+A host reached over ssh speaks this same protocol; `docs/remote-execution.md`
+owns the design. In short:
+
+- `dsh-shellout-runner --mode attach --host <alias>` probes the host, pushes the
+  one static musl binary of this build through the same transport, verifies it
+  runs, and then bridges the caller's stdio to it.
+- The host plugin selects that transport with `remote: { host }` instead of a
+  socket path; `transport` in a resolved config is either
+  `{ kind: 'socket', path }` or `{ kind: 'command', argv }`.
+- Everything below the transport is unchanged: one supervisor per state root,
+  a shim per execution, the same settlement facts, the same history projection,
+  and the same `lost` reconciliation after a host reboot.
+
+ssh keeps identity, `ProxyJump` and keepalives. The runner opens no port and
+adds no credential of its own, and `rsync` stays rexec's job.
