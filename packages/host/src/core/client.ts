@@ -54,6 +54,34 @@ export interface ClientOptions {
   readonly reconnectDelayMs?: number
 }
 
+/**
+ * Bound a handshake.
+ *
+ * `connectTimeoutMs` used to cover only the spawn event, so a blackholed host —
+ * or a remote bootstrap that pushes three megabytes first — left `connect`
+ * pending forever and the caller's fallback unreachable.
+ *
+ * @param handshake - the in-flight handshake.
+ * @param timeoutMs - how long the whole exchange may take.
+ * @param socket - the transport to destroy when the bound is hit.
+ * @returns the handshake result.
+ */
+async function withDeadline<T>(handshake: Promise<T>, timeoutMs: number, socket: Duplex): Promise<T> {
+  let timer: NodeJS.Timeout | undefined
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      socket.destroy()
+      reject(new Error(`the runner did not complete its handshake within ${timeoutMs}ms`))
+    }, timeoutMs)
+    timer.unref()
+  })
+  try {
+    return await Promise.race([handshake, deadline])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 /** The transport a client uses, derived from its options. */
 function transportOf(options: ClientOptions): TransportOptions {
   if (options.transport !== undefined) return options.transport
@@ -101,7 +129,11 @@ export class ShelloutClient {
     // A transport that already started (an attach child, a socket) must not
     // outlive a failed handshake: the caller retries, and every retry would
     // otherwise leave another session holding the host's state lock.
-    const { hello, trailing } = await handshakeOn(socket, options).catch((error: Error) => {
+    const { hello, trailing } = await withDeadline(
+      handshakeOn(socket, options),
+      options.connectTimeoutMs ?? 5_000,
+      socket,
+    ).catch((error: Error) => {
       socket.destroy()
       throw error
     })
@@ -260,7 +292,16 @@ export class ShelloutClient {
       const socket = await openTransport(transportOf(this.options), this.options.connectTimeoutMs ?? 5_000).catch(
         (error: Error) => { throw new ShelloutRpcError('protocol', error.message) },
       )
-      const { hello, trailing } = await handshakeOn(socket, this.options)
+      // Same rule as the first connect: a transport that already started must
+      // not survive a failed handshake, or each retry leaks another session.
+      const { hello, trailing } = await withDeadline(
+        handshakeOn(socket, this.options),
+        this.options.connectTimeoutMs ?? 5_000,
+        socket,
+      ).catch((error: Error) => {
+        socket.destroy()
+        throw error
+      })
       this.latest = hello
       this.current = socket
       this.attach(socket)

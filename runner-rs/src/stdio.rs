@@ -57,7 +57,12 @@ pub async fn bridge(socket: &Path) -> std::io::Result<bool> {
         }
         stdout.flush().await
     };
-    let _ = tokio::try_join!(upstream, downstream);
+    // Either side ending ends the bridge; waiting for both would keep the
+    // caller blocked on a stdin it may never close.
+    tokio::select! {
+        _ = downstream => {}
+        _ = upstream => {}
+    }
     Ok(true)
 }
 

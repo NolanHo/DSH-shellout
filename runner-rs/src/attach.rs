@@ -103,7 +103,7 @@ fn probe_script(version: &str, arch: &str) -> String {
          printf 'system %s\\n' \"$(uname -s)\"\n\
          printf 'machine %s\\n' \"$(uname -m)\"\n\
          printf 'home %s\\n' \"$HOME\"\n\
-         if ! test -w \"$HOME\"; then\n\
+         if [ -z \"$1\" ] && ! test -w \"$HOME\"; then\n\
            root=\"/tmp/dsh-shellout-$(id -u)\"\n\
            if [ -e \"$root\" ] && {{ [ ! -O \"$root\" ] || [ -L \"$root\" ]; }}; then\n\
              printf 'root unsafe\\n'\n\
@@ -244,6 +244,10 @@ async fn push(target: &Target, remote: &Remote, destination: &str) -> io::Result
         "set -eu\n\
          umask 077\n\
          mkdir -p \"$1\"\n\
+         if [ -e \"$1\" ] && {{ [ ! -O \"$1\" ] || [ -L \"$1\" ]; }}; then\n\
+           printf 'unsafe root\\n' >&2\n\
+           exit 3\n\
+         fi\n\
          chmod 700 \"$1\"\n\
          cat > \"$2\"\n\
          chmod 700 \"$2\"\n\
@@ -276,18 +280,15 @@ async fn push(target: &Target, remote: &Remote, destination: &str) -> io::Result
 
 /// Verify the remote binary runs and reports a matching version.
 async fn verify(target: &Target, binary: &str, state_root: &str) -> io::Result<()> {
-    let result = run(
-        target,
-        &[
-            binary.to_string(),
-            "--mode".into(),
-            "status".into(),
-            "--state".into(),
-            format!("{state_root}/state"),
-        ],
-        None,
-    )
-    .await?;
+    let status = [
+        shell_quote(binary),
+        "--mode".into(),
+        "status".into(),
+        "--state".into(),
+        shell_quote(&format!("{state_root}/state")),
+    ]
+    .join(" ");
+    let result = run(target, &[status], None).await?;
     // `status` exits 1 when no executor owns the state root yet, which still
     // proves the binary ran; only a loader/arch failure is an error.
     if result.code == 0 || result.code == 1 {
@@ -369,18 +370,19 @@ pub async fn attach(target: Target, version: &str) -> io::Result<()> {
 
 /// Start the remote executor over the transport and return the child.
 fn spawn_stdio(target: &Target, binary: &str, root: &str) -> io::Result<Child> {
-    let remote = vec![
-        binary.to_string(),
+    let remote = [
+        shell_quote(binary),
         "--mode".into(),
         "stdio".into(),
         "--state".into(),
-        format!("{root}/state"),
+        shell_quote(&format!("{root}/state")),
         "--socket".into(),
-        format!("{root}/control.sock"),
+        shell_quote(&format!("{root}/control.sock")),
         "--history".into(),
-        format!("{root}/history.sqlite"),
-    ];
-    let argv = target.argv(&remote);
+        shell_quote(&format!("{root}/history.sqlite")),
+    ]
+    .join(" ");
+    let argv = target.argv(&[remote]);
     Command::new(&argv[0])
         .args(&argv[1..])
         .stdin(Stdio::piped())
@@ -419,7 +421,12 @@ async fn bridge(child: &mut Child) -> io::Result<()> {
         }
         Ok::<(), io::Error>(())
     };
-    let _ = tokio::try_join!(upstream, downstream);
+    // Ending on the remote side matters: a client waiting for a reply must not
+    // hang because our stdin is still open after the executor exited.
+    tokio::select! {
+        _ = downstream => {}
+        _ = upstream => {}
+    }
     let status = child.wait().await?;
     // A remote executor that refuses to start (bad socket path, refused lock,
     // loader error) must not look like a clean end of session.

@@ -124,13 +124,18 @@ Attach performs, in order, each step separately diagnosable:
 
 1. `uname -sm` → `linux-x86_64` / `linux-aarch64`; anything else is a clear
    refusal, never a silent fallback.
-2. Probe the state root: `$DSH_SHELLOUT_HOME` on the host, else
-   `~/.dsh-shellout`, else `/tmp/dsh-shellout-<uid>` when the home is read-only.
-3. Probe executability: run the cached binary with `--mode status`; a `noexec`
-   mount or a wrong arch shows up here rather than at the first real command.
-4. If the probe found no cached binary, push the local static binary, verify
-   `sha256`, `chmod 0700`, atomic rename, then re-probe. A cached binary that
-   exists but cannot run is a reported failure, not a silent re-push.
+2. Probe the state root: `--remote-root`, else the host's `$DSH_SHELLOUT_HOME`,
+   else `~/.dsh-shellout`, else `/tmp/dsh-shellout-<uid>` when the home is
+   read-only and no root was named.
+3. If the probe found no cached binary, push the local static binary, verify
+   `sha256`, `chmod 0700`, atomic rename.
+4. Run the binary with `--mode status`: a `noexec` mount, a wrong arch or a
+   truncated push surfaces here, with the host's own error, before any command.
+
+The digest is checked as the bytes are written; a binary already at
+`bin/<version>-<arch>/runner` is trusted because it is the one this version
+pushed. Rebuilding the controller without changing its version therefore keeps
+the cached copy until the version or the root changes.
 5. Exec `… --mode stdio --state <root>/state` and speak frames.
 
 Every step reports what it found, so a host that fails says which precondition
@@ -141,7 +146,7 @@ failed instead of "worker died".
 | Condition | Behaviour |
 |---|---|
 | No `/proc` (unusual containers) | adoption cannot verify identity; executions settle from `status.json` but are never adopted — reported as `lost` on attach |
-| Read-only home | state root moves to `/tmp/dsh-shellout-<uid>` (0700; the parent is sticky), and history there is not durable across a reboot |
+| Read-only home | state root moves to `/tmp/dsh-shellout-<uid>` (0700, created by us and checked for ownership before every write), and history there is not durable across a reboot |
 | `noexec` home | the push lands and `--mode status` fails to execute, which is reported with the host's own error; there is no silent fallback to `/tmp` |
 | No `sha256sum`/`shasum` | attach refuses: an unverified binary is not executed |
 | Non-Linux remote | refused with the detected platform, by design |
