@@ -4,6 +4,10 @@
 //! command locally. Everything the attach adds — platform probe, versioned
 //! cache, sha256-pinned push, run verification — is exercised unchanged; only
 //! the ssh hop itself is substituted, because ssh is not ours to reimplement.
+//!
+//! These tests drive the static artifact a deployment pushes, so run
+//! `scripts/build-static.sh` first; `DSH_REQUIRE_STATIC=1` turns a missing
+//! artifact into a failure instead of a silent pass.
 
 mod support;
 
