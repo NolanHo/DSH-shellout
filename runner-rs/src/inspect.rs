@@ -7,7 +7,7 @@
 //! reads that file plus the per-execution status documents — no process
 //! scanning, no pattern that can match the observer.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde_json::{json, Value};
 
@@ -110,7 +110,7 @@ fn rows(state: &Path) -> Vec<Row> {
             command,
         });
     }
-    collected.sort_by(|a, b| b.age_seconds.cmp(&a.age_seconds));
+    collected.sort_by_key(|row| std::cmp::Reverse(row.age_seconds));
     collected
 }
 
@@ -182,16 +182,11 @@ pub fn status(state: &Path, as_json: bool) -> i32 {
     }
 }
 
-/// State directory the operator view reads when none was given.
-pub fn default_state(state: &Path) -> PathBuf {
-    state.to_path_buf()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
+    fn scratch(name: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!("dsh-inspect-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();

@@ -54,11 +54,19 @@ fn a_slow_admission_does_not_stall_other_requests() {
 /// writing it; a torn copy then fails later for a reason that has nothing to do
 /// with the behaviour under test.
 fn verified_copy(source: &std::path::Path, target: &std::path::Path) {
+    let size = |path: &std::path::Path| std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    // A torn or half-replaced artifact is not what this test is about, so a copy
+    // is only accepted once it matches the source size and starts with ELF.
+    let runnable = |path: &std::path::Path| {
+        let mut header = [0u8; 4];
+        std::fs::File::open(path)
+            .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut header))
+            .map(|()| header == *b"\x7fELF")
+            .unwrap_or(false)
+    };
     for attempt in 1..=10 {
         std::fs::copy(source, target).expect("copy the runner binary");
-        let size =
-            |path: &std::path::Path| std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
-        if size(target) == size(source) && size(target) > 0 {
+        if size(target) == size(source) && size(target) > 0 && runnable(target) {
             return;
         }
         std::thread::sleep(Duration::from_millis(50 * attempt));
