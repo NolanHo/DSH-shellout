@@ -106,20 +106,26 @@ fn main() -> std::io::Result<()> {
     if mode == "attach" {
         let host =
             arg_value("--host").ok_or_else(|| std::io::Error::other("attach requires --host"))?;
-        let ssh = arg_value("--ssh")
-            .map(|words| {
-                words
-                    .split_whitespace()
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_else(|| {
-                vec![
-                    "ssh".to_string(),
-                    "-o".to_string(),
-                    "BatchMode=yes".to_string(),
-                ]
-            });
+        // One `--ssh` per word: a single string split on whitespace cannot
+        // express `-J user@host` or `-o 'ProxyCommand=…'`.
+        let mut ssh: Vec<String> = Vec::new();
+        let mut words = std::env::args().skip(1);
+        while let Some(word) = words.next() {
+            if word == "--ssh" {
+                if let Some(value) = words.next() {
+                    ssh.push(value);
+                }
+            } else if let Some(value) = word.strip_prefix("--ssh=") {
+                ssh.push(value.to_string());
+            }
+        }
+        if ssh.is_empty() {
+            ssh = vec![
+                "ssh".to_string(),
+                "-o".to_string(),
+                "BatchMode=yes".to_string(),
+            ];
+        }
         let target = attach::Target {
             ssh,
             host,

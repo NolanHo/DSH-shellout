@@ -155,6 +155,22 @@ failed instead of "worker died".
 - A remote host can always run anything the ssh account can run; the runner does
   not pretend to sandbox beyond the policy the host already passes.
 
+## Verifying against a real sshd
+
+`scripts/e2e-remote-ssh.mjs` drives the attach path over a real ssh connection to
+whatever host the environment names:
+
+```sh
+DSH_SSH_HOST=root@127.0.0.1 DSH_SSH_PORT=2322 DSH_SSH_KEY=/tmp/key/id \
+  node --import tsx/esm scripts/e2e-remote-ssh.mjs
+```
+
+A throwaway `alpine:latest` container with `openssh` installed and port 22
+published is the useful case: it is a musl user space, which is exactly where a
+glibc controller binary fails and the static artifact must simply work. The run
+asserts the handshake, the settlement, that the captured output names the host,
+and that history answers from the host.
+
 ## Test plan
 
 - `--mode stdio` over a pipe pair: framing, request/response, settlement replay.

@@ -110,6 +110,12 @@ impl Store {
                 .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         }
         let mut connection = Connection::open(path)?;
+        // History records argv, so the database is owner-only from the moment it
+        // exists; the default umask would leave it world-readable.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
         connection.pragma_update(None, "journal_mode", "WAL")?;
         let transaction = connection.transaction()?;
         transaction.execute_batch(
