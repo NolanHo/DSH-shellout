@@ -135,7 +135,7 @@ export class ShelloutClient {
       socket,
     ).catch((error: Error) => {
       socket.destroy()
-      throw error
+      throw error instanceof ShelloutRpcError ? error : new ShelloutRpcError('protocol', error.message)
     })
     const client = new ShelloutClient(socket, options, hello.descriptor, hello)
     for (const frame of trailing) client.dispatch(frame)
@@ -300,7 +300,7 @@ export class ShelloutClient {
         socket,
       ).catch((error: Error) => {
         socket.destroy()
-        throw error
+        throw error instanceof ShelloutRpcError ? error : new ShelloutRpcError('protocol', error.message)
       })
       this.latest = hello
       this.current = socket
