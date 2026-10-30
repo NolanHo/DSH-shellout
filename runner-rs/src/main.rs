@@ -10,6 +10,7 @@ mod protocol;
 mod registry;
 mod server;
 mod shim;
+mod stdio;
 mod store;
 
 use std::path::PathBuf;
@@ -117,8 +118,18 @@ fn main() -> std::io::Result<()> {
                     _ = shutdown_signal() => Ok(()),
                 };
             }
-            if mode != "executor" {
+            let stdio_mode = mode == "stdio";
+            if mode != "executor" && !stdio_mode {
                 return Err(std::io::Error::other(format!("unknown mode {mode}")));
+            }
+            // A session that finds an owner already serving this state root
+            // becomes a bridge instead of a second supervisor.
+            if stdio_mode {
+                // The owner listens where `--socket` points, which is not
+                // necessarily inside the state directory.
+                if stdio::bridge(std::path::Path::new(&paths.socket)).await? {
+                    return Ok(());
+                }
             }
             // One executor owns a state directory. Take the claim before the
             // socket is unlinked, so a refused start leaves the live one intact.
@@ -169,10 +180,23 @@ fn main() -> std::io::Result<()> {
             // by what it wrote rather than by a pgrep pattern that also matches
             // the shell running the query.
             inspect::publish(&paths.state, &paths.socket)?;
-            let outcome = tokio::select! {
-                result = server::serve(config, registry) => result,
-                // Dropping the listener/runtime leaves detached shims and commands untouched.
-                _ = shutdown_signal() => Ok(()),
+            let outcome = if stdio_mode {
+                // Serve both faces: this ssh connection and the local unix
+                // socket, so a second session bridges rather than competing for
+                // the state root. When ssh closes, this process leaves the
+                // shims and commands behind and exits.
+                let unix = server::serve(config.clone(), Arc::clone(&registry));
+                tokio::select! {
+                    result = stdio::serve(config, Arc::clone(&registry)) => result,
+                    result = unix => result,
+                    _ = shutdown_signal() => Ok(()),
+                }
+            } else {
+                tokio::select! {
+                    result = server::serve(config, registry) => result,
+                    // Dropping the listener/runtime leaves detached shims and commands untouched.
+                    _ = shutdown_signal() => Ok(()),
+                }
             };
             inspect::withdraw(&paths.state);
             outcome

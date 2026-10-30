@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixListener;
 use tokio::sync::broadcast;
 
 use crate::legacy::{is_legacy, to_spawn_spec, LegacyExecRequest};
@@ -96,17 +96,26 @@ pub async fn serve(config: Config, registry: Arc<Registry>) -> std::io::Result<(
         let registry = Arc::clone(&registry);
         let config = config.clone();
         tokio::spawn(async move {
-            let _ = handle_connection(stream, registry, config).await;
+            let (reader, writer) = stream.into_split();
+            let _ = handle_stream(reader, writer, registry, config).await;
         });
     }
 }
 
-async fn handle_connection(
-    stream: UnixStream,
+/// Serve one connected host over any byte channel.
+///
+/// The unix socket and the ssh stdio transport share this loop: the framing and
+/// the settlement rules are identical, so only the byte source differs.
+pub async fn handle_stream<R, W>(
+    mut reader: R,
+    mut writer: W,
     registry: Arc<Registry>,
     config: Config,
-) -> std::io::Result<()> {
-    let (mut reader, mut writer) = stream.into_split();
+) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
     let mut frames = Frames::new(&mut reader);
     let mut events: Option<broadcast::Receiver<Value>> = None;
     let mut observer = false;
@@ -477,7 +486,13 @@ mod tests {
     async fn a_request_split_around_an_event_still_replies() {
         let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
         let registry = Registry::new(8, std::time::Duration::from_secs(10));
-        let task = tokio::spawn(handle_connection(server, Arc::clone(&registry), config()));
+        let (reader, writer) = server.into_split();
+        let task = tokio::spawn(handle_stream(
+            reader,
+            writer,
+            Arc::clone(&registry),
+            config(),
+        ));
         let (mut reader, mut writer) = client.split();
         let mut replies = Frames::new(&mut reader);
 
@@ -514,7 +529,13 @@ mod tests {
     async fn a_lagged_connection_is_dropped_so_the_host_rehandshakes() {
         let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
         let registry = Registry::new(8, std::time::Duration::from_secs(10));
-        let task = tokio::spawn(handle_connection(server, Arc::clone(&registry), config()));
+        let (reader, writer) = server.into_split();
+        let task = tokio::spawn(handle_stream(
+            reader,
+            writer,
+            Arc::clone(&registry),
+            config(),
+        ));
         let (mut reader, mut writer) = client.split();
         let mut replies = Frames::new(&mut reader);
         write_frame(
