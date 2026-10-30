@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url'
 
 import { describe, expect, it } from 'vitest'
 
-import { ShelloutClient } from '../src/core/client.ts'
+import { ShelloutClient, ShelloutRpcError } from '../src/core/client.ts'
 import { resolveConfig } from '../src/dsh/provider.ts'
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../../..')
@@ -49,6 +49,22 @@ describe('remote transport selection', () => {
       argv: ['/opt/runner', '--mode', 'attach', '--host', 'worker-1'],
     })
   })
+})
+
+describe('a transport that never answers', () => {
+  it('fails within the connect deadline instead of hanging forever', async () => {
+    const started = Date.now()
+    await expect(
+      ShelloutClient.connect({
+        transport: { kind: 'command', argv: ['/bin/sh', '-c', 'sleep 30'] },
+        bootId: 'boot-blackhole',
+        connectTimeoutMs: 700,
+        reconnectDelayMs: 0,
+      }),
+    ).rejects.toBeInstanceOf(ShelloutRpcError)
+    // The deadline bounds the whole handshake, not only the spawn event.
+    expect(Date.now() - started).toBeLessThan(5_000)
+  }, 15_000)
 })
 
 const ready = existsSync(runner) && existsSync(fakeRemote)
