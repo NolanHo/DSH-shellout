@@ -16,6 +16,15 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use support::Scratch;
 
+/// The controller must be the static build: attach refuses to push a binary
+/// that carries a dynamic loader, because that is the failure this plane exists
+/// to avoid. Build it with `scripts/build-static.sh`.
+fn controller() -> Option<PathBuf> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/x86_64-unknown-linux-musl/release/dsh-shellout-runner");
+    path.exists().then_some(path)
+}
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn repo() -> PathBuf {
@@ -50,7 +59,8 @@ struct Attached {
 impl Attached {
     fn start(scratch: &Scratch, remote_root: &Path) -> Self {
         let transport = repo().join("scripts/fake-remote.sh");
-        let mut child = Command::new(support::BINARY)
+        let binary = controller().expect("static controller");
+        let mut child = Command::new(binary)
             .args(["--mode", "attach", "--host", "fake-host", "--ssh"])
             .arg(&transport)
             .arg("--remote-root")
@@ -141,6 +151,10 @@ fn spec(command: &str) -> Value {
 
 #[test]
 fn bootstraps_a_host_and_runs_a_command_over_the_transport() {
+    let Some(_controller) = controller() else {
+        eprintln!("skipped: run scripts/build-static.sh to provide the static controller");
+        return;
+    };
     let scratch = Scratch::new("attach-run");
     let remote_root = remote_root(&scratch);
     let mut attached = Attached::start(&scratch, &remote_root);
@@ -182,6 +196,10 @@ fn bootstraps_a_host_and_runs_a_command_over_the_transport() {
 /// while the state directory stays behind.
 #[test]
 fn a_rebooted_host_reconciles_its_running_rows_as_lost() {
+    let Some(_controller) = controller() else {
+        eprintln!("skipped: run scripts/build-static.sh to provide the static controller");
+        return;
+    };
     let scratch = Scratch::new("attach-reboot");
     let remote_root = remote_root(&scratch);
     let state = remote_root.join("state");
@@ -257,6 +275,10 @@ fn a_rebooted_host_reconciles_its_running_rows_as_lost() {
 /// survive, exactly as on the local plane.
 #[test]
 fn a_killed_remote_executor_is_adopted_and_still_reports_the_real_exit_code() {
+    let Some(_controller) = controller() else {
+        eprintln!("skipped: run scripts/build-static.sh to provide the static controller");
+        return;
+    };
     let scratch = Scratch::new("attach-adopt");
     let remote_root = remote_root(&scratch);
     let state = remote_root.join("state");
@@ -343,6 +365,10 @@ fn a_killed_remote_executor_is_adopted_and_still_reports_the_real_exit_code() {
 /// history lives with the host, so the protocol has to return it.
 #[test]
 fn a_late_attach_can_read_the_hosts_history() {
+    let Some(_controller) = controller() else {
+        eprintln!("skipped: run scripts/build-static.sh to provide the static controller");
+        return;
+    };
     let scratch = Scratch::new("attach-history");
     let remote_root = remote_root(&scratch);
 

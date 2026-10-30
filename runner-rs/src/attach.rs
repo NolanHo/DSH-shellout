@@ -144,6 +144,15 @@ fn parse_probe(stdout: &str) -> io::Result<Remote> {
     })
 }
 
+/// Quote one value for the remote shell.
+///
+/// `ssh host -- cmd a b` concatenates its arguments with spaces and the remote
+/// login shell parses that string again, so a value is only safe if it is
+/// quoted for that second parse rather than merely being a separate argv entry.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 /// Whether the bytes are a statically linked executable.
 ///
 /// A glibc build reproduces exactly the failure this plane exists to avoid: the
@@ -153,6 +162,10 @@ fn is_static_executable(bytes: &[u8]) -> bool {
     if bytes.len() < 64 || &bytes[..4] != b"\x7fELF" || bytes[4] != 2 {
         return false;
     }
+    let read_u32 = |offset: usize| -> Option<u32> {
+        let slice = bytes.get(offset..offset + 4)?;
+        Some(u32::from_le_bytes(slice.try_into().ok()?))
+    };
     let read_u64 = |offset: usize| -> Option<u64> {
         let slice = bytes.get(offset..offset + 8)?;
         Some(u64::from_le_bytes(slice.try_into().ok()?))
@@ -170,7 +183,8 @@ fn is_static_executable(bytes: &[u8]) -> bool {
             Ok(start) => start,
             Err(_) => return false,
         };
-        match read_u64(start) {
+        match read_u32(start) {
+            // `p_type` is the first 32-bit field of a 64-bit program header.
             Some(3) => return false,
             Some(_) => {}
             None => return false,
@@ -220,21 +234,18 @@ async fn push(target: &Target, remote: &Remote, destination: &str) -> io::Result
          printf 'pushed %s\\n' \"$4\"\n"
     );
     let incoming = format!("{destination}.incoming.{}", std::process::id());
-    let result = run(
-        target,
-        &[
-            "sh".to_string(),
-            "-c".to_string(),
-            script,
-            "sh".to_string(),
-            directory,
-            incoming,
-            digest,
-            destination.to_string(),
-        ],
-        Some(bytes),
-    )
-    .await?;
+    let command = [
+        "sh".to_string(),
+        "-c".to_string(),
+        shell_quote(&script),
+        "sh".to_string(),
+        shell_quote(&directory),
+        shell_quote(&incoming),
+        shell_quote(&digest),
+        shell_quote(destination),
+    ]
+    .join(" ");
+    let result = run(target, &[command], Some(bytes)).await?;
     if result.code != 0 {
         return Err(io::Error::other(format!(
             "push to {} failed (exit {}): {}",
@@ -524,6 +535,30 @@ mod tests {
         let missing = parse_probe("system Linux\nmachine x86_64\nhome /home/u\nroot /home/u/.dsh-shellout\nbinary missing\ndigest sha256sum\n")
             .expect("parse");
         assert!(needs_push(&missing));
+    }
+
+    #[test]
+    fn a_value_survives_the_remote_shell() {
+        assert_eq!(shell_quote("plain"), "'plain'");
+        assert_eq!(shell_quote("with space"), "'with space'");
+        // A single quote cannot end the quoting: it is closed, escaped, reopened.
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn a_dynamic_controller_is_refused() {
+        let mut bytes = vec![0u8; 128];
+        bytes[..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 2;
+        // e_phoff at 32, e_phentsize at 54, e_phnum at 56.
+        bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+        bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+        bytes[56..58].copy_from_slice(&1u16.to_le_bytes());
+        // One program header whose p_type is PT_INTERP.
+        bytes[64..68].copy_from_slice(&3u32.to_le_bytes());
+        assert!(!is_static_executable(&bytes));
+        bytes[64..68].copy_from_slice(&1u32.to_le_bytes());
+        assert!(is_static_executable(&bytes));
     }
 
     #[test]
