@@ -178,7 +178,9 @@ fn shell_quote(value: &str) -> String {
 /// host reports a loader error instead of running. Look for a `PT_INTERP`
 /// segment, which only a dynamically linked executable carries.
 fn is_static_executable(bytes: &[u8]) -> bool {
-    if bytes.len() < 64 || &bytes[..4] != b"\x7fELF" || bytes[4] != 2 {
+    // Only a 64-bit little-endian ELF is what the readers below assume; a
+    // big-endian host would otherwise be classified from nonsense fields.
+    if bytes.len() < 64 || &bytes[..4] != b"\x7fELF" || bytes[4] != 2 || bytes[5] != 1 {
         return false;
     }
     let read_u32 = |offset: usize| -> Option<u32> {
@@ -584,6 +586,7 @@ mod tests {
         let mut bytes = vec![0u8; 128];
         bytes[..4].copy_from_slice(b"\x7fELF");
         bytes[4] = 2;
+        bytes[5] = 1;
         // e_phoff at 32, e_phentsize at 54, e_phnum at 56.
         bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
         bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
