@@ -48,23 +48,47 @@ fn a_slow_admission_does_not_stall_other_requests() {
 /// Deployment replaces the binary file; the executor keeps running from the
 /// image it already loaded. Spawning the shim from the old path would fail for
 /// every later execution until a restart.
+/// Copy the runner binary, retrying until the copy matches the source size.
+///
+/// A parallel test run can observe the artifact while the test runner is still
+/// writing it; a torn copy then fails later for a reason that has nothing to do
+/// with the behaviour under test.
+fn verified_copy(source: &std::path::Path, target: &std::path::Path) {
+    for attempt in 1..=10 {
+        std::fs::copy(source, target).expect("copy the runner binary");
+        let size =
+            |path: &std::path::Path| std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+        if size(target) == size(source) && size(target) > 0 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50 * attempt));
+    }
+    panic!("the copied binary never matched the source: {source:?}");
+}
+
 #[test]
 fn deleting_the_running_binary_does_not_break_later_spawns() {
     let scratch = Scratch::new("replace");
     let binary = scratch.root.join("runner");
-    std::fs::copy(support::BINARY, &binary).expect("copy the runner binary");
+    verified_copy(std::path::Path::new(support::BINARY), &binary);
+    // A parallel suite leaves the machine busy; give the shim a generous
+    // window to report its spawn outcome so the test measures the deleted
+    // binary, not the scheduler.
     let executor = Executor::start_full(
         &scratch,
         "executor",
         std::path::Path::new(&binary),
         &[],
-        &[],
+        &[("DSH_SHELLOUT_SPAWN_GRACE_MS", "15000")],
     );
     let mut host = executor.ready();
     host.hello("boot-replace");
     std::fs::remove_file(&binary).expect("the deployment removed the old file");
-    host.exec("after-replace", "exit 0", json!({}))
-        .expect("a later execution is still admitted");
+    if host.exec("after-replace", "exit 0", json!({})).is_none() {
+        let stderr =
+            std::fs::read_to_string(scratch.root.join("executor.stderr")).unwrap_or_default();
+        panic!("a later execution is still admitted\nexecutor stderr:\n{stderr}");
+    }
     let state = until(
         || {
             host.state("after-replace")
