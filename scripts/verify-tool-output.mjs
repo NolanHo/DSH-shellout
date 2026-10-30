@@ -182,8 +182,11 @@ async function main() {
 try {
   await main()
 } finally {
+  // The host plugin's client keeps heartbeat and reconnect timers alive, so the
+  // context must be disposed before the process can end on its own.
+  if (cached?.ctx?.dispose !== undefined) await cached.ctx.dispose()
   if (executor !== undefined && executor.exitCode === null) executor.kill('SIGTERM')
   await sleep(200)
   rmSync(root, { recursive: true, force: true })
 }
-process.exitCode = failures === 0 ? 0 : 1
+process.exit(failures === 0 ? 0 : 1)
