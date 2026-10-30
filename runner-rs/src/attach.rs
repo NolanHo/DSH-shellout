@@ -95,7 +95,12 @@ fn probe_script(version: &str, arch: &str) -> String {
          test -w \"$HOME\" || root=\"/tmp/dsh-shellout-$(id -u)\"\n\
          printf 'root %s\\n' \"$root\"\n\
          binary=\"$root/bin/{version}-{arch}/runner\"\n\
-         if [ -x \"$binary\" ]; then printf 'binary %s\\n' \"$binary\"; else printf 'binary missing\\n'; fi\n"
+         if [ -x \"$binary\" ]; then printf 'binary %s\\n' \"$binary\"; else printf 'binary missing\\n'; fi\n\
+         digest=missing\n\
+         if command -v sha256sum >/dev/null 2>&1; then digest=sha256sum\n\
+         elif command -v shasum >/dev/null 2>&1; then digest=shasum\n\
+         fi\n\
+         printf 'digest %s\\n' \"$digest\"\n"
     )
 }
 
@@ -105,6 +110,8 @@ struct Remote {
     machine: String,
     root: String,
     binary: Option<String>,
+    /// `sha256sum` or `shasum`, or `missing` when the host has neither.
+    digest: String,
 }
 
 /// Parse the probe output; every line is `key value`.
@@ -113,12 +120,14 @@ fn parse_probe(stdout: &str) -> io::Result<Remote> {
     let mut machine = None;
     let mut root = None;
     let mut binary = None;
+    let mut digest = None;
     for line in stdout.lines() {
         match line.split_once(' ') {
             Some(("system", value)) => system = Some(value.to_string()),
             Some(("machine", value)) => machine = Some(value.to_string()),
             Some(("root", value)) => root = Some(value.to_string()),
             Some(("binary", value)) if value != "missing" => binary = Some(value.to_string()),
+            Some(("digest", value)) => digest = Some(value.to_string()),
             _ => {}
         }
     }
@@ -127,6 +136,7 @@ fn parse_probe(stdout: &str) -> io::Result<Remote> {
         machine: machine.ok_or_else(|| io::Error::other("probe did not report the machine"))?,
         root: root.ok_or_else(|| io::Error::other("probe did not report a state root"))?,
         binary,
+        digest: digest.unwrap_or_else(|| "missing".into()),
     })
 }
 
@@ -143,12 +153,19 @@ async fn push(target: &Target, remote: &Remote, destination: &str) -> io::Result
         .parent()
         .map(|parent| parent.display().to_string())
         .unwrap_or_else(|| remote.root.clone());
+    // `shasum` needs `-a 256`; `sha256sum` reads the digest from stdin.
+    let verify = if remote.digest == "shasum" {
+        "shasum -a 256 -c - >/dev/null"
+    } else {
+        "sha256sum -c - >/dev/null"
+    };
     let script = format!(
         "set -eu\n\
          mkdir -p '{directory}'\n\
+         umask 077\n\
          cat > '{destination}.incoming'\n\
          chmod 700 '{destination}.incoming'\n\
-         printf '%s  %s\\n' '{digest}' '{destination}.incoming' | sha256sum -c - >/dev/null\n\
+         printf '%s  %s\\n' '{digest}' '{destination}.incoming' | {verify}\n\
          mv '{destination}.incoming' '{destination}'\n\
          printf 'pushed %s\\n' '{destination}'\n"
     );
@@ -224,6 +241,12 @@ pub async fn attach(target: Target, version: &str) -> io::Result<()> {
         return Err(io::Error::other(format!(
             "{} runs {}, and this plane only serves Linux hosts",
             target.host, remote.system
+        )));
+    }
+    if remote.digest == "missing" {
+        return Err(io::Error::other(format!(
+            "{} has neither sha256sum nor shasum, so a pushed binary could not be verified",
+            target.host
         )));
     }
     if remote.machine != arch {
@@ -427,18 +450,18 @@ mod tests {
     #[test]
     fn a_host_that_reports_our_binary_is_not_pushed_again() {
         let present = parse_probe(
-            "system Linux\nmachine x86_64\nhome /home/u\nroot /home/u/.dsh-shellout\nbinary /home/u/.dsh-shellout/bin/0.2.0-x86_64/runner\n",
+            "system Linux\nmachine x86_64\nhome /home/u\nroot /home/u/.dsh-shellout\nbinary /home/u/.dsh-shellout/bin/0.2.0-x86_64/runner\ndigest sha256sum\n",
         )
         .expect("parse");
         assert!(!needs_push(&present), "{:?}", present.binary);
-        let missing = parse_probe("system Linux\nmachine x86_64\nhome /home/u\nroot /home/u/.dsh-shellout\nbinary missing\n")
+        let missing = parse_probe("system Linux\nmachine x86_64\nhome /home/u\nroot /home/u/.dsh-shellout\nbinary missing\ndigest sha256sum\n")
             .expect("parse");
         assert!(needs_push(&missing));
     }
 
     #[test]
     fn probe_output_is_parsed() {
-        let remote = parse_probe("system Linux\nmachine x86_64\nhome /home/u\nroot /home/u/.dsh-shellout\nbinary missing\n")
+        let remote = parse_probe("system Linux\nmachine x86_64\nhome /home/u\nroot /home/u/.dsh-shellout\nbinary missing\ndigest shasum\n")
             .expect("parse");
         assert_eq!(remote.system, "Linux");
         assert_eq!(remote.root, "/home/u/.dsh-shellout");
