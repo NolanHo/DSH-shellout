@@ -159,6 +159,10 @@ failed instead of "worker died".
 - The pushed binary is pinned by `sha256` of the bytes actually sent.
 - A remote host can always run anything the ssh account can run; the runner does
   not pretend to sandbox beyond the policy the host already passes.
+- The verify and spawn steps trust the paths the probe discovered — the ssh
+  account itself is the trust boundary, and a root that is a symlink, or whose
+  existing components are owned by another user, is refused before anything is
+  written.
 
 ## Verifying against a real sshd
 

@@ -357,6 +357,31 @@ pub async fn attach(target: Target, version: &str) -> io::Result<()> {
         )));
     }
     let root = target.root.clone().unwrap_or_else(|| remote.root.clone());
+    if std::path::Path::new(&root).components().count() > 0 {
+        let check = [
+            "sh".to_string(),
+            "-c".to_string(),
+            shell_quote(
+                "set -eu\n\
+                 if [ -L \"$1\" ]; then printf 'symlinked root\\n' >&2; exit 3; fi\n\
+                 target=\"$1\"\n\
+                 while [ \"$target\" != \"/\" ] && [ -n \"$target\" ]; do\n\
+                   if [ -e \"$target\" ] && [ ! -O \"$target\" ]; then printf 'root not owned\\n' >&2; exit 3; fi\n\
+                   target=$(dirname \"$target\")\n\
+                 done\n",
+            ),
+            "sh".to_string(),
+            shell_quote(&root),
+        ]
+        .join(" ");
+        let check = run(&target, &[check], None).await?;
+        if check.code != 0 {
+            return Err(io::Error::other(format!(
+                "{}: the state root {} is not safe to write to: {}{}",
+                target.host, root, check.stdout, check.stderr
+            )));
+        }
+    }
     let binary = remote
         .binary
         .clone()
@@ -429,6 +454,10 @@ async fn bridge(child: &mut Child) -> io::Result<()> {
         _ = downstream => {}
         _ = upstream => {}
     }
+    // Whichever side ended, the remote executor is no longer serving anyone on
+    // this connection; leaving it running would keep the state lock held.
+    // `kill` is a future: start it and wait for the exit it causes.
+    let _ = child.start_kill();
     let status = child.wait().await?;
     // A remote executor that refuses to start (bad socket path, refused lock,
     // loader error) must not look like a clean end of session.
