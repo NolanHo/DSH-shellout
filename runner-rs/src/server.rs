@@ -58,9 +58,20 @@ pub async fn serve(config: Config, registry: Arc<Registry>) -> std::io::Result<(
     let listener = UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
 
+    // Settlement is observed by polling each live execution's status file.
+    // That poll is cheap and bounds how late a `settled` event can arrive, so
+    // it runs far more often than the lease/spill sweep it used to share.
+    let poller = Arc::clone(&registry);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(25));
+        loop {
+            ticker.tick().await;
+            poller.poll();
+        }
+    });
     let sweeper = Arc::clone(&registry);
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(500));
         loop {
             ticker.tick().await;
             sweeper.sweep();

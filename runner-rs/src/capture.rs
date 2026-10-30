@@ -85,7 +85,11 @@ mod tests {
         std::fs::write(dir.join("stdout.log"), b"ok\n").unwrap();
         let reply = read_stream(&dir, None, "stdout", 0, 64, false).unwrap();
         assert_eq!(reply["text"], "ok\n");
-        assert!(reply.get("spillPath").is_none(), "spillPath must be absent, got {:?}", reply.get("spillPath"));
+        assert!(
+            reply.get("spillPath").is_none(),
+            "spillPath must be absent, got {:?}",
+            reply.get("spillPath")
+        );
     }
 
     #[test]

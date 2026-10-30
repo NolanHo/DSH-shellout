@@ -516,8 +516,12 @@ impl Registry {
     }
 
     pub fn state(&self, id: &str) -> Result<Value, Failure> {
+        // Reflect a settlement the poller has not reached yet.
+        self.poll();
         let status = self.get(id)?.state();
-        Ok(json!({"state":status.state,"exitCode":status.exit_code,"signal":crate::protocol::signal_name(status.signal)}))
+        Ok(
+            json!({"state":status.state,"exitCode":status.exit_code,"signal":crate::protocol::signal_name(status.signal)}),
+        )
     }
 
     pub fn drain(&self, timeout_ms: u64) -> Value {
@@ -568,7 +572,7 @@ impl Registry {
         }
     }
 
-    fn poll(&self) {
+    pub fn poll(&self) {
         let mut persistence_error = None;
         for execution in self.all() {
             execution.refresh();
