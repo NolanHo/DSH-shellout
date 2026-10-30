@@ -29,7 +29,9 @@ operating-system work:
 
 The executor holds no sessions, model connection, HTTP surface or harness dependency.
 The separate `--mode hub` owns the dashboard and opens history read-only.
-See [execution-plane.md](execution-plane.md) for paths, flags and restart guarantees.
+See [execution-plane.md](execution-plane.md) for paths, flags and restart guarantees,
+and [remote-execution.md](remote-execution.md) for running the same protocol
+against a host reached over ssh.
 
 ## Build and run
 
