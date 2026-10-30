@@ -177,3 +177,164 @@ fn bootstraps_a_host_and_runs_a_command_over_the_transport() {
     let mode = std::fs::metadata(&binary).expect("metadata").permissions();
     assert!(mode.mode() & 0o100 != 0, "the pushed binary is executable");
 }
+
+/// Simulate a host reboot: every process of the plane on that host disappears
+/// while the state directory stays behind.
+#[test]
+fn a_rebooted_host_reconciles_its_running_rows_as_lost() {
+    let scratch = Scratch::new("attach-reboot");
+    let remote_root = remote_root(&scratch);
+    let state = remote_root.join("state");
+    let history = remote_root.join("history.sqlite");
+
+    let mut attached = Attached::start(&scratch, &remote_root);
+    let hello = attached.request(
+        "hello",
+        json!({ "protocol": "2.0", "clientBuild": "test", "bootId": "boot-reboot" }),
+    );
+    assert_eq!(hello["kind"], "res", "{hello}");
+    attached.request(
+        "exec",
+        json!({ "operationId": "op-reboot", "executionId": "reboot-1", "specDigest": "d", "spec": spec("sleep 120") }),
+    );
+
+    // Wait until the plane really started the command.
+    let status_path = state.join("reboot-1").join("status.json");
+    let running = support::until(
+        || {
+            let status: Value = support::read_json(&status_path);
+            (status["state"] == "running").then_some(status)
+        },
+        Duration::from_secs(20),
+        "the command starts",
+    );
+    let shim = running["shimPid"].as_i64().expect("shim pid") as i32;
+    let command = running["pid"].as_i64().expect("command pid") as i32;
+
+    // The reboot: the client goes away, then every process of the plane.
+    drop(attached);
+    for pid in [command, shim] {
+        // SAFETY: pids just read from the state document; ESRCH is tolerated.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+    std::thread::sleep(Duration::from_millis(500));
+
+    // A fresh attach is what a later session does after the host came back.
+    let mut after = Attached::start(&scratch, &remote_root);
+    let hello = after.request(
+        "hello",
+        json!({ "protocol": "2.0", "clientBuild": "test", "bootId": "boot-after-reboot" }),
+    );
+    assert_eq!(hello["kind"], "res", "{hello}");
+
+    // History is a projection of the state directory: a row whose process is
+    // gone must read `lost`, not `running`, without anyone settling it.
+    let rows = support::until(
+        || {
+            let connection = rusqlite::Connection::open_with_flags(
+                &history,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .ok()?;
+            let state: String = connection
+                .query_row(
+                    "select state from executions where id = 'reboot-1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .ok()?;
+            (state == "lost").then_some(state)
+        },
+        Duration::from_secs(20),
+        "the rebooted row reconciles to lost",
+    );
+    assert_eq!(rows, "lost");
+}
+
+/// The executor may die while a command runs; the command and its facts must
+/// survive, exactly as on the local plane.
+#[test]
+fn a_killed_remote_executor_is_adopted_and_still_reports_the_real_exit_code() {
+    let scratch = Scratch::new("attach-adopt");
+    let remote_root = remote_root(&scratch);
+    let state = remote_root.join("state");
+    let history = remote_root.join("history.sqlite");
+
+    let mut attached = Attached::start(&scratch, &remote_root);
+    let hello = attached.request(
+        "hello",
+        json!({ "protocol": "2.0", "clientBuild": "test", "bootId": "boot-adopt" }),
+    );
+    assert_eq!(hello["kind"], "res", "{hello}");
+    attached.request(
+        "exec",
+        json!({
+            "operationId": "op-adopt",
+            "executionId": "adopt-1",
+            "specDigest": "d",
+            "spec": spec("i=0; while [ $i -lt 4 ]; do echo tick-$i; i=$((i+1)); sleep 1; done; exit 7"),
+        }),
+    );
+    let status_path = state.join("adopt-1").join("status.json");
+    support::until(
+        || {
+            let status: Value = support::read_json(&status_path);
+            (status["state"] == "running").then_some(())
+        },
+        Duration::from_secs(20),
+        "the command starts",
+    );
+
+    // Kill the executor only: the shim owns the command and must keep it alive.
+    let identity = support::read_json(&state.join("executor.json"));
+    let executor = identity["pid"].as_i64().expect("executor pid") as i32;
+    // SAFETY: the pid this plane just published; ESRCH is tolerated.
+    unsafe {
+        libc::kill(executor, libc::SIGKILL);
+    }
+    drop(attached);
+    std::thread::sleep(Duration::from_millis(800));
+
+    // A later attach adopts the shim and reports the settlement it observed.
+    let mut after = Attached::start(&scratch, &remote_root);
+    let hello = after.request(
+        "hello",
+        json!({ "protocol": "2.0", "clientBuild": "test", "bootId": "boot-adopt-after" }),
+    );
+    assert_eq!(hello["kind"], "res", "{hello}");
+    let settled = after.settled("adopt-1");
+    assert_eq!(settled["exitCode"], 7, "{settled}");
+
+    let stdout = after.request(
+        "readStream",
+        json!({ "executionId": "adopt-1", "stream": "stdout", "offset": 0, "limit": 4096 }),
+    );
+    assert_eq!(
+        stdout["payload"]["text"], "tick-0\ntick-1\ntick-2\ntick-3\n",
+        "{stdout}"
+    );
+
+    // History agrees with the settlement the host received.
+    let row = support::until(
+        || {
+            let connection = rusqlite::Connection::open_with_flags(
+                &history,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .ok()?;
+            let row: (String, Option<i64>) = connection
+                .query_row(
+                    "select state, exit_code from executions where id = 'adopt-1'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .ok()?;
+            (row.0 == "exited").then_some(row)
+        },
+        Duration::from_secs(20),
+        "the adopted execution reaches history",
+    );
+    assert_eq!(row.1, Some(7), "{row:?}");
+}
