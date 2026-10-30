@@ -159,7 +159,8 @@ async function main() {
   const timed = await exec(client, "trap '' TERM; while :; do sleep 1; done", { timeoutMs: 200, graceMs: 100 })
   const deadlineResult = await settled(client, timed)
   assert.equal(deadlineResult.state, 'killed')
-  assert.equal(deadlineResult.signal, 9)
+  // Signals travel as names now: the seam declares `NodeJS.Signals | null`.
+  assert.equal(deadlineResult.signal, 'SIGKILL')
   ok('deadline TERM-to-KILL escalation')
 
   const background = await exec(client, 'sleep 600 & echo started')
