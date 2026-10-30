@@ -16,7 +16,9 @@ import { ShelloutClient } from '../src/core/client.ts'
 import { resolveConfig } from '../src/dsh/provider.ts'
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../../..')
-const runner = resolve(repo, 'runner-rs/target/release/dsh-shellout-runner')
+// attach refuses a controller that carries a dynamic loader, so the test drives
+// the same artifact a deployment pushes: the static build.
+const runner = resolve(repo, 'runner-rs/target/x86_64-unknown-linux-musl/release/dsh-shellout-runner')
 const fakeRemote = resolve(repo, 'scripts/fake-remote.sh')
 
 describe('remote transport selection', () => {

@@ -290,6 +290,7 @@ impl Execution {
             // not a complete capture: replace it instead of serving it.
             if let Ok(metadata) = fs::metadata(&target) {
                 if metadata.len() == facts.bytes {
+                    private_file(&target);
                     book.record(target, metadata.len());
                     continue;
                 }
@@ -305,7 +306,7 @@ impl Execution {
                 }
             }
             if let Some(parent) = target.parent() {
-                if let Err(error) = private_dir(parent) {
+                if let Err(error) = fs::create_dir_all(parent) {
                     eprintln!(
                         "execution {}: cannot create the spill directory: {error}",
                         self.meta.id
@@ -329,6 +330,7 @@ impl Execution {
             }
             match fs::metadata(&target) {
                 Ok(metadata) if metadata.len() == facts.bytes => {
+                    private_file(&target);
                     book.record(target, metadata.len());
                 }
                 Ok(metadata) => {
@@ -701,11 +703,13 @@ fn needs_persist(store: Option<&Store>, id: &str, status: &Status) -> bool {
     }
 }
 
-/// Create a directory readable only by its owner.
-fn private_dir(path: &Path) -> std::io::Result<()> {
+/// Make one file readable only by its owner.
+///
+/// The directory is the operator's choice and may be shared (`/tmp`); the copy
+/// carries the capture's mode with it, so the file is what has to be narrowed.
+fn private_file(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::create_dir_all(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
 }
 
 pub fn load(dir: PathBuf, store: Option<&Store>) -> io::Result<Arc<Execution>> {

@@ -30,20 +30,30 @@ pub struct Target {
 struct RemoteResult {
     code: i32,
     stdout: String,
+    stderr: String,
 }
 
 impl Target {
     /// The argv for one remote command line, host substituted where asked.
+    ///
+    /// `--` ends option parsing *before* the host; anything after the host is
+    /// already the remote command. A non-permuting getopt on the controller
+    /// would otherwise receive `--` as the first word of that command.
     fn argv(&self, remote: &[String]) -> Vec<String> {
-        let mut argv: Vec<String> = self
-            .ssh
-            .iter()
-            .map(|part| part.replace("{host}", &self.host))
-            .collect();
-        if !self.ssh.iter().any(|part| part.contains("{host}")) {
+        let templated = self.ssh.iter().any(|part| part.contains("{host}"));
+        let mut argv: Vec<String> = Vec::with_capacity(self.ssh.len() + remote.len() + 2);
+        for part in &self.ssh {
+            if templated && part.contains("{host}") {
+                argv.push("--".into());
+                argv.push(part.replace("{host}", &self.host));
+                continue;
+            }
+            argv.push(part.clone());
+        }
+        if !templated {
+            argv.push("--".into());
             argv.push(self.host.clone());
         }
-        argv.push("--".into());
         argv.extend(remote.iter().cloned());
         argv
     }
@@ -81,21 +91,18 @@ async fn run(
     Ok(RemoteResult {
         code: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
 }
 
 /// Probe the remote host: platform, home, and whether our binary is there.
-fn probe_script(version: &str, arch: &str, requested_root: Option<&str>) -> String {
-    let root_line = requested_root
-        .map(|root| format!("root={root}\n"))
-        .unwrap_or_default();
+fn probe_script(version: &str, arch: &str) -> String {
     format!(
         "set -eu\n\
-         {root_line}\
+         root=\"${{1:-${{DSH_SHELLOUT_HOME:-$HOME/.dsh-shellout}}}}\"\n\
          printf 'system %s\\n' \"$(uname -s)\"\n\
          printf 'machine %s\\n' \"$(uname -m)\"\n\
          printf 'home %s\\n' \"$HOME\"\n\
-         root=\"${{DSH_SHELLOUT_HOME:-$HOME/.dsh-shellout}}\"\n\
          test -w \"$HOME\" || root=\"/tmp/dsh-shellout-$(id -u)\"\n\
          printf 'root %s\\n' \"$root\"\n\
          binary=\"$root/bin/{version}-{arch}/runner\"\n\
@@ -248,8 +255,8 @@ async fn push(target: &Target, remote: &Remote, destination: &str) -> io::Result
     let result = run(target, &[command], Some(bytes)).await?;
     if result.code != 0 {
         return Err(io::Error::other(format!(
-            "push to {} failed (exit {}): {}",
-            target.host, result.code, result.stdout
+            "push to {} failed (exit {}): {}{}",
+            target.host, result.code, result.stdout, result.stderr
         )));
     }
     Ok(())
@@ -275,8 +282,8 @@ async fn verify(target: &Target, binary: &str, state_root: &str) -> io::Result<(
         return Ok(());
     }
     Err(io::Error::other(format!(
-        "the pushed binary cannot run on the host (exit {}): {}",
-        result.code, result.stdout
+        "the pushed binary cannot run on the host (exit {}): {}{}",
+        result.code, result.stdout, result.stderr
     )))
 }
 
@@ -291,20 +298,21 @@ pub async fn attach(target: Target, version: &str) -> io::Result<()> {
             )))
         }
     };
-    let probe = run(
-        &target,
-        &[
-            "sh".to_string(),
-            "-c".to_string(),
-            probe_script(version, arch, target.root.as_deref()),
-        ],
-        None,
-    )
-    .await?;
+    // The root travels as an argument: the remote login shell re-parses this
+    // line, so an interpolated value would be code.
+    let probe_command = [
+        "sh".to_string(),
+        "-c".to_string(),
+        shell_quote(&probe_script(version, arch)),
+        "sh".to_string(),
+        shell_quote(target.root.as_deref().unwrap_or("")),
+    ]
+    .join(" ");
+    let probe = run(&target, &[probe_command], None).await?;
     if probe.code != 0 {
         return Err(io::Error::other(format!(
-            "cannot probe {}: exit {}: {}",
-            target.host, probe.code, probe.stdout
+            "cannot probe {}: exit {}: {}{}",
+            target.host, probe.code, probe.stdout, probe.stderr
         )));
     }
     let remote = parse_probe(&probe.stdout)?;
@@ -512,7 +520,7 @@ mod tests {
         };
         assert_eq!(
             target.argv(&["true".into()]),
-            vec!["ssh", "example", "--", "true"]
+            vec!["ssh", "--", "example", "true"]
         );
         let templated = Target {
             ssh: vec!["ssh".into(), "{host}".into()],
@@ -521,7 +529,7 @@ mod tests {
         };
         assert_eq!(
             templated.argv(&["true".into()]),
-            vec!["ssh", "example", "--", "true"]
+            vec!["ssh", "--", "example", "true"]
         );
     }
 

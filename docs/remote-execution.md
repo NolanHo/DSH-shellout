@@ -116,7 +116,7 @@ binary through it.
 The protocol answers `history { limit }` with the host's recent settlements, so
 a controller that attaches after the fact still sees what ran there. The rows
 live with the host — that is where the state directory and the shim facts are —
-and a dashboard merges them by asking each attached host.
+so a controller reading them asks the host rather than opening its database.
 
 ## Bootstrap protocol
 
@@ -128,8 +128,9 @@ Attach performs, in order, each step separately diagnosable:
    `~/.dsh-shellout`, else `/tmp/dsh-shellout-<uid>` when the home is read-only.
 3. Probe executability: run the cached binary with `--mode status`; a `noexec`
    mount or a wrong arch shows up here rather than at the first real command.
-4. If the cached version does not answer, push the local static binary, verify
-   `sha256`, `chmod 0700`, atomic rename, then re-probe.
+4. If the probe found no cached binary, push the local static binary, verify
+   `sha256`, `chmod 0700`, atomic rename, then re-probe. A cached binary that
+   exists but cannot run is a reported failure, not a silent re-push.
 5. Exec `… --mode stdio --state <root>/state` and speak frames.
 
 Every step reports what it found, so a host that fails says which precondition

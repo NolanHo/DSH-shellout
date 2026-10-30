@@ -8,6 +8,7 @@
 # result — a transport that exec'd them as separate argv entries would hide
 # exactly the quoting bugs this test exists to catch.
 set -euo pipefail
-shift # host
+# ssh: `ssh [options] -- host command…`
 [ "${1:-}" = "--" ] && shift
+shift # host
 exec sh -c "$*"

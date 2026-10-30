@@ -98,7 +98,13 @@ export class ShelloutClient {
     const socket = await openTransport(transportOf(options), options.connectTimeoutMs ?? 5_000).catch(
       (error: Error) => { throw new ShelloutRpcError('protocol', error.message) },
     )
-    const { hello, trailing } = await handshakeOn(socket, options)
+    // A transport that already started (an attach child, a socket) must not
+    // outlive a failed handshake: the caller retries, and every retry would
+    // otherwise leave another session holding the host's state lock.
+    const { hello, trailing } = await handshakeOn(socket, options).catch((error: Error) => {
+      socket.destroy()
+      throw error
+    })
     const client = new ShelloutClient(socket, options, hello.descriptor, hello)
     for (const frame of trailing) client.dispatch(frame)
     socket.resume()
