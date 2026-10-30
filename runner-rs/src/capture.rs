@@ -60,16 +60,33 @@ pub fn read_stream(
     }
     let text = String::from_utf8_lossy(&bytes);
     let invalid = matches!(&text, std::borrow::Cow::Owned(_));
-    Ok(json!({"text":text,"nextOffset":offset + bytes.len() as u64,
-    "lossy":truncated || invalid,"truncated":truncated,
-    "spillPath": if truncated { None } else {
-        spill.map(|path| path.display().to_string())
-    }}))
+    // `spillPath` is omitted rather than null: the wire contract makes it an
+    // optional string, and a null reaches strict consumers as a type violation.
+    let mut reply = json!({"text":text,"nextOffset":offset + bytes.len() as u64,
+    "lossy":truncated || invalid,"truncated":truncated});
+    if !truncated {
+        if let Some(path) = spill {
+            reply["spillPath"] = serde_json::Value::String(path.display().to_string());
+        }
+    }
+    Ok(reply)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_absent_spill_is_omitted_rather_than_null() {
+        // The wire contract makes `spillPath` an optional string. A null value
+        // reaches a strict consumer as a type violation, so it must be absent.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".test-state/no-spill");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stdout.log"), b"ok\n").unwrap();
+        let reply = read_stream(&dir, None, "stdout", 0, 64, false).unwrap();
+        assert_eq!(reply["text"], "ok\n");
+        assert!(reply.get("spillPath").is_none(), "spillPath must be absent, got {:?}", reply.get("spillPath"));
+    }
 
     #[test]
     fn file_offsets_limits_and_binary_bytes() {

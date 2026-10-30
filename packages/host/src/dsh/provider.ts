@@ -351,7 +351,9 @@ class RunnerShellExecution implements ShellExecution {
       return {
         text: read.text,
         truncated: read.lossy,
-        ...read.spillPath === undefined ? {} : { spillPath: read.spillPath },
+        // A runner from an older or newer release may send null here; the
+        // contract is an optional string, so treat null as absent.
+        ...read.spillPath == null ? {} : { spillPath: read.spillPath },
       }
     }
     return {
