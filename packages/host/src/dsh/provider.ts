@@ -78,6 +78,27 @@ export interface ShelloutConfig {
 }
 
 /** Configuration after defaulting. */
+/** Signal numbers a runner may report, mapped to the names the seam declares. */
+const SIGNAL_NAMES: Record<number, NodeJS.Signals> = {
+  1: 'SIGHUP', 2: 'SIGINT', 3: 'SIGQUIT', 4: 'SIGILL', 5: 'SIGTRAP', 6: 'SIGABRT',
+  7: 'SIGBUS', 8: 'SIGFPE', 9: 'SIGKILL', 10: 'SIGUSR1', 11: 'SIGSEGV', 12: 'SIGUSR2',
+  13: 'SIGPIPE', 14: 'SIGALRM', 15: 'SIGTERM', 16: 'SIGSTKFLT', 17: 'SIGCHLD',
+  18: 'SIGCONT', 19: 'SIGSTOP', 20: 'SIGTSTP', 21: 'SIGTTIN', 22: 'SIGTTOU',
+  23: 'SIGURG', 24: 'SIGXCPU', 25: 'SIGXFSZ', 26: 'SIGVTALRM', 27: 'SIGPROF',
+  28: 'SIGWINCH', 29: 'SIGIO', 30: 'SIGPWR', 31: 'SIGSYS',
+}
+
+/**
+ * Normalize a reported terminating signal to the seam's name form.
+ * @param value - name, number, or null as reported by the runner.
+ * @returns the signal name, or null when none was reported.
+ */
+function signalName(value: string | number | null | undefined): NodeJS.Signals | null {
+  if (value === null || value === undefined) return null
+  if (typeof value === 'string') return value as NodeJS.Signals
+  return SIGNAL_NAMES[value] ?? null
+}
+
 export interface ResolvedShelloutConfig {
   readonly socketPath: string
   readonly connectTimeoutMs: number
@@ -305,7 +326,9 @@ class RunnerShellExecution implements ShellExecution {
   }
 
   get signal(): NodeJS.Signals | null {
-    return this.remote.signal as NodeJS.Signals | null
+    // The seam declares a signal name, but an executor may report the raw
+    // number; a number reaching the tool schema fails its string branch.
+    return signalName(this.remote.signal)
   }
 
   get sandbox(): ShellSandboxInfo | undefined {

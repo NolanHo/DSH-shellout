@@ -517,7 +517,7 @@ impl Registry {
 
     pub fn state(&self, id: &str) -> Result<Value, Failure> {
         let status = self.get(id)?.state();
-        Ok(json!({"state":status.state,"exitCode":status.exit_code,"signal":status.signal}))
+        Ok(json!({"state":status.state,"exitCode":status.exit_code,"signal":crate::protocol::signal_name(status.signal)}))
     }
 
     pub fn drain(&self, timeout_ms: u64) -> Value {
@@ -652,7 +652,7 @@ fn settled_event(execution: &Execution) -> Value {
         "settled",
         json!({"executionId":execution.meta.id,
             "status":if status.state == "lost" { "failed" } else { &status.state },
-            "exitCode":status.exit_code,"signal":status.signal,
+            "exitCode":status.exit_code,"signal":crate::protocol::signal_name(status.signal),
             "termination":status.termination,"detail":status.error}),
     )
 }

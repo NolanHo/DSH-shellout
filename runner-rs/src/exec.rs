@@ -225,7 +225,7 @@ impl Execution {
             .take(256)
             .collect();
         json!({"id": self.meta.id, "command": command, "state":status.state,
-            "exitCode":status.exit_code,"signal":status.signal,
+            "exitCode":status.exit_code,"signal":crate::protocol::signal_name(status.signal),
             "startedAtMs":status.started_at,"finishedAtMs":status.finished_at,
             "ageMs":shim::now_ms().saturating_sub(status.started_at),
             "durationMs":status.finished_at.map(|end| end.saturating_sub(status.started_at)),
@@ -239,7 +239,7 @@ impl Execution {
     pub fn terminal_facts(&self) -> Value {
         let status = self.state();
         json!({"executionId":self.meta.id,"state":status.state,
-            "exitCode":status.exit_code,"signal":status.signal,
+            "exitCode":status.exit_code,"signal":crate::protocol::signal_name(status.signal),
             "termination":status.termination,
             "detail":status.error})
     }
