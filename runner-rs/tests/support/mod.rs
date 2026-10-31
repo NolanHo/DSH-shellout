@@ -84,7 +84,10 @@ impl Executor {
         let stderr = scratch.root.join(format!("{name}.stderr"));
         let file = std::fs::File::create(&stderr).expect("stderr file");
         let mut command = Command::new(binary);
+        // Extras come first: the runner takes the first occurrence of a flag, so
+        // a test can override a default instead of being overridden by it.
         command
+            .args(extra)
             .arg("--state")
             .arg(scratch.state())
             .arg("--history")
@@ -93,7 +96,6 @@ impl Executor {
             .arg(scratch.socket())
             .arg("--lease-ttl-ms")
             .arg("60000")
-            .args(extra)
             .envs(envs.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -255,6 +257,11 @@ impl Client {
     }
 
     /// State of one execution, or `None` on a wire error.
+    /// Send a heartbeat for one boot, keeping its lease alive.
+    pub fn ping(&mut self, boot: &str) -> Option<Value> {
+        self.request("ping", json!({ "bootId": boot }))
+    }
+
     pub fn state(&mut self, id: &str) -> Option<Value> {
         self.request("state", json!({"executionId": id}))
     }

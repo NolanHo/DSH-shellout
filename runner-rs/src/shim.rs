@@ -275,9 +275,36 @@ pub fn read_status(dir: &Path) -> io::Result<Status> {
     Ok(status)
 }
 
+/// Why the client boot's lease looks expired, if it does.
+///
+/// The executor writes `.boots/<bootId>` on every ping; with no executor left,
+/// the file simply stops being refreshed, which is exactly the condition this
+/// plane wants to act on — and the shim is the process that is always there.
+fn expired_lease(state: &Path, boot: &str, now: SystemTime) -> Option<String> {
+    let name: String = boot
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let path = state.join(".boots").join(name);
+    let text = fs::read_to_string(&path).ok()?;
+    let ttl = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()?
+        .get("ttlMs")?
+        .as_u64()?;
+    let touched = fs::metadata(&path).ok()?.modified().ok()?;
+    let age = now.duration_since(touched).ok()?;
+    (age > Duration::from_millis(ttl)).then(|| TERMINATION_LEASE.to_string())
+}
+
 /// The reason recorded in `kill.request`, or `None` when nothing asked for a
 /// termination. An empty request file (older executors, tests) is a plain request.
-pub fn kill_request(dir: &Path) -> Option<String> {
+fn kill_request(dir: &Path) -> Option<String> {
     let text = fs::read_to_string(dir.join("kill.request")).ok()?;
     Some(
         match text.trim() {
@@ -410,7 +437,7 @@ pub fn run(state: &Path, id: &str) -> io::Result<()> {
     let result = match decision {
         Ok(()) => {
             exec_delay();
-            supervise(&dir, &meta.spec, &mut status)
+            supervise(&dir, &meta.spec, &mut status, &meta.boot_id, state)
         }
         Err(refusal) => Err(io::Error::other(refusal)),
     };
@@ -452,7 +479,13 @@ fn publish_running(dir: &Path, status: &Status, published: &mut Option<Status>) 
     Ok(())
 }
 
-fn supervise(dir: &Path, spec: &SpawnSpec, status: &mut Status) -> io::Result<()> {
+fn supervise(
+    dir: &Path,
+    spec: &SpawnSpec,
+    status: &mut Status,
+    boot: &str,
+    state: &Path,
+) -> io::Result<()> {
     let program = spec
         .argv
         .first()
@@ -541,7 +574,15 @@ fn supervise(dir: &Path, spec: &SpawnSpec, status: &mut Status) -> io::Result<()
         });
     }
     let mut published = Some(status.clone());
-    let outcome = wait_for_exit(dir, spec, status, &out, &err, &mut published);
+    let outcome = wait_for_exit(
+        dir,
+        spec,
+        status,
+        &out,
+        &err,
+        &mut published,
+        Lease { state, boot },
+    );
     let outcome = match outcome {
         Ok(facts) => facts,
         Err(error) => {
@@ -607,6 +648,14 @@ fn collect_streams(
     }
 }
 
+/// Where a waiting shim looks for the facts that outlive one connection.
+struct Lease<'a> {
+    /// State root holding `.boots/`.
+    state: &'a Path,
+    /// Client boot this execution is charged to.
+    boot: &'a str,
+}
+
 fn wait_for_exit(
     dir: &Path,
     spec: &SpawnSpec,
@@ -614,6 +663,7 @@ fn wait_for_exit(
     out: &Arc<Mutex<StreamStatus>>,
     err: &Arc<Mutex<StreamStatus>>,
     published: &mut Option<Status>,
+    lease: Lease<'_>,
 ) -> io::Result<ExitFacts> {
     let pid = status.pid.expect("spawned");
     let started = Instant::now();
@@ -624,11 +674,13 @@ fn wait_for_exit(
             return Ok(facts);
         }
         if terminating.is_none() {
-            let reason = kill_request(dir).or_else(|| {
-                (spec.on_expiry == "kill"
-                    && started.elapsed() >= Duration::from_millis(spec.timeout_ms))
-                .then(|| TERMINATION_DEADLINE.to_string())
-            });
+            let reason = kill_request(dir)
+                .or_else(|| expired_lease(lease.state, lease.boot, SystemTime::now()))
+                .or_else(|| {
+                    (spec.on_expiry == "kill"
+                        && started.elapsed() >= Duration::from_millis(spec.timeout_ms))
+                    .then(|| TERMINATION_DEADLINE.to_string())
+                });
             if let Some(reason) = reason {
                 status.termination = Some(reason);
                 terminating = Some(Instant::now());

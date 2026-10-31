@@ -176,6 +176,7 @@ impl Registry {
                             .expect("boots poisoned")
                             .entry(execution.meta.boot_id.clone())
                             .or_insert(Instant::now() + self.lease_ttl);
+                        self.heartbeat(&execution.meta.boot_id);
                     }
                     self.executions
                         .lock()
@@ -311,6 +312,9 @@ impl Registry {
             .lock()
             .expect("boots poisoned")
             .insert(boot.into(), Instant::now() + self.lease_ttl);
+        // The shim enforces the lease from this file, so it has to exist from
+        // the moment the boot does; otherwise a dead executor means no lease.
+        self.heartbeat(boot);
         self.executions
             .lock()
             .expect("executions poisoned")
@@ -345,6 +349,30 @@ impl Registry {
             .collect()
     }
 
+    /// Publish this boot's lease heartbeat to the state directory.
+    ///
+    /// The shim enforces the lease from this file, so a client that vanishes
+    /// still gets its commands terminated when no executor is left to sweep.
+    fn heartbeat(&self, boot: &str) {
+        let directory = self.state_dir.join(".boots");
+        if std::fs::create_dir_all(&directory).is_err() {
+            return;
+        }
+        // The boot id comes from the client: keep it a single path component.
+        let name: String = boot
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let document = json!({ "ttlMs": self.lease_ttl.as_millis() as u64, "bootId": boot });
+        let _ = std::fs::write(directory.join(name), document.to_string());
+    }
+
     pub fn ping(&self, boot: &str) -> Result<(), Failure> {
         let mut boots = self
             .boots
@@ -354,6 +382,8 @@ impl Registry {
             .get_mut(boot)
             .ok_or_else(|| Failure::new("protocol", "unknown boot; reconnect with hello"))?;
         *deadline = Instant::now() + self.lease_ttl;
+        drop(boots);
+        self.heartbeat(boot);
         Ok(())
     }
 

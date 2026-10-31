@@ -93,7 +93,7 @@ the local plane hold unchanged:
 |---|---|---|---|
 | ssh connection drops | keeps running (shim owns it) | intact | remote rows resume on the next attach |
 | remote executor killed | keeps running; the next attach adopts it by pid+start time | intact | idem |
-| owner dies while a session is bridged | keeps running, but that session ends; the next attach becomes the owner | intact | resumes after that attach |
+| owner dies while a session is bridged | keeps running; the next attach serves the state root again | intact | resumes after that attach |
 | remote host reboots | lost (processes are gone) | rows reconcile to `lost` on the next attach | visible as `lost` |
 
 The reconnect path is the existing settlement replay plus the handshake's
@@ -193,14 +193,24 @@ and that history answers from the host.
   `lost`.
 - Static binary runs with an empty `PATH` and no `/etc/ld.so` entry.
 
-### Known limitation: a bridge does not outlive its owner
+### Why an owner is not a correctness prerequisite
 
-A session that found an owner bridges to it. If that owner disappears, the
-bridge ends with the connection, because the takeover would have to replay a
-handshake the caller already completed. Commands survive (the shims own them)
-and the next attach becomes the owner, so the gap is a session lifetime, not a
-lost execution. The alternative — replaying the handshake into a promoted
-session — is tracked as future work rather than guessed at.
+Nothing a command needs lives in the process that serves the socket:
+
+- the command's supervisor is its own shim, which writes `status.json` and the
+  capture files whether or not anyone is attached;
+- a timeout is enforced by that shim, from the spec it was given;
+- a termination request is a file (`kill.request`) any client can write;
+- **the lease is enforced by the shim too**: the executor touches
+  `<state>/.boots/<bootId>` on every heartbeat, and a shim whose heartbeat is
+  older than the lease TTL terminates its group with reason `lease`. A client
+  that vanishes therefore loses its commands even when no executor is left to
+  sweep — the same rule rexec follows when its worker outlives the connection.
+
+So the serving process is replaceable at any moment. Losing it costs the live
+event stream and leaves history rows to be reconciled by the next attach; it
+does not lose an execution, and no handshake has to be replayed, because a new
+session simply becomes the owner against the same state directory.
 
 ## Non-goals
 
