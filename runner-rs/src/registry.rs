@@ -163,6 +163,11 @@ impl Registry {
             if !entry.file_type()?.is_dir() {
                 continue;
             }
+            // Hidden entries are the plane's own bookkeeping (`.boots/` holds the
+            // lease heartbeats), not executions.
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
             match exec::load(entry.path(), store.as_deref()) {
                 Ok(execution) => {
                     if execution.running() {

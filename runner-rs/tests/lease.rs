@@ -81,3 +81,32 @@ fn a_client_that_keeps_pinging_keeps_its_command() {
     let status: serde_json::Value = support::read_json(&status_path);
     assert_eq!(status["state"], "running", "{status}");
 }
+
+/// The plane's own bookkeeping must not look like an execution at startup.
+#[test]
+fn adoption_ignores_the_heartbeat_directory() {
+    let scratch = Scratch::new("lease-adopt");
+    let mut executor = Executor::start_named(&scratch, "executor", &["--lease-ttl-ms", "60000"]);
+    let mut host = executor.ready();
+    host.hello("boot-adopt");
+    host.exec("real", "true", json!({})).expect("admitted");
+    support::until(
+        || {
+            let status: serde_json::Value =
+                support::read_json(&scratch.state().join("real").join("status.json"));
+            (status["state"] != "running").then_some(())
+        },
+        Duration::from_secs(20),
+        "the execution settles",
+    );
+    executor.kill();
+
+    // The restarted executor adopts what it finds; `.boots/` must be skipped
+    // rather than reported as a broken execution.
+    let restarted = Executor::start_named(&scratch, "executor", &["--lease-ttl-ms", "60000"]);
+    let stderr = restarted.diagnose();
+    assert!(
+        !stderr.contains(".boots: recovery failed"),
+        "the heartbeat directory is not an execution: {stderr}"
+    );
+}
