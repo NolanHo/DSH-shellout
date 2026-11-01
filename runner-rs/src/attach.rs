@@ -454,18 +454,12 @@ async fn bridge(child: &mut Child) -> io::Result<()> {
         _ = downstream => {}
         _ = upstream => {}
     }
-    // Whichever side ended, the remote executor is no longer serving anyone on
-    // this connection; leaving it running would keep the state lock held.
-    // `kill` is a future: start it and wait for the exit it causes.
+    // Whichever side ended, this connection is over; the remote executor is no
+    // longer serving it, and leaving it alive would keep the host's state lock.
+    // A bootstrap failure already returned above, so a session that ends here is
+    // a normal disconnect: the client reconnects and finds the state root again.
     let _ = child.start_kill();
-    let status = child.wait().await?;
-    // A remote executor that refuses to start (bad socket path, refused lock,
-    // loader error) must not look like a clean end of session.
-    if !status.success() {
-        return Err(io::Error::other(format!(
-            "the remote executor exited with {status}"
-        )));
-    }
+    let _ = child.wait().await;
     Ok(())
 }
 

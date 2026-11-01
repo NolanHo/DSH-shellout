@@ -60,6 +60,11 @@ export interface RemoteTarget {
   readonly ssh?: readonly string[]
   /** Remote state root; defaults to `$HOME/.dsh-shellout` on the host. */
   readonly remoteRoot?: string
+  /**
+   * Working directory for commands on the host. A local workspace path usually
+   * does not exist there, so a remote deployment names its own.
+   */
+  readonly cwd?: string
 }
 
 /** Plugin configuration; every field is optional. */
@@ -134,6 +139,8 @@ export interface ResolvedShelloutConfig {
   readonly settlementLog?: string
   /** Host label recorded with each remote settlement. */
   readonly remoteHost?: string
+  /** Working directory remote commands run in, when the deployment names one. */
+  readonly remoteCwd?: string
   /** How the client reaches the runner. */
   readonly transport: TransportOptions
   readonly connectTimeoutMs: number
@@ -202,6 +209,7 @@ export function resolveConfig(config: ShelloutConfig = {}, env: NodeJS.ProcessEn
       : {
           settlementLog: config.settlementLog ?? join(dirname(socketPath), 'remote-settlements.jsonl'),
           remoteHost: config.remote.host,
+          ...config.remote.cwd === undefined ? {} : { remoteCwd: config.remote.cwd },
         },
     transport: transportFor(config, socketPath),
     connectTimeoutMs: config.connectTimeoutMs ?? 5_000,
@@ -533,9 +541,15 @@ function toSpawnSpec(spec: ShellExecSpec, config: ResolvedShelloutConfig): Spawn
   })) {
     if (value !== undefined) env[key] = value
   }
+  // A remote host is a different machine: the controller's PATH, HOME and
+  // tmpdir describe this one, so a remote command inherits none of them and
+  // resolves `bash` against the host's own environment.
+  if (config.remoteHost !== undefined) {
+    for (const key of ['PATH', 'HOME', 'TMPDIR', 'PWD', 'SHELL', 'HOSTNAME']) delete env[key]
+  }
   return {
     argv: ['bash', '-c', spec.command],
-    cwd: spec.workdir,
+    cwd: config.remoteCwd ?? spec.workdir,
     env,
     ...spec.stdin === undefined ? {} : { stdin: spec.stdin },
     timeoutMs: spec.timeoutMs,
