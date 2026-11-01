@@ -147,11 +147,17 @@ fn main() -> std::io::Result<()> {
             if mode == "hub" {
                 let store = hub::open_store(&paths.history);
                 let mut hub = hub::Hub::new(store, paths.executor_socket);
-                // Beside the socket is where the host plugin writes it.
+                // The host plugin appends remote settlements beside its socket;
+                // a deployment points both at the same file.
                 hub.settlement_log = Some(
-                    std::path::Path::new(&paths.socket)
-                        .parent()
-                        .map(|parent| parent.join("remote-settlements.jsonl"))
+                    arg_value("--remote-settlements")
+                        .map(std::path::PathBuf::from)
+                        .or_else(|| {
+                            paths
+                                .history
+                                .parent()
+                                .map(|parent| parent.join("remote-settlements.jsonl"))
+                        })
                         .unwrap_or_else(|| std::path::PathBuf::from("remote-settlements.jsonl")),
                 );
                 let hub = Arc::new(hub);
