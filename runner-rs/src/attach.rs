@@ -24,6 +24,8 @@ pub struct Target {
     pub host: String,
     /// Remote root override; empty means "resolve from $HOME".
     pub root: Option<String>,
+    /// Extra flags for the remote executor, one word per entry.
+    pub executor_args: Vec<String>,
 }
 
 /// A completed remote command.
@@ -397,7 +399,7 @@ pub async fn attach(target: Target, version: &str) -> io::Result<()> {
 
 /// Start the remote executor over the transport and return the child.
 fn spawn_stdio(target: &Target, binary: &str, root: &str) -> io::Result<Child> {
-    let remote = [
+    let mut remote = vec![
         shell_quote(binary),
         "--mode".into(),
         "stdio".into(),
@@ -407,8 +409,9 @@ fn spawn_stdio(target: &Target, binary: &str, root: &str) -> io::Result<Child> {
         shell_quote(&format!("{root}/control.sock")),
         "--history".into(),
         shell_quote(&format!("{root}/history.sqlite")),
-    ]
-    .join(" ");
+    ];
+    remote.extend(target.executor_args.iter().map(|arg| shell_quote(arg)));
+    let remote = remote.join(" ");
     let argv = target.argv(&[remote]);
     Command::new(&argv[0])
         .args(&argv[1..])
@@ -568,6 +571,7 @@ mod tests {
             ssh: vec!["ssh".into()],
             host: "example".into(),
             root: None,
+            executor_args: Vec::new(),
         };
         assert_eq!(
             target.argv(&["true".into()]),
@@ -577,6 +581,7 @@ mod tests {
             ssh: vec!["ssh".into(), "{host}".into()],
             host: "example".into(),
             root: None,
+            executor_args: Vec::new(),
         };
         assert_eq!(
             templated.argv(&["true".into()]),

@@ -126,10 +126,22 @@ fn main() -> std::io::Result<()> {
                 "BatchMode=yes".to_string(),
             ];
         }
+        let mut executor_args: Vec<String> = Vec::new();
+        let mut rest = std::env::args().skip(1);
+        while let Some(word) = rest.next() {
+            if word == "--remote-executor-arg" {
+                if let Some(value) = rest.next() {
+                    executor_args.push(value);
+                }
+            } else if let Some(value) = word.strip_prefix("--remote-executor-arg=") {
+                executor_args.push(value.to_string());
+            }
+        }
         let target = attach::Target {
             ssh,
             host,
             root: arg_value("--remote-root"),
+            executor_args,
         };
         return tokio::runtime::Builder::new_multi_thread()
             .enable_all()
