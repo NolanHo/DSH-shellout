@@ -66,6 +66,7 @@ pre{margin:0 0 12px;padding:11px 13px;background:#0b0d11;border:1px solid #22262
   <button class="fbtn on" data-filter="all">全部 <b data-count="all">0</b></button>
   <button class="fbtn" data-filter="running">运行中 <b data-count="running">0</b></button>
   <button class="fbtn" data-filter="finished">已结束 <b data-count="finished">0</b></button>
+  <button class="fbtn" data-filter="remote">远端 <b data-count="remote">0</b></button>
 </div>
 <div class="tools">
   <input id="filter" placeholder="filter by command…" autocomplete="off">
@@ -140,6 +141,7 @@ function render() {
   const needle = filter.trim().toLowerCase()
   const byKind = kind === 'running' ? rowsCache.filter(e => e.state === 'running')
     : kind === 'finished' ? rowsCache.filter(e => e.state !== 'running')
+    : kind === 'remote' ? rowsCache.filter(e => e.remote === true)
     : rowsCache
   const visible = needle === '' ? byKind : byKind.filter(e => commandLine(e).toLowerCase().includes(needle))
   const counts = {
@@ -188,6 +190,19 @@ function render() {
 async function loadList() {
   const { executions } = await (await fetch('/api/executions', { cache: 'no-store' })).json()
   rowsCache = executions
+  // Remote settlements live on the host; this instance only indexes them.
+  const { rows } = await (await fetch('/api/remote-settlements', { cache: 'no-store' })).json()
+  for (const row of rows ?? []) {
+    rowsCache = rowsCache.concat({
+      id: row.executionId,
+      remote: true,
+      argv: [row.host ?? 'remote', '\u00b7', row.status].join(' '),
+      startedAt: row.at,
+      state: row.status,
+      exitCode: row.exitCode,
+      remoteRow: row,
+    })
+  }
   if (selected !== null && !executions.some(e => e.id === selected)) {
     detailCache = null
   }

@@ -12,7 +12,8 @@
 
 import { randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { appendFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { SandboxMode } from '@deepseek-ai/dsh-sandbox'
 import { ShellExecutor } from '@deepseek-ai/dsh-shell'
@@ -25,6 +26,7 @@ import type {
   ShellRunResult,
   ShellSandboxInfo,
 } from '@deepseek-ai/dsh-shell'
+import type { SettledEvent } from 'dsh-shellout-protocol'
 import { ENV_OVERRIDES } from '@deepseek-ai/dsh-bash-local'
 import { scrubbedParentEnv } from '@deepseek-ai/dsh-subprocess'
 import { specDigest, type SpawnSpec } from 'dsh-shellout-protocol'
@@ -93,6 +95,11 @@ export interface ShelloutConfig {
   fallback?: 'local' | 'none'
   /** Settings for the fallback executor. */
   local?: LocalExecutorConfig
+  /**
+   * Where remote settlements are appended for the local dashboard; defaults to
+   * `remote-settlements.jsonl` beside the socket path. Ignored without `remote`.
+   */
+  settlementLog?: string
 }
 
 /** Configuration after defaulting. */
@@ -119,6 +126,14 @@ function signalName(value: string | number | null | undefined): NodeJS.Signals |
 
 export interface ResolvedShelloutConfig {
   readonly socketPath: string
+  /**
+   * Append-only settlement log for a remote target. The runner keeps its own
+   * history on the host; this file is how a local dashboard sees those rows
+   * without write access to the host's database.
+   */
+  readonly settlementLog?: string
+  /** Host label recorded with each remote settlement. */
+  readonly remoteHost?: string
   /** How the client reaches the runner. */
   readonly transport: TransportOptions
   readonly connectTimeoutMs: number
@@ -148,6 +163,29 @@ function transportFor(config: ShelloutConfig, socketPath: string): TransportOpti
 }
 
 /**
+ * One line of the read-side index a local dashboard merges.
+ *
+ * @param host - target the settlement came from.
+ * @param executionId - execution the settlement belongs to.
+ * @param event - settlement facts the runner reported.
+ * @returns the JSON line, without a trailing newline.
+ */
+export function settlementLine(
+  host: string | undefined,
+  executionId: string,
+  event: { status: string; exitCode?: number | null; signal?: string | number | null },
+): string {
+  return JSON.stringify({
+    at: Date.now(),
+    host,
+    executionId,
+    status: event.status,
+    exitCode: event.exitCode ?? null,
+    signal: signalName(event.signal),
+  })
+}
+
+/**
  * Apply defaults to a plugin configuration.
  * @param config - caller configuration, possibly partial.
  * @param env - environment to read the harness home from.
@@ -158,6 +196,13 @@ export function resolveConfig(config: ShelloutConfig = {}, env: NodeJS.ProcessEn
   const socketPath = config.socketPath ?? join(home, 'shellout', 'control.sock')
   return {
     socketPath,
+    // Only a remote target produces rows the local history cannot know about.
+    ...config.remote === undefined
+      ? {}
+      : {
+          settlementLog: config.settlementLog ?? join(dirname(socketPath), 'remote-settlements.jsonl'),
+          remoteHost: config.remote.host,
+        },
     transport: transportFor(config, socketPath),
     connectTimeoutMs: config.connectTimeoutMs ?? 5_000,
     connectRetryMs: config.connectRetryMs ?? 10_000,
@@ -237,6 +282,26 @@ export class ShelloutExecutor extends ShellExecutor {
    * @returns the live execution handle.
    * @throws when the command could not be prepared or the caller aborted first.
    */
+  /**
+   * Append one line the local dashboard can read.
+   *
+   * The remote host's history is authoritative and stays there; this is a
+   * read-side index, so a failed append must never affect the execution.
+   *
+   * @param executionId - execution the settlement belongs to.
+   * @param event - settlement facts the runner reported.
+   */
+  private recordRemoteSettlement(executionId: string, event: SettledEvent): void {
+    const log = this.config.settlementLog
+    if (log === undefined) return
+    const line = settlementLine(this.config.remoteHost, executionId, event)
+    try {
+      appendFileSync(log, `${line}\n`, { mode: 0o600 })
+    } catch {
+      // A dashboard index that cannot be written is not a reason to fail work.
+    }
+  }
+
   async execute(spec: ShellExecSpec): Promise<ShellExecution> {
     if (spec.signal?.aborted === true) throw new Error('shellout: command aborted before start')
     const executionId = randomUUID()
@@ -246,7 +311,11 @@ export class ShelloutExecutor extends ShellExecutor {
       pollMs: this.config.mirrorPollMs,
       retainBytes: this.config.mirrorRetainBytes,
     })
-    const detach = this.client.onSettled((event) => { if (event.executionId === executionId) remote.receive(event) })
+    const detach = this.client.onSettled((event) => {
+      if (event.executionId !== executionId) return
+      this.recordRemoteSettlement(executionId, event)
+      remote.receive(event)
+    })
     try {
       await this.client.request('exec', {
         operationId,

@@ -146,7 +146,15 @@ fn main() -> std::io::Result<()> {
         .block_on(async move {
             if mode == "hub" {
                 let store = hub::open_store(&paths.history);
-                let hub = Arc::new(hub::Hub::new(store, paths.executor_socket));
+                let mut hub = hub::Hub::new(store, paths.executor_socket);
+                // Beside the socket is where the host plugin writes it.
+                hub.settlement_log = Some(
+                    std::path::Path::new(&paths.socket)
+                        .parent()
+                        .map(|parent| parent.join("remote-settlements.jsonl"))
+                        .unwrap_or_else(|| std::path::PathBuf::from("remote-settlements.jsonl")),
+                );
+                let hub = Arc::new(hub);
                 return tokio::select! {
                     result = hub::serve(paths.listen,hub) => result,
                     _ = shutdown_signal() => Ok(()),

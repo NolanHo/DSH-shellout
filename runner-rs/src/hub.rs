@@ -1,7 +1,7 @@
 //! Read-only HTTP surface. Live state is observed without creating a host lease.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,6 +19,9 @@ const RECENT_LIMIT: usize = 50;
 pub struct Hub {
     pub store: Option<Arc<Store>>,
     pub executor_socket: String,
+    /// Where the host plugin appends remote settlements, if this deployment
+    /// runs a remote target at all.
+    pub settlement_log: Option<PathBuf>,
     observers: Semaphore,
 }
 
@@ -27,8 +30,31 @@ impl Hub {
         Self {
             store,
             executor_socket,
+            settlement_log: None,
             observers: Semaphore::new(8),
         }
+    }
+
+    /// Read the most recent remote settlements the host appended.
+    ///
+    /// The remote host keeps its own history; this file is the read-side index a
+    /// local dashboard merges, so nothing here writes to the remote database.
+    fn remote_settlements(&self, limit: usize) -> Value {
+        let Some(path) = &self.settlement_log else {
+            return json!({ "rows": [], "configured": false });
+        };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return json!({ "rows": [], "configured": true, "missing": true });
+        };
+        // Parse before taking: a malformed line must not shrink the page.
+        let mut rows: Vec<Value> = text
+            .lines()
+            .rev()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .take(limit)
+            .collect();
+        rows.reverse();
+        json!({ "rows": rows, "configured": true })
     }
 
     /// The deadline includes queueing, connect, write, and every response read.
@@ -84,6 +110,13 @@ impl Hub {
                 )
             }
             "/health" => return ("200 OK", "text/plain", "ok".to_string()),
+            "/api/remote-settlements" => {
+                return (
+                    "200 OK",
+                    "application/json",
+                    self.remote_settlements(200).to_string(),
+                )
+            }
             "/api/stats" | "/api/executions" | "/api/execution" => {}
             _ => return ("404 Not Found", "text/plain", "not found".to_string()),
         }
@@ -513,5 +546,35 @@ mod tests {
         assert_eq!(rows[0]["state"], "running");
         assert!(rows[1].get("stdout").is_none());
         assert!(rows[1].get("stderr").is_none());
+    }
+
+    #[test]
+    fn remote_settlements_reads_the_hosts_index_newest_first() {
+        let root = std::env::temp_dir().join(format!("dsh-hub-remote-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let log = root.join("remote-settlements.jsonl");
+        std::fs::write(
+            &log,
+            "{\"executionId\":\"a\",\"status\":\"exited\",\"host\":\"h1\"}\n\
+             not json\n\
+             {\"executionId\":\"b\",\"status\":\"killed\",\"host\":\"h1\"}\n",
+        )
+        .unwrap();
+        let mut hub = Hub::new(None, "/nonexistent".into());
+        hub.settlement_log = Some(log);
+        let document = hub.remote_settlements(2);
+        assert_eq!(document["configured"], true);
+        let rows = document["rows"].as_array().expect("rows");
+        assert_eq!(rows.len(), 2, "a malformed line is skipped, not fatal");
+        assert_eq!(rows[1]["executionId"], "b", "the newest row comes last");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_missing_index_reports_itself_instead_of_failing() {
+        let hub = Hub::new(None, "/nonexistent".into());
+        let document = hub.remote_settlements(5);
+        assert_eq!(document["configured"], false);
+        assert_eq!(document["rows"].as_array().expect("rows").len(), 0);
     }
 }

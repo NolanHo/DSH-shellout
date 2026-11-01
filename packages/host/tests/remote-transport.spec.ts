@@ -116,3 +116,21 @@ describe.skipIf(!ready)('attach through a command transport', () => {
     }
   }, 40_000)
 })
+
+describe('remote settlement index', () => {
+  it('names the index beside the socket and describes each settlement', async () => {
+    const { settlementLine } = await import('../src/dsh/provider.ts')
+    const config = resolveConfig(
+      { socketPath: '/var/lib/shellout/control.sock', remote: { host: 'worker-1' } },
+      { HOME: '/root' },
+    )
+    expect(config.settlementLog).toBe('/var/lib/shellout/remote-settlements.jsonl')
+    expect(config.remoteHost).toBe('worker-1')
+
+    const row = JSON.parse(settlementLine('worker-1', 'exec-1', { status: 'killed', exitCode: null, signal: 9 }))
+    expect(row).toMatchObject({ host: 'worker-1', executionId: 'exec-1', status: 'killed', exitCode: null, signal: 'SIGKILL' })
+
+    // A local deployment has no remote rows to index.
+    expect(resolveConfig({ socketPath: '/tmp/x.sock' }, { HOME: '/root' }).settlementLog).toBeUndefined()
+  })
+})
