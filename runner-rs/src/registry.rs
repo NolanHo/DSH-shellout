@@ -363,6 +363,9 @@ impl Registry {
         if std::fs::create_dir_all(&directory).is_err() {
             return;
         }
+        // Boot ids and heartbeat times are not public: another local user must
+        // not be able to list which clients are connected.
+        private(&directory);
         // The boot id comes from the client: keep it a single path component.
         let name: String = boot
             .chars()

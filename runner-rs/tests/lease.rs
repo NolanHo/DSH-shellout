@@ -110,3 +110,27 @@ fn adoption_ignores_the_heartbeat_directory() {
         "the heartbeat directory is not an execution: {stderr}"
     );
 }
+
+/// Heartbeats name the clients that are connected: they are owner-only.
+#[test]
+fn the_heartbeat_directory_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let scratch = Scratch::new("lease-perms");
+    let executor = Executor::start_named(&scratch, "executor", &["--lease-ttl-ms", "60000"]);
+    let mut host = executor.ready();
+    host.hello("boot-perms");
+
+    let directory = scratch.state().join(".boots");
+    support::until(
+        || directory.join("boot-perms").exists().then_some(()),
+        Duration::from_secs(10),
+        "the heartbeat appears",
+    );
+    let mode = std::fs::metadata(&directory)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o700, "the heartbeat directory is owner-only");
+}
