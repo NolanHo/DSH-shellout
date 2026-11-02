@@ -13,6 +13,7 @@ import type { ShelloutClient } from '../core/client.js'
 import { startOn, type ShelloutExecutor } from './provider.js'
 import { attachArgv, resolveHost, type Hosts } from './hosts.js'
 import { syncToHost, type SyncReport, type SyncRequest } from './sync.js'
+import { runInTty } from './tty.js'
 
 /** What the tool needs from the plugin to reach a host. */
 export interface ShellToolOptions {
@@ -84,6 +85,10 @@ export async function registerShellTool(ctx: Context, options: ShellToolOptions)
       remote_host: { type: 'string', description: 'Configured host alias; omit to run locally.' },
       cwd: { type: 'string', description: 'Working directory; defaults to the local workspace or the host default.' },
       timeout_ms: { type: 'number', description: 'Deadline in milliseconds; the runner caps it.' },
+      tty: {
+        type: 'boolean',
+        description: 'Attach a terminal, for programs that need one (interactive prompts, TUIs). Output arrives as one merged stream with control sequences, and a terminal run is bound to this call: it is not indexed, cannot be adopted after the connection drops, and ignores remote_host sync. Defaults to false, which keeps stdout and stderr separate.',
+      },
       sync: {
         type: 'object',
         additionalProperties: false,
@@ -101,6 +106,22 @@ export async function registerShellTool(ctx: Context, options: ShellToolOptions)
     },
     async execute(args, exec) {
       exec.signal.throwIfAborted()
+      if (args.tty === true) {
+        if (args.sync !== undefined) throw new Error('shell: sync needs a runner execution; a terminal run is connection-bound and cannot be indexed')
+        const entry = args.remote_host === undefined ? undefined : resolveHost(options.hosts, args.remote_host)
+        const result = await runInTty({
+          command: args.command,
+          ...args.cwd === undefined ? {} : { cwd: args.cwd },
+          ...args.timeout_ms === undefined ? {} : { timeoutMs: args.timeout_ms },
+          ...exec.signal === undefined ? {} : { signal: exec.signal },
+        }, entry)
+        const header = [
+          `host: ${args.remote_host ?? 'local'}  tty: true  merged: true`,
+          `exit: ${result.exitCode ?? 'null'}${result.signal === null ? '' : ` (signal ${result.signal})`}`,
+          ...result.timedOut ? ['timedOut: true'] : [],
+        ].join('  ')
+        return `${header}\n${result.output}`
+      }
       const request = {
         command: args.command,
         ...args.cwd === undefined ? {} : { workdir: args.cwd },

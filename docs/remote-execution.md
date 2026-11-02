@@ -87,6 +87,22 @@ tar stream instead, which refuses `delete` rather than approximating a mirror.
 Measured on a 22.7 MB tree of 3020 files over a real hop: rsync 1.02 s cold and
 0.43 s repeat, tar stream 1.10 s and 1.17 s.
 
+### A terminal, when a program needs one
+
+`tty: true` attaches a terminal — `ssh -tt` on a host, `script` locally — for
+interactive prompts and full-screen programs. It is a different contract from the
+rest of the tool, and the difference is stated rather than hidden:
+
+- Output is one merged stream carrying control sequences; `stderr` cannot be
+  separated from it, so the result is marked merged.
+- A terminal run is bound to this connection. Nothing is indexed, nothing is
+  adopted after a drop, and `sync` is refused: there is no state root to read a
+  later answer from.
+- The deadline kills the process group, not one process.
+
+Everything else — exit status, host selection, alias checking — behaves as it
+does without a terminal.
+
 ## Transport
 
 `--mode stdio` runs the executor protocol on stdin/stdout instead of a unix
