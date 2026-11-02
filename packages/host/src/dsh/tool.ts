@@ -12,6 +12,7 @@ import type { ShellRunResult } from '@deepseek-ai/dsh-shell'
 import type { ShelloutClient } from '../core/client.js'
 import { startOn, type ShelloutExecutor } from './provider.js'
 import { attachArgv, resolveHost, type Hosts } from './hosts.js'
+import { syncToHost, type SyncReport, type SyncRequest } from './sync.js'
 
 /** What the tool needs from the plugin to reach a host. */
 export interface ShellToolOptions {
@@ -26,6 +27,12 @@ export interface ShellToolOptions {
 /** One connection per host, kept for the life of the plugin. */
 interface HostBinding {
   readonly client: ShelloutClient
+}
+
+/** One line that says what the copy did before the command ran. */
+function describeSync(report: SyncReport): string {
+  const deleted = report.deleted ? 'host files absent from the source were removed' : 'nothing was deleted on the host'
+  return `synced ${report.from} -> ${report.to} in ${String(report.ms)} ms (${report.mode}; ${deleted})`
 }
 
 /** Render one finished command the way the model reads it. */
@@ -77,6 +84,16 @@ export async function registerShellTool(ctx: Context, options: ShellToolOptions)
       remote_host: { type: 'string', description: 'Configured host alias; omit to run locally.' },
       cwd: { type: 'string', description: 'Working directory; defaults to the local workspace or the host default.' },
       timeout_ms: { type: 'number', description: 'Deadline in milliseconds; the runner caps it.' },
+      sync: {
+        type: 'object',
+        additionalProperties: false,
+        description: 'Copy a local path to the host before the command runs. Needs remote_host. Nothing is deleted on the host unless delete is true.',
+        properties: {
+          from: { type: 'string', required: true, description: 'Local file or directory to copy.' },
+          to: { type: 'string', required: true, description: 'Destination path on the host.' },
+          delete: { type: 'boolean', description: 'Remove host files the source does not have; defaults to false.' },
+        },
+      },
     },
     output: {
       schema: { type: 'string' },
@@ -91,11 +108,14 @@ export async function registerShellTool(ctx: Context, options: ShellToolOptions)
         ...exec.signal === undefined ? {} : { signal: exec.signal },
       } as const
       if (args.remote_host === undefined) {
+        if (args.sync !== undefined) throw new Error('shell: sync needs remote_host; there is nothing to copy to for a local command')
         const execution = await options.local.execute(options.local.resolve(request))
         return render('local', await execution.result())
       }
-      const binding = await executorFor(args.remote_host)
       const entry = resolveHost(options.hosts, args.remote_host)
+      const requested = args.sync as SyncRequest | undefined
+      const report = requested === undefined ? undefined : await syncToHost(entry, requested)
+      const binding = await executorFor(args.remote_host)
       const host = args.cwd ?? entry.cwd ?? process.cwd()
       const started = await startOn(binding.client, options.local.configuration, {
         command: args.command,
@@ -106,7 +126,8 @@ export async function registerShellTool(ctx: Context, options: ShellToolOptions)
         stdoutMaxBytes: binding.client.descriptor.maxOutputBytes,
         ...exec.signal === undefined ? {} : { signal: exec.signal },
       }, { remote: true })
-      return render(args.remote_host, await started.execution.result())
+      const rendered = render(args.remote_host, await started.execution.result())
+      return report === undefined ? rendered : `${describeSync(report)}\n${rendered}`
     },
   }))
   })
