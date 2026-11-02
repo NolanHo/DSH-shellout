@@ -76,19 +76,37 @@ export function suggestAliases(hosts: Hosts, wanted: string): string[] {
 
 /**
  * Look up one host.
+ *
+ * A name the account's ssh config defines is a host in its own right, so the
+ * configuration does not have to repeat every machine it can already reach.
+ *
  * @param hosts - configured aliases.
  * @param alias - the name the caller used.
- * @returns the entry.
- * @throws when the alias is not configured, naming the closest ones.
+ * @param options - `aliases` from the ssh config; empty disables the fallback.
+ * @returns the entry, synthesized from the alias when only ssh knows it.
+ * @throws when nobody defines the name, naming the closest known ones.
  */
-export function resolveHost(hosts: Hosts, alias: string): HostEntry {
+export function resolveHost(
+  hosts: Hosts,
+  alias: string,
+  options: { readonly aliases?: readonly string[] } = {},
+): HostEntry {
   const entry = hosts[alias]
   if (entry !== undefined) return entry
-  const suggestions = suggestAliases(hosts, alias)
+  const aliases = options.aliases ?? []
+  // An address a person typed is a target too: it needs no registry entry.
+  if (alias.includes('@') || alias.includes(':')) return { target: alias }
+  if (aliases.includes(alias)) return { target: alias }
+  const known = [...new Set([...Object.keys(hosts), ...aliases])].sort()
+  const suggestions = suggestAliases(
+    Object.fromEntries(known.map((name) => [name, { target: name }])),
+    alias,
+  )
   const hint = suggestions.length > 0 ? ` Did you mean ${suggestions.join(', ')}?` : ''
-  const known = Object.keys(hosts)
+  const shown = known.slice(0, 20).join(', ')
+  const more = known.length > 20 ? `, and ${String(known.length - 20)} more` : ''
   return fail(
-    `unknown remote_host "${alias}".${hint}${known.length > 0 ? ` Configured hosts: ${known.join(', ')}.` : ' No hosts are configured.'}`,
+    `unknown remote_host "${alias}".${hint}${known.length > 0 ? ` Known hosts: ${shown}${more}.` : ' No hosts are configured and the ssh config defines none.'}`,
   )
 }
 
@@ -132,8 +150,8 @@ export function sshWordsFor(entry: HostEntry): string[] {
  * @param entry - configured host.
  * @returns argv for the transport command.
  */
-export function attachArgv(entry: HostEntry): string[] {
-  const argv = [entry.runner ?? 'dsh-shellout-runner', '--mode', 'attach', '--host', splitTarget(entry.target).destination]
+export function attachArgv(entry: HostEntry, defaultRunner = 'dsh-shellout-runner'): string[] {
+  const argv = [entry.runner ?? defaultRunner, '--mode', 'attach', '--host', splitTarget(entry.target).destination]
   for (const word of sshWordsFor(entry)) argv.push('--ssh', word)
   if (entry.root !== undefined) argv.push('--remote-root', entry.root)
   return argv

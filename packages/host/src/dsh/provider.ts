@@ -107,6 +107,17 @@ export interface ShelloutConfig {
    */
   hosts?: Hosts
   /**
+   * Accept host names from the account's `~/.ssh/config` as targets, so a
+   * deployment does not have to list machines ssh already defines. Defaults to
+   * true; `false` restricts the tool to configured entries.
+   */
+  autoAliases?: boolean
+  /**
+   * Runner binary the attach command starts for a host that names none. A host
+   * entry may override it; a deployment sets it once here.
+   */
+  runnerPath?: string
+  /**
    * Where remote settlements are appended for the local dashboard; defaults to
    * `remote-settlements.jsonl` beside the socket path. Ignored without `remote`.
    */
@@ -160,6 +171,10 @@ export interface ResolvedShelloutConfig {
   readonly local: Omit<Required<LocalExecutorConfig>, 'cwd'> & { readonly cwd?: string }
   /** Configured hosts for the `shell` tool. */
   readonly hosts: Hosts
+  /** Whether ssh config aliases are accepted as hosts; defaults to true. */
+  readonly autoAliases: boolean
+  /** Runner for hosts that name none; defaults to `dsh-shellout-runner`. */
+  readonly runnerPath?: string
 }
 
 /**
@@ -283,6 +298,8 @@ export function resolveConfig(config: ShelloutConfig = {}, env: NodeJS.ProcessEn
     heartbeatMs: config.heartbeatMs ?? 5_000,
     fallback: config.fallback ?? 'local',
     hosts: config.hosts ?? {},
+    autoAliases: config.autoAliases ?? true,
+    ...config.runnerPath === undefined ? {} : { runnerPath: config.runnerPath },
     local: {
       ...config.local?.cwd === undefined ? {} : { cwd: config.local.cwd },
       timeoutMs: config.local?.timeoutMs ?? 120_000,

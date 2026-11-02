@@ -13,6 +13,7 @@ import type { ShelloutClient } from '../core/client.js'
 import { startOn, type ShelloutExecutor } from './provider.js'
 import { probePlatform, runDirect } from './direct.js'
 import { attachArgv, resolveHost, type Hosts } from './hosts.js'
+import { aliasesFromSshConfig } from './ssh-aliases.js'
 import { syncToHost, type SyncReport, type SyncRequest } from './sync.js'
 import { runInTty } from './tty.js'
 
@@ -24,6 +25,10 @@ export interface ShellToolOptions {
   readonly hosts: Hosts
   /** Plugin configuration, for per-host defaults. */
   readonly connect: (argv: readonly string[]) => Promise<ShelloutClient>
+  /** Accept names the account's ssh config defines; defaults to true. */
+  readonly autoAliases?: boolean
+  /** Runner the attach command starts; hosts may override it. */
+  readonly runnerPath?: string
 }
 
 /** One connection per host, kept for the life of the plugin. */
@@ -58,16 +63,30 @@ function render(host: string, result: ShellRunResult): string {
  */
 export async function registerShellTool(ctx: Context, options: ShellToolOptions): Promise<void> {
   const bindings = new Map<string, HostBinding>()
+  /**
+   * Names the account's ssh config defines. Read once, and again when a name is
+   * missing, so a host added to the config mid-session is still reachable.
+   */
+  let sshAliases: readonly string[] = options.autoAliases ? aliasesFromSshConfig() : []
+  const entryFor = (alias: string) => {
+    try {
+      return resolveHost(options.hosts, alias, { aliases: sshAliases })
+    } catch (error) {
+      if (!options.autoAliases) throw error
+      sshAliases = aliasesFromSshConfig()
+      return resolveHost(options.hosts, alias, { aliases: sshAliases })
+    }
+  }
   /** Chosen path per alias, decided once from the host itself. */
   const paths = new Map<string, 'runner' | 'ssh'>()
 
   /** A host runs the runner only when it is Linux on an architecture this plane ships. */
   const pathFor = async (alias: string): Promise<'runner' | 'ssh'> => {
-    const declared = resolveHost(options.hosts, alias).mode
+    const declared = entryFor(alias).mode
     if (declared !== undefined) return declared
     const known = paths.get(alias)
     if (known !== undefined) return known
-    const platform = await probePlatform(resolveHost(options.hosts, alias))
+    const platform = await probePlatform(entryFor(alias))
     const chosen = platform === undefined
       ? 'runner'
       : platform.os === 'Linux' && (platform.arch === 'x86_64' || platform.arch === 'aarch64')
@@ -80,7 +99,7 @@ export async function registerShellTool(ctx: Context, options: ShellToolOptions)
   const executorFor = async (alias: string): Promise<HostBinding> => {
     const existing = bindings.get(alias)
     if (existing !== undefined) return existing
-    const client = await options.connect(attachArgv(resolveHost(options.hosts, alias)))
+    const client = await options.connect(attachArgv(entryFor(alias), options.runnerPath))
     const binding = { client }
     bindings.set(alias, binding)
     ctx.effect(() => () => {
@@ -127,7 +146,7 @@ export async function registerShellTool(ctx: Context, options: ShellToolOptions)
       exec.signal.throwIfAborted()
       if (args.tty === true) {
         if (args.sync !== undefined) throw new Error('shell: sync needs a runner execution; a terminal run is connection-bound and cannot be indexed')
-        const entry = args.remote_host === undefined ? undefined : resolveHost(options.hosts, args.remote_host)
+        const entry = args.remote_host === undefined ? undefined : entryFor(args.remote_host)
         const result = await runInTty({
           command: args.command,
           ...args.cwd === undefined ? {} : { cwd: args.cwd },
@@ -152,7 +171,7 @@ export async function registerShellTool(ctx: Context, options: ShellToolOptions)
         const execution = await options.local.execute(options.local.resolve(request))
         return render('local', await execution.result())
       }
-      const entry = resolveHost(options.hosts, args.remote_host)
+      const entry = entryFor(args.remote_host)
       const requested = args.sync as SyncRequest | undefined
       const report = requested === undefined ? undefined : await syncToHost(entry, requested)
       if (await pathFor(args.remote_host) === 'ssh') {

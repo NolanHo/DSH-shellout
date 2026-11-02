@@ -51,6 +51,9 @@ export async function apply(ctx: Context, config: ShelloutConfig = {}): Promise<
       await registerShellTool(ctx, {
         local: executor!,
         hosts: resolved.hosts,
+        // A name the account's ssh config defines needs no entry here.
+        autoAliases: resolved.autoAliases,
+        ...resolved.runnerPath === undefined ? {} : { runnerPath: resolved.runnerPath },
         connect: async (argv) => await ShelloutClient.connect({
           transport: { kind: 'command', argv },
           bootId: randomUUID(),

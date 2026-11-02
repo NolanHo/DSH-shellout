@@ -25,8 +25,17 @@ describe('host registry', () => {
     expect(() => resolveHost(hosts, 'gpu-c')).toThrow(/Did you mean gpu-a, gpu-b/)
   })
 
+  it('accepts a name the ssh config defines, and a typed address', () => {
+    const aliases = ['gpu-a', 'workstation']
+    expect(resolveHost(hosts, 'workstation', { aliases })).toEqual({ target: 'workstation' })
+    expect(resolveHost({}, 'root@10.0.0.5:2222', { aliases })).toEqual({ target: 'root@10.0.0.5:2222' })
+    // Without the ssh list the same name is refused, so the fallback is what
+    // makes it work rather than a loosened check.
+    expect(() => resolveHost(hosts, 'workstation')).toThrow(/unknown remote_host/)
+  })
+
   it('says so when nothing is close and lists what exists', () => {
-    expect(() => resolveHost(hosts, 'zzzzzzzzzz')).toThrow(/Configured hosts: gpu-a, gpu-b, lab/)
+    expect(() => resolveHost(hosts, 'zzzzzzzzzz')).toThrow(/Known hosts: gpu-a, gpu-b, lab/)
     expect(() => resolveHost({}, 'anything')).toThrow(/No hosts are configured/)
   })
 
