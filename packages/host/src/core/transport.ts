@@ -71,6 +71,9 @@ async function openCommandTransport(
     env: options.env ?? process.env,
     stdio: ['pipe', 'pipe', 'pipe'],
   })
+  // A program that cannot be started at all reports it here, not on the frame
+  // stream: without a listener the process crashes on an unhandled 'error'.
+  child.once('error', () => {})
   child.stderr.on('data', (chunk: Buffer) => { process.stderr.write(chunk) })
   // The client speaks to one duplex: reads come from the child's stdout, writes
   // go to its stdin. Destroying that duplex must take the child with it, or a
@@ -79,6 +82,9 @@ async function openCommandTransport(
     readable: child.stdout as NodeJS.ReadableStream,
     writable: child.stdin as NodeJS.WritableStream,
   })
+  // The pinned streams are destroyed when the child dies; an error on either is
+  // an end of connection, not a process-level crash.
+  stream.on('error', () => {})
   stream.on('close', () => { if (child.exitCode === null) child.kill('SIGTERM') })
   return await new Promise<Duplex>((resolve, reject) => {
     const timer = setTimeout(() => {

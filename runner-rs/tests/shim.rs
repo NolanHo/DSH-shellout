@@ -172,6 +172,39 @@ fn environment_values_are_cleared_once_the_execution_settled() {
     assert_eq!(meta["cwd"], json!(scratch.root));
 }
 
+/// A controller on another machine has no PATH that fits this one, so a spec
+/// without PATH must still let the child resolve its own program: the shim keeps
+/// the PATH its session was given.
+#[test]
+fn a_spec_without_path_still_resolves_the_program() {
+    let scratch = Scratch::new("nopath");
+    let state = scratch.state();
+    write_meta(
+        &state,
+        "nopath",
+        json!({
+            "argv": ["sh", "-c", "echo resolved; exit 0"],
+            "cwd": scratch.root,
+            "env": {"REMOTE_ONLY": "1"},
+            "timeoutMs": 10_000,
+            "onExpiry": "kill",
+            "graceMs": 100,
+            "capture": {"stdoutMaxBytes": 64_000, "stderrMaxBytes": 64_000,
+                "spillMaxBytes": 1_048_576, "spillDir": "/tmp"},
+        }),
+    );
+    let mut shim = spawn_shim(&state, "nopath");
+    shim.wait().expect("shim exits");
+    let status = terminal(&state, "nopath", Duration::from_secs(10));
+    assert_eq!(
+        status["exitCode"], 0,
+        "the program resolved through the session PATH: {status}"
+    );
+    let stdout =
+        std::fs::read_to_string(state.join("nopath").join("stdout.log")).expect("stdout log");
+    assert_eq!(stdout, "resolved\n");
+}
+
 /// The executor creates the spawn claim before it starts the shim and decides
 /// the outcome; a shim that starts late must honour that decision instead of
 /// running a command the caller was told was rejected.

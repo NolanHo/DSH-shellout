@@ -504,7 +504,16 @@ fn supervise(
         .args(&spec.argv[1..])
         .current_dir(&spec.cwd)
         .env_clear()
-        .envs(&spec.env)
+        .envs(&spec.env);
+    // A caller that sends no PATH (a remote controller has none that fits this
+    // machine) must not leave the child unable to resolve its own program: keep
+    // this session's PATH, which is the one the ssh login gave the shim.
+    if !spec.env.contains_key("PATH") {
+        if let Some(path) = std::env::var_os("PATH") {
+            command.env("PATH", path);
+        }
+    }
+    command
         .stdin(if spec.stdin.is_some() {
             Stdio::piped()
         } else {

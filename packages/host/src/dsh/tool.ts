@@ -175,16 +175,25 @@ export async function registerShellTool(ctx: Context, options: ShellToolOptions)
         return report === undefined ? body : `${describeSync(report)}\n${body}`
       }
       const binding = await executorFor(args.remote_host)
-      const host = args.cwd ?? entry.cwd ?? process.cwd()
-      const started = await startOn(binding.client, options.local.configuration, {
+      // Without a caller or host directory, the runner's own default is the
+      // host's answer — the controller's cwd would name a path that is not there.
+      const host = args.cwd ?? entry.cwd ?? binding.client.descriptor.cwd
+      const spec = {
         command: args.command,
-        workdir: host,
         timeoutMs: Math.min(args.timeout_ms ?? options.local.configuration.local.timeoutMs, binding.client.descriptor.maxTimeoutMs),
-        onExpiry: 'kill',
+        onExpiry: 'kill' as const,
         sandboxPolicy: undefined,
         stdoutMaxBytes: binding.client.descriptor.maxOutputBytes,
         ...exec.signal === undefined ? {} : { signal: exec.signal },
-      }, { remote: true })
+      }
+      // A controller path means nothing on the host: without an explicit one the
+      // runner keeps its own default rather than failing on a missing directory.
+      const started = await startOn(
+        binding.client,
+        options.local.configuration,
+        { ...spec, workdir: host },
+        { remote: true },
+      )
       const rendered = render(args.remote_host, await started.execution.result())
       return report === undefined ? rendered : `${describeSync(report)}\n${rendered}`
     },
