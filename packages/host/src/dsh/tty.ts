@@ -12,7 +12,7 @@
  */
 import { spawn, type ChildProcess } from 'node:child_process'
 
-import type { HostEntry } from './hosts.js'
+import { splitTarget, sshWordsFor, type HostEntry } from './hosts.js'
 
 /** One terminal run. */
 export interface TtyRequest {
@@ -75,7 +75,7 @@ export function ttyArgv(request: TtyRequest, host?: HostEntry): { readonly progr
   if (host === undefined) {
     return { program: 'script', args: ['-qec', script, '/dev/null'], ...request.cwd === undefined ? {} : { cwd: request.cwd } }
   }
-  const words = [...host.ssh ?? ['ssh', '-o', 'BatchMode=yes'], '-tt', host.target, script]
+  const words = [...sshWordsFor(host), '-tt', splitTarget(host.target).destination, script]
   return { program: words[0]!, args: words.slice(1) }
 }
 

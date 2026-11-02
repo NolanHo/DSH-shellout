@@ -13,7 +13,7 @@
 import { spawn } from 'node:child_process'
 import { existsSync, statSync } from 'node:fs'
 
-import type { HostEntry } from './hosts.js'
+import { splitTarget, sshWordsFor, type HostEntry } from './hosts.js'
 
 /** What the caller asks to copy. */
 export interface SyncRequest {
@@ -43,9 +43,9 @@ export interface SyncReport {
   readonly to: string
 }
 
-/** ssh words for a host, defaulting to a non-interactive session. */
+/** ssh words for a host, including a port written into the target. */
 function sshWords(entry: HostEntry): string[] {
-  return [...entry.ssh ?? ['ssh', '-o', 'BatchMode=yes']]
+  return sshWordsFor(entry)
 }
 
 /**
@@ -64,7 +64,7 @@ export function rsyncArgv(entry: HostEntry, request: SyncRequest): string[] {
     '-e',
     sshWords(entry).join(' '),
     source,
-    `${entry.target}:${destination}`,
+    `${splitTarget(entry.target).destination}:${destination}`,
   ]
 }
 
@@ -124,7 +124,7 @@ export async function syncToHost(entry: HostEntry, request: SyncRequest): Promis
     // A file copies to the exact path; a directory mirrors its contents, which is
     // why rsync --delete is only meaningful for the directory case.
     const argv = isFile
-      ? ['rsync', '-az', '-e', sshWords(entry).join(' '), request.from, `${entry.target}:${request.to}`]
+      ? ['rsync', '-az', '-e', sshWords(entry).join(' '), request.from, `${splitTarget(entry.target).destination}:${request.to}`]
       : rsyncArgv(entry, request)
     await run(argv[0]!, argv.slice(1))
   } else {

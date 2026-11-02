@@ -5,7 +5,7 @@
  */
 import { describe, expect, it } from 'vitest'
 
-import { attachArgv, resolveHost, suggestAliases, type Hosts } from '../src/dsh/hosts.ts'
+import { attachArgv, resolveHost, splitTarget, sshWordsFor, suggestAliases, type Hosts } from '../src/dsh/hosts.ts'
 
 const hosts: Hosts = {
   'gpu-a': { target: 'root@gpu-a.example', root: '/root/.dsh-shellout', cwd: '/workspace', shell: '/bin/bash' },
@@ -28,6 +28,16 @@ describe('host registry', () => {
   it('says so when nothing is close and lists what exists', () => {
     expect(() => resolveHost(hosts, 'zzzzzzzzzz')).toThrow(/Configured hosts: gpu-a, gpu-b, lab/)
     expect(() => resolveHost({}, 'anything')).toThrow(/No hosts are configured/)
+  })
+
+  it('carries a port written into the target', () => {
+    expect(splitTarget('root@10.0.0.5:2222')).toEqual({ destination: 'root@10.0.0.5', port: '2222' })
+    expect(splitTarget('nolan-mac')).toEqual({ destination: 'nolan-mac' })
+    // A host that already names its port keeps it, and is not given a second one.
+    const entry = { target: 'root@10.0.0.5:2222', ssh: ['ssh', '-p', '2200'] }
+    expect(sshWordsFor(entry)).toEqual(['ssh', '-p', '2200'])
+    expect(sshWordsFor({ target: 'root@10.0.0.5:2222' })).toEqual(['ssh', '-o', 'BatchMode=yes', '-p', '2222'])
+    expect(attachArgv(entry)).toContain('root@10.0.0.5')
   })
 
   it('builds an attach command from the entry', () => {

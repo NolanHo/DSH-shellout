@@ -10,7 +10,7 @@
  */
 import { spawn } from 'node:child_process'
 
-import type { HostEntry } from './hosts.js'
+import { splitTarget, sshWordsFor, type HostEntry } from './hosts.js'
 
 /** One direct run. */
 export interface DirectRequest {
@@ -77,7 +77,7 @@ export function directScript(request: DirectRequest): string {
  * @returns the program and its arguments.
  */
 export function directArgv(entry: HostEntry, request: DirectRequest): { readonly program: string; readonly args: readonly string[] } {
-  const words = [...entry.ssh ?? ['ssh', '-o', 'BatchMode=yes'], entry.target, directScript(request)]
+  const words = [...sshWordsFor(entry), splitTarget(entry.target).destination, directScript(request)]
   return { program: words[0]!, args: words.slice(1) }
 }
 

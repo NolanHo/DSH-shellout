@@ -98,13 +98,43 @@ function fail(message: string): never {
 }
 
 /**
+ * Split an `user@host:port` target into what `ssh` needs.
+ *
+ * A person who already knows an address should not have to write ssh argv for
+ * it, and the shorthand has to keep working when a host entry has no `ssh` list.
+ *
+ * @param target - alias, `user@host`, or `user@host:port`.
+ * @returns the ssh destination and the port when the target carried one.
+ */
+export function splitTarget(target: string): { readonly destination: string; readonly port?: string } {
+  const colon = target.lastIndexOf(':')
+  if (colon === -1) return { destination: target }
+  const port = target.slice(colon + 1)
+  // A bare IPv6 address has no port; only digits after the last colon count.
+  if (!/^\d+$/.test(port)) return { destination: target }
+  return { destination: target.slice(0, colon), port }
+}
+
+/**
+ * The ssh words for a host, with an explicit port when the target carried one.
+ * @param entry - configured host.
+ * @returns argv words before the destination.
+ */
+export function sshWordsFor(entry: HostEntry): string[] {
+  const { port } = splitTarget(entry.target)
+  const words = [...entry.ssh ?? ['ssh', '-o', 'BatchMode=yes']]
+  if (port !== undefined && !words.includes('-p')) words.push('-p', port)
+  return words
+}
+
+/**
  * The attach argv that reaches one host.
  * @param entry - configured host.
  * @returns argv for the transport command.
  */
 export function attachArgv(entry: HostEntry): string[] {
-  const argv = [entry.runner ?? 'dsh-shellout-runner', '--mode', 'attach', '--host', entry.target]
-  for (const word of entry.ssh ?? ['ssh', '-o', 'BatchMode=yes']) argv.push('--ssh', word)
+  const argv = [entry.runner ?? 'dsh-shellout-runner', '--mode', 'attach', '--host', splitTarget(entry.target).destination]
+  for (const word of sshWordsFor(entry)) argv.push('--ssh', word)
   if (entry.root !== undefined) argv.push('--remote-root', entry.root)
   return argv
 }

@@ -226,6 +226,39 @@ deployment step, not a code edit here:
    managed CPython, a macOS/Windows host, or an interactive login is the point to
    reach for rexec again rather than rebuild it here.
 
+## What rexec does, and where each piece stands now
+
+Every capability the old path offered, checked against this plane so the switch
+is one step rather than a migration:
+
+| rexec | here | state |
+|---|---|---|
+| `run` on a host | `shell` | verified on a Linux host and on macOS |
+| `run --sync from:to` | `sync: { from, to }` | verified: identical `md5sum` listing; rsync, `--delete` off by default |
+| `script ./x.sh -- args` | `sync` the file, then run it | verified on macOS (`script ok from-args`, mode preserved) |
+| `-p` / `user@host:port` | `ssh` words, or the same shorthand in `target` | verified by unit test |
+| `init` (install remote deps) | probe once, then choose runner or ssh | verified: a non-Linux host is served without installing anything |
+| `list` (ssh aliases) | configured `hosts`, and an unknown alias lists them | by design: a target must be deliberate |
+| `history list/show/grep`, `attach` | per-host SQLite history, adoption, `--mode status`, dashboard | verified earlier: seven scenarios against a real ssh host |
+| `--python` | none | dropped: a host runs its own interpreter |
+| macOS remote | `mode: ssh` | verified; the runner path cannot serve a Darwin host and says so |
+
+### What the old path got wrong, found while comparing
+
+- **Exit status swallowed.** `rexec host run -- 'exit 1'` exits **0**; the failure
+  is text on stderr, so any caller that checks the process status sees success.
+- **`ProxyCommand` ignored.** `ssh nolan-mac` reaches the machine through the
+  SOCKS proxy in the account config, while `rexec nolan-mac run` times out
+  connecting to `192.168.5.15:22` directly. Any host reached through a proxy,
+  tunnel, or `-J` chain written as a `ProxyCommand` is unreachable this way.
+- **Its own tunnel breaks where ssh works.** On `mint-dev-2700x-worker-1` it
+  reported `TCP connecting to 127.0.0.1:27001: Connection refused` while the same
+  host answered every case here through the account's ssh.
+- **Directory sync deletes by default.** `do_sync` passes `--delete` for a
+  directory, so a source that lost a directory removes it on the host.
+- **Progress text on stderr.** `Remote PID: …` and `✓ Remote process exited` share
+  the stream the caller reads for diagnostics.
+
 ## Boundaries after rexec retires
 
 Stated so nobody discovers them at the wrong moment:
