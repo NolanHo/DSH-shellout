@@ -59,6 +59,34 @@ Only (1) and (2) are defects in the sense of "works here, not there"; (3) and
 - **No new dependencies.** Execution needs `sh`, `mkdir`, `cat`, `chmod`,
   `sha256sum` (or `shasum`), all POSIX. Sync stays with rexec.
 
+## The `shell` tool: naming a host
+
+`bash` runs on this machine by definition. A deployment with more than one
+machine adds the `shell` tool, which takes an optional `remote_host` naming an
+entry under the plugin's `hosts` configuration; without it the command runs on
+the local runner through the same code path, so the two results read alike.
+
+```yaml
+hosts:
+  gpu-a:
+    target: root@gpu-a.example     # ssh alias or user@host
+    ssh: ['ssh', '-i', '/root/.ssh/key', '-p', '2222']
+    root: /root/.dsh-shellout      # defaults to the account's ~/.dsh-shellout
+    cwd: /workspace                # defaults to the account's home
+```
+
+An unknown alias is refused with the closest configured names. It is never
+attempted: a typo must not reach a different machine. A host execution also
+drops this controller's `PATH`, `HOME`, `TMPDIR`, `PWD`, `SHELL`, and `HOSTNAME`,
+which describe a different machine.
+
+`sync: { from, to, delete? }` copies a local path to the host before the command
+runs. Nothing is deleted on the host unless `delete` is true, and the result says
+which of the two happened. rsync carries the copy; a host without rsync gets a
+tar stream instead, which refuses `delete` rather than approximating a mirror.
+Measured on a 22.7 MB tree of 3020 files over a real hop: rsync 1.02 s cold and
+0.43 s repeat, tar stream 1.10 s and 1.17 s.
+
 ## Transport
 
 `--mode stdio` runs the executor protocol on stdin/stdout instead of a unix
