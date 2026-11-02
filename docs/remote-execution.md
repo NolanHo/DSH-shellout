@@ -185,6 +185,59 @@ the cached copy until the version or the root changes.
 Every step reports what it found, so a host that fails says which precondition
 failed instead of "worker died".
 
+## Compared with rexec on what an agent actually runs
+
+Measured on one host both tools could reach (`mint-dev-2500x-worker-1`), same
+commands, same working directory. "Code" is the caller's process exit status,
+which is what a tool result depends on.
+
+| case | this plane | rexec |
+|---|---|---|
+| `echo hello` | stdout `hello\n`, code 0 | stdout `hello\n`, code 0, stderr carries `Remote PID: …` and `✓ Remote process exited` |
+| `pwd` | `/tmp` (the requested directory) | `/root` |
+| `exit 1` | code **1** | code **0**, the failure only appears as text |
+| `printf 'a\nb\n' \| wc -l` | `2` | `2` |
+| two streams | stdout `out-line`, stderr `err-line` | stdout `out-line`, stderr `Remote PID: …` + `err-line` |
+| partial output then failure | stdout `partial`, code **42** | stdout `partial`, code **0**, `✗ … code 42` in text |
+| `sleep 2; echo slept` | `slept`, code 0 | `slept`, code 0 |
+| directory sync | identical `md5sum` listing | identical `md5sum` listing |
+
+Two differences decide a tool result: this plane returns the command's real exit
+status and keeps the two streams apart, while rexec reports success and puts the
+outcome in text. A third difference is availability: on
+`mint-dev-2700x-worker-1`, rexec refused to connect (`TCP connecting to
+127.0.0.1:27001: Connection refused`) while the same host answered every case
+here, because the plane uses the account's own `ssh` rather than its own tunnel.
+
+## Retiring rexec from the agent surface
+
+The evidence above makes the replacement defensible; retiring the old path is a
+deployment step, not a code edit here:
+
+1. Configure `hosts` in the profile and mount the `shell` tool (both are inert
+   until a host is named).
+2. Run one week of real work through `shell` while rexec stays available; every
+   rexec use in that window is a case this plane could not serve, and the goal is
+   zero.
+3. Remove rexec from what the agent can call — its tool and its skill entry. The
+   binary and its history stay on disk as the fallback for a case that turns up
+   later.
+4. Keep the capability boundaries above in the operator's view: a request for
+   managed CPython, a macOS/Windows host, or an interactive login is the point to
+   reach for rexec again rather than rebuild it here.
+
+## Boundaries after rexec retires
+
+Stated so nobody discovers them at the wrong moment:
+
+- **No managed CPython.** `rexec <host> script --python` downloads a runtime; this
+  plane runs commands and copies trees, and a host needs its own interpreter.
+- **Linux hosts only.** The controller binary is a static musl executable built
+  for `x86_64` and `aarch64`; a macOS or Windows host would need its own build
+  and its own shell semantics.
+- **No interactive stdin.** A `tty` run allocates a terminal but the caller does
+  not write into it; programs prompting for input still need a person.
+
 ## Degradations, stated rather than assumed
 
 | Condition | Behaviour |
