@@ -32,6 +32,7 @@ import { scrubbedParentEnv } from '@deepseek-ai/dsh-subprocess'
 import { specDigest, type SpawnSpec } from 'dsh-shellout-protocol'
 import { ShelloutClient } from '../core/client.js'
 import type { TransportOptions } from '../core/transport.js'
+import type { Hosts } from './hosts.js'
 import { RemoteExecution } from '../core/execution.js'
 
 /** Local executor settings used by the fallback path. */
@@ -101,6 +102,11 @@ export interface ShelloutConfig {
   /** Settings for the fallback executor. */
   local?: LocalExecutorConfig
   /**
+   * Named hosts the `shell` tool can target. Empty keeps the surface as it is;
+   * a non-empty map adds the tool.
+   */
+  hosts?: Hosts
+  /**
    * Where remote settlements are appended for the local dashboard; defaults to
    * `remote-settlements.jsonl` beside the socket path. Ignored without `remote`.
    */
@@ -152,6 +158,8 @@ export interface ResolvedShelloutConfig {
   readonly heartbeatMs: number
   readonly fallback: 'local' | 'none'
   readonly local: Omit<Required<LocalExecutorConfig>, 'cwd'> & { readonly cwd?: string }
+  /** Configured hosts for the `shell` tool. */
+  readonly hosts: Hosts
 }
 
 /**
@@ -167,6 +175,60 @@ function transportFor(config: ShelloutConfig, socketPath: string): TransportOpti
   for (const word of remote.ssh ?? []) argv.push('--ssh', word)
   if (remote.remoteRoot !== undefined) argv.push('--remote-root', remote.remoteRoot)
   return { kind: 'command', argv }
+}
+
+/**
+ * Start one command on a connected runner.
+ *
+ * The same path serves this context's executor and the `shell` tool's named
+ * hosts, so a host the model reaches through the tool keeps the settlement,
+ * adoption, and read semantics of a local execution.
+ *
+ * @param client - connected runner.
+ * @param config - plugin configuration for environment and settlement index.
+ * @param spec - a resolved spec.
+ * @returns the execution, its live mirror, and a disposer for the settlement listener.
+ * @throws when the runner refuses the execution or the caller aborted first.
+ */
+export async function startOn(
+  client: ShelloutClient,
+  config: ResolvedShelloutConfig,
+  spec: ShellExecSpec,
+  options: { readonly remote?: boolean } = {},
+): Promise<{ readonly execution: ShellExecution; readonly remote: RemoteExecution; readonly detach: () => void }> {
+  if (spec.signal?.aborted === true) throw new Error('shellout: command aborted before start')
+  const executionId = randomUUID()
+  const operationId = randomUUID()
+  const wireSpec = toSpawnSpec(spec, config, options.remote ?? false)
+  const remote = new RemoteExecution(client, executionId, {
+    pollMs: config.mirrorPollMs,
+    retainBytes: config.mirrorRetainBytes,
+  })
+  const detach = client.onSettled((event) => {
+    if (event.executionId !== executionId) return
+    const line = config.settlementLog === undefined ? undefined : settlementLine(config.remoteHost, executionId, event)
+    if (line !== undefined) {
+      try {
+        appendFileSync(config.settlementLog!, `${line}\n`, { mode: 0o600 })
+      } catch {
+        // A dashboard index that cannot be written is not a reason to fail work.
+      }
+    }
+    remote.receive(event)
+  })
+  try {
+    await client.request('exec', {
+      operationId,
+      executionId,
+      spec: wireSpec,
+      specDigest: specDigest(wireSpec),
+    })
+  } catch (error: unknown) {
+    detach()
+    throw error
+  }
+  remote.start()
+  return { execution: new RunnerShellExecution(remote, spec, detach), remote, detach }
 }
 
 /**
@@ -220,6 +282,7 @@ export function resolveConfig(config: ShelloutConfig = {}, env: NodeJS.ProcessEn
     mirrorRetainBytes: config.mirrorRetainBytes ?? 1_048_576,
     heartbeatMs: config.heartbeatMs ?? 5_000,
     fallback: config.fallback ?? 'local',
+    hosts: config.hosts ?? {},
     local: {
       ...config.local?.cwd === undefined ? {} : { cwd: config.local.cwd },
       timeoutMs: config.local?.timeoutMs ?? 120_000,
@@ -245,11 +308,37 @@ export class ShelloutExecutor extends ShellExecutor {
    * @param config - resolved plugin configuration.
    * @param client - connected runner client.
    */
-  constructor(ctx: Context, private readonly config: ResolvedShelloutConfig, private readonly client: ShelloutClient) {
+  /**
+   * @param ctx - owning context.
+   * @param config - resolved plugin configuration.
+   * @param client - connected runner client.
+   * @param options - `listeners: false` builds a handler for a second connection
+   *   that does not own this context's lifecycle (used by the `shell` tool for
+   *   named hosts); the owner disposes it explicitly.
+   */
+  constructor(
+    ctx: Context,
+    private readonly config: ResolvedShelloutConfig,
+    private readonly client: ShelloutClient,
+    options: { readonly listeners?: boolean } = {},
+  ) {
     super(ctx)
-    this.detachClose = client.onClose(() => { this.settleAllLost() })
-    this.detachDisconnect = client.onDisconnect(() => { this.beginLossGrace() })
-    this.detachReconnect = client.onReconnect(() => { this.recover() })
+    const listeners = options.listeners ?? true
+    this.detachClose = listeners ? client.onClose(() => { this.settleAllLost() }) : () => {}
+    this.detachDisconnect = listeners ? client.onDisconnect(() => { this.beginLossGrace() }) : () => {}
+    this.detachReconnect = listeners ? client.onReconnect(() => { this.recover() }) : () => {}
+  }
+
+  /** The configuration this handler applies, for handlers built on another connection. */
+  get configuration(): ResolvedShelloutConfig {
+    return this.config
+  }
+
+  /** Stop listening to the connection; the client itself is closed by its owner. */
+  stopListening(): void {
+    this.detachClose()
+    this.detachDisconnect()
+    this.detachReconnect()
   }
 
   /** The runner's sandbox mode, when its executor confines. */
@@ -290,56 +379,13 @@ export class ShelloutExecutor extends ShellExecutor {
    * @returns the live execution handle.
    * @throws when the command could not be prepared or the caller aborted first.
    */
-  /**
-   * Append one line the local dashboard can read.
-   *
-   * The remote host's history is authoritative and stays there; this is a
-   * read-side index, so a failed append must never affect the execution.
-   *
-   * @param executionId - execution the settlement belongs to.
-   * @param event - settlement facts the runner reported.
-   */
-  private recordRemoteSettlement(executionId: string, event: SettledEvent): void {
-    const log = this.config.settlementLog
-    if (log === undefined) return
-    const line = settlementLine(this.config.remoteHost, executionId, event)
-    try {
-      appendFileSync(log, `${line}\n`, { mode: 0o600 })
-    } catch {
-      // A dashboard index that cannot be written is not a reason to fail work.
-    }
-  }
+
 
   async execute(spec: ShellExecSpec): Promise<ShellExecution> {
-    if (spec.signal?.aborted === true) throw new Error('shellout: command aborted before start')
-    const executionId = randomUUID()
-    const operationId = randomUUID()
-    const wireSpec = toSpawnSpec(spec, this.config)
-    const remote = new RemoteExecution(this.client, executionId, {
-      pollMs: this.config.mirrorPollMs,
-      retainBytes: this.config.mirrorRetainBytes,
-    })
-    const detach = this.client.onSettled((event) => {
-      if (event.executionId !== executionId) return
-      this.recordRemoteSettlement(executionId, event)
-      remote.receive(event)
-    })
-    try {
-      await this.client.request('exec', {
-        operationId,
-        executionId,
-        spec: wireSpec,
-        specDigest: specDigest(wireSpec),
-      })
-    } catch (error: unknown) {
-      detach()
-      throw error
-    }
-    remote.start()
-    this.live.add(remote)
-    const release = (): void => { this.live.delete(remote); detach() }
-    void remote.done.then(release)
-    return new RunnerShellExecution(remote, spec, release)
+    const started = await startOn(this.client, this.config, spec)
+    this.live.add(started.remote)
+    void started.remote.done.then(() => { this.live.delete(started.remote) })
+    return started.execution
   }
 
   /** Close the connection and settle every live execution. */
@@ -531,7 +577,7 @@ function toSandboxMode(value: string | undefined): SandboxMode | undefined {
  * @param config - resolved plugin configuration (local budgets and grace).
  * @returns the wire spawn spec.
  */
-function toSpawnSpec(spec: ShellExecSpec, config: ResolvedShelloutConfig): SpawnSpec {
+function toSpawnSpec(spec: ShellExecSpec, config: ResolvedShelloutConfig, remote: boolean): SpawnSpec {
   const env: Record<string, string> = {}
   for (const [key, value] of Object.entries({
     ...scrubbedParentEnv(),
@@ -544,7 +590,7 @@ function toSpawnSpec(spec: ShellExecSpec, config: ResolvedShelloutConfig): Spawn
   // A remote host is a different machine: the controller's PATH, HOME and
   // tmpdir describe this one, so a remote command inherits none of them and
   // resolves `bash` against the host's own environment.
-  if (config.remoteHost !== undefined) {
+  if (remote || config.remoteHost !== undefined) {
     for (const key of ['PATH', 'HOME', 'TMPDIR', 'PWD', 'SHELL', 'HOSTNAME']) delete env[key]
   }
   return {

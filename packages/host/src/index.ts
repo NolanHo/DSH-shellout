@@ -16,6 +16,7 @@ import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import { ShelloutClient } from './core/client.js'
 import { ShelloutExecutor, resolveConfig, type ShelloutConfig } from './dsh/provider.js'
+import { registerShellTool } from './dsh/tool.js'
 
 export { ShelloutExecutor, resolveConfig, type ShelloutConfig } from './dsh/provider.js'
 export { ShelloutClient, ShelloutRpcError } from './core/client.js'
@@ -37,11 +38,28 @@ export async function apply(ctx: Context, config: ShelloutConfig = {}): Promise<
   if (client !== undefined) {
     const connected: ShelloutClient = client
     ctx.effect(() => () => { connected.close() }, 'shellout.connection')
+    let executor: ShelloutExecutor | undefined
     await ctx.plugin(class extends ShelloutExecutor {
       constructor(inner: Context) {
         super(inner, resolved, connected)
+        executor = this
       }
     })
+    // A deployment that names hosts gets the `shell` tool; one that does not
+    // keeps exactly the surface it had.
+    if (Object.keys(resolved.hosts).length > 0) {
+      await registerShellTool(ctx, {
+        local: executor!,
+        hosts: resolved.hosts,
+        connect: async (argv) => await ShelloutClient.connect({
+          transport: { kind: 'command', argv },
+          bootId: randomUUID(),
+          clientBuild: 'dsh-shellout',
+          connectTimeoutMs: resolved.connectTimeoutMs,
+          reconnectDelayMs: 0,
+        }),
+      })
+    }
     return
   }
   if (resolved.fallback === 'none') {
