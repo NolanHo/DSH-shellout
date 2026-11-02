@@ -19,9 +19,18 @@ export interface HostEntry {
   readonly runner?: string
   /** Working directory for commands here; defaults to the remote home. */
   readonly cwd?: string
-  /** Shell that runs the command; defaults to `/bin/bash`. */
+  /** Shell that runs the command; defaults to `/bin/bash` locally, `bash` on a host. */
   readonly shell?: string
+  /**
+   * How commands run here. `runner` gives adoption and history and needs a Linux
+   * host this plane can bootstrap; `ssh` runs through the host's own ssh without
+   * installing anything. Omitted means choose by probing the host once.
+   */
+  readonly mode?: HostMode
 }
+
+/** How a host executes commands. */
+export type HostMode = 'runner' | 'ssh'
 
 /** Alias to host. */
 export type Hosts = Readonly<Record<string, HostEntry>>

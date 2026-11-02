@@ -11,6 +11,7 @@ import type { ShellRunResult } from '@deepseek-ai/dsh-shell'
 
 import type { ShelloutClient } from '../core/client.js'
 import { startOn, type ShelloutExecutor } from './provider.js'
+import { probePlatform, runDirect } from './direct.js'
 import { attachArgv, resolveHost, type Hosts } from './hosts.js'
 import { syncToHost, type SyncReport, type SyncRequest } from './sync.js'
 import { runInTty } from './tty.js'
@@ -57,6 +58,24 @@ function render(host: string, result: ShellRunResult): string {
  */
 export async function registerShellTool(ctx: Context, options: ShellToolOptions): Promise<void> {
   const bindings = new Map<string, HostBinding>()
+  /** Chosen path per alias, decided once from the host itself. */
+  const paths = new Map<string, 'runner' | 'ssh'>()
+
+  /** A host runs the runner only when it is Linux on an architecture this plane ships. */
+  const pathFor = async (alias: string): Promise<'runner' | 'ssh'> => {
+    const declared = resolveHost(options.hosts, alias).mode
+    if (declared !== undefined) return declared
+    const known = paths.get(alias)
+    if (known !== undefined) return known
+    const platform = await probePlatform(resolveHost(options.hosts, alias))
+    const chosen = platform === undefined
+      ? 'runner'
+      : platform.os === 'Linux' && (platform.arch === 'x86_64' || platform.arch === 'aarch64')
+        ? 'runner'
+        : 'ssh'
+    paths.set(alias, chosen)
+    return chosen
+  }
 
   const executorFor = async (alias: string): Promise<HostBinding> => {
     const existing = bindings.get(alias)
@@ -136,6 +155,25 @@ export async function registerShellTool(ctx: Context, options: ShellToolOptions)
       const entry = resolveHost(options.hosts, args.remote_host)
       const requested = args.sync as SyncRequest | undefined
       const report = requested === undefined ? undefined : await syncToHost(entry, requested)
+      if (await pathFor(args.remote_host) === 'ssh') {
+        const direct = await runDirect(entry, {
+          command: args.command,
+          ...(args.cwd ?? entry.cwd) === undefined ? {} : { cwd: args.cwd ?? entry.cwd },
+          ...entry.shell === undefined ? {} : { shell: entry.shell },
+          ...args.timeout_ms === undefined ? {} : { timeoutMs: args.timeout_ms },
+          ...exec.signal === undefined ? {} : { signal: exec.signal },
+        })
+        const header = [
+          `host: ${args.remote_host}  path: ssh (no runner there)`,
+          `exit: ${direct.exitCode ?? 'null'}${direct.signal === null ? '' : ` (signal ${direct.signal})`}`,
+          ...direct.timedOut ? ['timedOut: true'] : [],
+        ].join('  ')
+        const parts = [header]
+        if (direct.stdout.length > 0) parts.push(`stdout:\n${direct.stdout}`)
+        if (direct.stderr.length > 0) parts.push(`stderr:\n${direct.stderr}`)
+        const body = parts.join('\n')
+        return report === undefined ? body : `${describeSync(report)}\n${body}`
+      }
       const binding = await executorFor(args.remote_host)
       const host = args.cwd ?? entry.cwd ?? process.cwd()
       const started = await startOn(binding.client, options.local.configuration, {
